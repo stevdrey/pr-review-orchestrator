@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status:** Initial planning. All phases below are planned, not delivered. Issue trackers are the source of truth for implementation.
+**Status:** Initial implementation. The Java service bootstrap is present; milestone outcomes remain planned. Issue trackers are the source of truth for implementation.
 
 ## Milestones
 
