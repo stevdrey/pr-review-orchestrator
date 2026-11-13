@@ -6,14 +6,14 @@
 
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
-| EPIC 1 — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |
-| EPIC 2 — Reviews & findings | P0 | Codex trigger spike, review/comment normalization, PR state machine | Inline and general findings tracked against current head SHA |
-| EPIC 3 — Feedback loop & notifications | P0 | Push / CI / resolution correlation, bounded retries, author notifications | Deterministic end-to-end review/repair/clean-review loop demonstrated |
-| EPIC 4 — MCP & Dot event bridge | P1 | Optional MCP tools, subscription-based event delivery and provider-neutral callbacks | Verified with a supported client; no polling dependency |
-| EPIC 5 — Policy, budgets & metrics | P1 | Per-installation rules, API usage accounting, quotas, audit and observability | Reliable per-PR and global budget enforcement and operator controls |
-| EPIC 6 — Deep review providers | P1 | Strong-model OpenAI review, optional Claude review, reusable skills | Validated prompts, normalized findings, error/fallback handling |
-| EPIC 7 — Sandboxed auto-fix | P2 | CI diagnosis, isolated workers, patches/tests, approval gates | No unreviewed privileges or runaway repair loops |
-| EPIC 8 — Operator UI & operations | P2 | Admin console, alerts, deployment, audit and retention controls | Maintainable, inspectable service with documented runbooks |
+| [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |
+| [EPIC 2](https://github.com/stevdrey/pr-review-orchestrator/issues/2) — Reviews & findings | P0 | Codex trigger spike, review/comment normalization, PR state machine | Inline and general findings tracked against current head SHA |
+| [EPIC 3](https://github.com/stevdrey/pr-review-orchestrator/issues/3) — Feedback loop & notifications | P0 | Push / CI / resolution correlation, bounded retries, author notifications | Deterministic end-to-end review/repair/clean-review loop demonstrated |
+| [EPIC 4](https://github.com/stevdrey/pr-review-orchestrator/issues/4) — MCP & Dot event bridge | P1 | Optional MCP tools, subscription-based event delivery and provider-neutral callbacks | Verified with a supported client; no polling dependency |
+| [EPIC 5](https://github.com/stevdrey/pr-review-orchestrator/issues/5) — Policy, budgets & metrics | P1 | Per-installation rules, API usage accounting, quotas, audit and observability | Reliable per-PR and global budget enforcement and operator controls |
+| [EPIC 6](https://github.com/stevdrey/pr-review-orchestrator/issues/6) — Deep review providers | P1 | Strong-model OpenAI review, optional Claude review, reusable skills | Validated prompts, normalized findings, error/fallback handling |
+| [EPIC 7](https://github.com/stevdrey/pr-review-orchestrator/issues/7) — Sandboxed auto-fix | P2 | CI diagnosis, isolated workers, patches/tests, approval gates | No unreviewed privileges or runaway repair loops |
+| [EPIC 8](https://github.com/stevdrey/pr-review-orchestrator/issues/8) — Operator UI & operations | P2 | Admin console, alerts, deployment, audit and retention controls | Maintainable, inspectable service with documented runbooks |
 
 **Priority vocabulary:** P0 must-have MVP, P1 next increment, P2 later. Dependencies: 1 → 2 → 3; 4–6 build on 1–3; 7 requires 2, 3, 5; 8 can evolve incrementally.
 
