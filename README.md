@@ -39,7 +39,7 @@ Install a JDK 27 distribution and run from the repository root:
 ./gradlew bootRun
 ```
 
-The Gradle wrapper downloads its pinned distribution on first use. Dependencies are resolved from Maven Central. On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns the application health status. This endpoint reports process health only; it does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C.
+The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns the application health status. This endpoint reports process health only; it does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C.
 
 The bootstrap contains the application entry point, placeholder domain, application, ports and adapter packages, and a health integration test. Those packages contain no business functionality yet and their dependency boundaries are not enforced automatically. No webhook, persistence, credentials, or review automation is configured by this bootstrap.
 

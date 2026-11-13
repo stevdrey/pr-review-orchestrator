@@ -1,3 +1,9 @@
+import org.springframework.boot.gradle.plugin.SpringBootPlugin
+
+buildscript {
+    configurations.classpath { resolutionStrategy.activateDependencyLocking() }
+}
+
 plugins {
     java
     id("org.springframework.boot") version "4.1.2"
@@ -15,7 +21,10 @@ repositories { mavenCentral() }
 dependencyLocking { lockAllConfigurations() }
 
 dependencies {
-    implementation(platform("org.springframework.boot:spring-boot-dependencies:4.1.2"))
+    val bom = platform(SpringBootPlugin.BOM_COORDINATES)
+    implementation(bom)
+    annotationProcessor(bom)
+    developmentOnly(bom)
     implementation("org.springframework.boot:spring-boot-starter-webmvc")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     testImplementation("org.springframework.boot:spring-boot-starter-test")
