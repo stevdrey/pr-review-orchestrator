@@ -1,0 +1,53 @@
+# Gradle / Java
+.gradle/
+build/
+out/
+target/
+bin/
+*.class
+*.jar
+*.war
+*.ear
+!gradle/wrapper/gradle-wrapper.jar
+# Gradle wrapper and properties are committed intentionally
+# IDE
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+.vscode/*
+!.vscode/extensions.json
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+# Environment/secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.keystore
+secrets/
+credentials/
+application-local.yml
+application-local.yaml
+application-secrets.yml
+application-secrets.yaml
+# Runtime/coverage/logs
+logs/
+*.log
+coverage/
+.jacoco/
+*.exec
+*.hprof
+heapdump*
+tmp/
+temp/
+# Local infrastructure
+.postgres/
+.data/

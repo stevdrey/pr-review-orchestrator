@@ -1,0 +1,5 @@
+# Adjust repository ownership through GitHub settings as the team grows.
+* @stevdrey
+/docs/ @stevdrey
+/.agents/ @stevdrey
+/.github/ @stevdrey
