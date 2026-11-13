@@ -1,6 +1,6 @@
 # Architecture overview
 
-**Target architecture — not yet implemented.**
+**Target architecture:** the application bootstrap exists; the components below are not yet implemented.
 
 ## Context
 

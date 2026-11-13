@@ -25,4 +25,4 @@ Use a safe test repository/PR to demonstrate new PR → review → inline/genera
 
 ## Delivery controls
 
-CI should add Java/Gradle build, tests, dependency and security scans only after a runnable Gradle project exists. Document exact checks and results; avoid false claims of current coverage.
+CI runs the Gradle build and health integration test on Java 27. Dependency and security scans and the contract, unit and integration cases above remain planned. Document exact checks and results; avoid false claims of current coverage.

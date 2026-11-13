@@ -2,7 +2,7 @@
 
 > Event-driven, provider-neutral pull request review orchestration.
 
-**Project status:** Initial planning and documentation. The application has not yet been implemented.
+**Project status:** Initial application bootstrap. Review orchestration and GitHub integrations are planned, not yet implemented.
 
 PR Review Orchestrator is an independent open-source project to coordinate GitHub pull request reviews, CI events, remediation feedback and AI agents. The first target repositories are [Dokene](https://github.com/stevdrey/dokene) and [Monada Neuron](https://github.com/stevdrey/monada-neuron), but the architecture is repository-agnostic.
 
@@ -32,7 +32,16 @@ Java 27 · Spring Boot · Gradle · PostgreSQL · Flyway · GitHub App · GitHub
 
 ## Getting started
 
-This repository contains project planning and agent guidance only. **There is no runnable backend yet**. Implementation and setup instructions will be added as corresponding issues are completed.
+Install a JDK 27 distribution and run from the repository root:
+
+```sh
+./gradlew clean build
+./gradlew bootRun
+```
+
+The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns the application health status. This endpoint reports process health only; it does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C.
+
+The bootstrap contains the application entry point, placeholder domain, application, ports and adapter packages, and a health integration test. Those packages contain no business functionality yet and their dependency boundaries are not enforced automatically. No webhook, persistence, credentials, or review automation is configured by this bootstrap.
 
 ## Documentation
 

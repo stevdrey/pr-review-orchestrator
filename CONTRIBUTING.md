@@ -12,7 +12,7 @@ Welcome! The project is currently in the design/implementation phase; review the
 
 ## Proposed development convention
 
-Java 27, Spring Boot, Gradle wrapper, PostgreSQL and Flyway are the intended stack. Do not claim commands exist before implementation adds them. Prefer modular boundaries, constructor injection, immutability, structured logs, and explicit policy types. Avoid provider-specific assumptions in the domain.
+Java 27, Spring Boot and the Gradle wrapper form the current bootstrap; PostgreSQL and Flyway are planned. Run `./gradlew clean build` to compile and test. Prefer modular boundaries, constructor injection, immutability, structured logs, and explicit policy types. Avoid provider-specific assumptions in the domain.
 
 ## Pull requests
 
