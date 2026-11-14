@@ -3,6 +3,15 @@ spring:
     url: ${DB_URL}
     username: ${DB_USER}
     password: ${DB_PASSWORD}
+    hikari:
+      connection-timeout: 2000
+      data-source-properties:
+        connectTimeout: 2
+        socketTimeout: 3
+        cancelSignalTimeout: 1
+  jdbc:
+    template:
+      query-timeout: 2s
   flyway:
     clean-disabled: true
     baseline-on-migrate: false

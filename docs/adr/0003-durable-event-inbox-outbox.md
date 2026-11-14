@@ -1,6 +1,6 @@
 # ADR 0003: Durable inbox/outbox and bounded idempotent dispatch
 
-**Status:** Accepted (implementation pending)  
+**Status:** Accepted (schema and durable metadata ingress implemented; workers and outbox dispatch pending)
 **Date:** 2026-11-13
 
 ## Context
