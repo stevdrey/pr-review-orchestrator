@@ -32,21 +32,32 @@ Java 27 · Spring Boot · Gradle · PostgreSQL · Flyway · GitHub App · GitHub
 
 ## Getting started
 
-Install a JDK 27 distribution and run from the repository root:
+Install a JDK 27 distribution and Docker with Compose. From the repository root:
 
 ```sh
+# Tests use a disposable PostgreSQL container; no .env or existing database is needed.
 ./gradlew clean build
+
+# Local development database (non-production credentials only).
+cp .env.example .env
+docker compose up -d --wait
+set -a
+. ./.env
+set +a
 ./gradlew bootRun
 ```
 
-The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns the application health status. This endpoint reports process health only; it does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C.
+The environment export commands above are for POSIX shells. See [local database setup and rollback](docs/development/database.md) for configuration, migration behavior, persistence, backup and reset instructions. The application requires `DB_URL`, `DB_USER` and `DB_PASSWORD`; it does not automatically load `.env`. Flyway applies migrations on startup and validates their checksums. Docker must be reachable by the current user for integration tests; missing Docker fails the build rather than skipping database checks.
 
-The bootstrap contains the application entry point, placeholder domain, application, ports and adapter packages, and a health integration test. Those packages contain no business functionality yet and their dependency boundaries are not enforced automatically. No webhook, persistence, credentials, or review automation is configured by this bootstrap.
+The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns application and database health without connection details. This does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C; `docker compose down` stops the local database and preserves its named volume.
+
+The bootstrap contains the application entry point, placeholder domain, application, ports and adapter packages, PostgreSQL/Flyway schema and database integration tests. Those packages contain no business functionality yet and their dependency boundaries are not enforced automatically. No webhook, persistence repositories, event worker, provider credentials or review automation is implemented.
 
 ## Documentation
 
 - [Roadmap](docs/ROADMAP.md)
 - [Architecture](docs/architecture/overview.md)
+- [Local database setup and rollback](docs/development/database.md)
 - [Review lifecycle](docs/architecture/review-lifecycle.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)

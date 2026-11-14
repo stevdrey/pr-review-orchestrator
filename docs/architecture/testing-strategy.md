@@ -1,4 +1,10 @@
-# Verification and testing strategy (planned)
+# Verification and testing strategy
+
+## Current coverage
+
+`./gradlew clean build` runs `DatabaseIntegrationTest` against disposable PostgreSQL 17.11 using Testcontainers. It covers Spring Boot migration from an empty database (single V1 history row, no baseline), checksum validation and a no-op second application startup against the migrated database, disabled clean, application/database health, duplicate delivery/command/cycle keys, installation/repository/SHA references, finding idempotency keys, comment/thread distinctions, explicit fix evidence distinct from the reviewed SHA, retry bounds, processing leases and terminal timestamps, trigger-maintained `updated_at`, inbox recording of installation-level and not-yet-known installation/repository events and transactional rollback of event/command/audit writes. Missing Docker is a failure, not a skipped test. Tests read the pinned image digest from `compose.yaml`.
+
+This verifies schema constraints and startup wiring, not a production inbox worker, webhook authorization, runtime budget enforcement or a complete review lifecycle. The remaining strategy below is planned.
 
 ## Contract tests
 
@@ -25,4 +31,4 @@ Use a safe test repository/PR to demonstrate new PR → review → inline/genera
 
 ## Delivery controls
 
-CI runs the Gradle build and health integration test on Java 27. Dependency and security scans and the contract, unit and integration cases above remain planned. Document exact checks and results; avoid false claims of current coverage.
+CI validates Compose configuration and runs the Gradle build with PostgreSQL integration tests on Java 27. Dependency and security scans and the remaining contract, unit and integration cases above remain planned. Document exact checks and results; avoid false claims of current coverage.

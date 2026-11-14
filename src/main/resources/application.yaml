@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  flyway:
+    clean-disabled: true
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+management:
+  endpoint:
+    health:
+      show-details: never

@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status:** Initial implementation. The Java service bootstrap is present; milestone outcomes remain planned. Issue trackers are the source of truth for implementation.
+**Status:** Initial implementation. The Java service bootstrap and PostgreSQL/Flyway schema are present, with a local Compose database and integration tests. Webhook ingestion and dispatch remain planned. Issue trackers are the source of truth for implementation.
 
 ## Milestones
 
