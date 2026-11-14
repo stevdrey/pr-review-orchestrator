@@ -10,6 +10,8 @@ Ingress: `POST /webhooks/github` (proposed). Verify raw HMAC-SHA256, delivery ID
 
 Outbound GitHub: limited to app-authorized operations; use user-to-server authorization where necessary for account attribution and verify Codex subscription ownership in an integration test. GitHub comment author identity and Codex billable identity may differ.
 
+The [Codex attribution spike](../spikes/issue-14-codex-attribution.md) records observed trigger behavior, attribution limits, the controlled test protocol and a fail-closed fallback. User-token and automatic triggers succeeded in the tested configuration; per-review usage attribution remains unverified and is tracked in [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42).
+
 ## ReviewProvider port
 
 Proposed operations: `requestReview(ReviewRequest)`, `getReviewOutcome(ProviderReference)`, `summarizeFindings(ReviewContext)`. Providers can be async; commands must carry idempotency key, review stage, budget reservation and expected head SHA. No generic provider contract should require a human login or a fixed model name.
