@@ -36,6 +36,10 @@ Malformed/signature mismatch; delivery replay; concurrent identical events; comm
 
 Prefer event metadata and references over storing full PR source. Document retention, privacy and deletion policies before launch. Never include access tokens or raw private diffs in public issue comments or log snapshots.
 
+The initial PostgreSQL schema stores metadata, hashes and optional references rather than raw event/review bodies. A reference must not contain a credential or signed access URL. Local Compose binds to `127.0.0.1` with disposable, explicitly non-production credentials; the image's bootstrap user is a database superuser for local development only. Real deployments require separately provisioned credentials, least-privilege application/migration roles, encrypted transport/storage, backups and retention policy. No production database deployment is supplied here.
+
+Composite foreign keys prevent persisted cycle/finding/command/audit references from crossing installation, repository or reviewed SHA boundaries. They do not enforce per-user data access, active installation status or the latest remote SHA. Row-level security, immutable audit enforcement, webhook verification and dispatcher authorization are not implemented. Future ingress must verify signature and installation/repository authorization before inserting events; future workers must recheck these gates before side effects.
+
 ## Security reviews
 
 Any new external integration, public endpoint, identity flow, sandbox bypass, callback route or billable model call requires security impact review and an ADR if the trust model changes.

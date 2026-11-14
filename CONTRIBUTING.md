@@ -12,7 +12,7 @@ Welcome! The project is currently in the design/implementation phase; review the
 
 ## Proposed development convention
 
-Java 27, Spring Boot and the Gradle wrapper form the current bootstrap; PostgreSQL and Flyway are planned. Run `./gradlew clean build` to compile and test. Prefer modular boundaries, constructor injection, immutability, structured logs, and explicit policy types. Avoid provider-specific assumptions in the domain.
+Java 27, Spring Boot, the Gradle wrapper, PostgreSQL and Flyway form the current bootstrap. Run `./gradlew clean build` with Docker available to compile and test, including disposable PostgreSQL integration tests. See [database development](docs/development/database.md) before changing schema or starting the service locally. Add a new versioned migration for schema changes; do not edit an already applied migration. Prefer modular boundaries, constructor injection, immutability, structured logs, and explicit policy types. Avoid provider-specific assumptions in the domain.
 
 ## Pull requests
 

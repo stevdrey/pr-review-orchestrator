@@ -1,6 +1,6 @@
 # Architecture overview
 
-**Target architecture:** the application bootstrap exists; the components below are not yet implemented.
+**Target architecture:** the application bootstrap and [PostgreSQL/Flyway schema](../development/database.md) exist. The orchestration components below are not yet implemented.
 
 ## Context
 
