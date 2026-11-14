@@ -4,7 +4,7 @@
 
 The service now has an installation/repository authorization gate, a PostgreSQL membership adapter, RS256 App authentication and a repository-scoped **read-only** installation-token client. Token issuance is disabled unless `orchestrator.github.enabled=true`; the deployment allowlist is empty by default. No HTTP token endpoint, webhook receiver, installation auto-enrollment, scheduled GitHub calls, comment writer or OAuth callback is supplied. Merely starting the service never contacts GitHub.
 
-This is the implementation and operator registration contract for [issue #11](https://github.com/stevdrey/pr-review-orchestrator/issues/11), under accepted [ADR 0002](../adr/0002-github-app-webhook-trust.md). It does not certify that an App has been registered or installed in a real account. Account-specific App identity, installation and remote revocation behavior still require a controlled live test. Webhook signature/replay processing belongs to #12/#13.
+This is the implementation and operator registration contract for [issue #11](https://github.com/stevdrey/pr-review-orchestrator/issues/11), under accepted [ADR 0002](../adr/0002-github-app-webhook-trust.md). The [registration evidence](issue-11-registration-evidence.md) records the operator-approved development App, installation on three repositories and live scoped-token checks. Remote token invalidation remains unproven; this is distinct from local authorization checks and does not certify other installations. Webhook signature/replay processing belongs to #12/#13.
 
 ## Registration contract and minimum permissions
 
@@ -103,7 +103,7 @@ App comment identity does not establish Codex acceptance or subscription billing
 
 - `./gradlew test --tests '*GitHub*' --tests '*RepositoryAuthorization*'` exercises paired allowlists, default-disabled configuration, RS256 signature verification, JWT lifetime, single-repository/operation scoping, key replacement, sanitized failure stack traces, invalid/expired responses, redirects/API errors, network failure and revocation during exchange. Keys/tokens are generated synthetic fixtures only.
 - `./gradlew clean build` also runs PostgreSQL/Testcontainers tests for default-disabled membership, ACTIVE/SUSPENDED/REVOKED transitions and exact paired authorization, alongside existing migration/schema/startup checks. Missing Docker fails the build.
-- Live App registration, installation/permission consent, real token minting, remote suspension/revocation and deployed secret-manager rotation are **not verified** by local tests. There are no actual GitHub or provider calls during tests. No user OAuth or webhook-HMAC behavior is claimed.
+- Live App registration, installation/permission consent and real scoped token minting are recorded separately in the [development registration evidence](issue-11-registration-evidence.md). They are **not verified by local tests**. Immediate remote token invalidation, remote suspension and deployed secret-manager rotation remain unverified. There are no actual GitHub or provider calls during tests. No user OAuth or webhook-HMAC behavior is claimed.
 
 Enable only in an operator-controlled test environment after provisioning both layers and credentials. Roll back by disabling affected database memberships first, disabling `orchestrator.github.enabled`, restarting, and revoking remote credentials if needed. No schema rollback or provider spending is introduced by this increment.
 
