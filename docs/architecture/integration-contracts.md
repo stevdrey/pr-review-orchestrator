@@ -1,12 +1,12 @@
 # Integration contracts and capability verification
 
-This document describes planned endpoints and adapter contracts. The [GitHub App authentication and installation authorization adapter](../github/app-setup.md) is implemented as an internal opt-in Java component; no GitHub HTTP endpoints are available yet.
+This document describes planned endpoints and adapter contracts. The [GitHub App authentication and installation authorization adapter](../github/app-setup.md) is implemented as an internal opt-in Java component; the [webhook receiver](../github/webhook-ingress.md) is a separate opt-in HTTP adapter.
 
 ## GitHub ingestion
 
 Events to investigate: `pull_request` (opened, ready_for_review, synchronize, reopened, closed), `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `workflow_run`. GitHub delivery semantics and payload availability depend on app event subscription and permissions; verify each combination via captured **sanitized** fixtures.
 
-Ingress: `POST /webhooks/github` (proposed). Verify raw HMAC-SHA256, delivery ID, installation, repository and permitted event before queuing. Return 2xx only after durable acceptance.
+Implemented ingress: `POST /webhooks/github`. Verify bounded raw HMAC-SHA256 bytes, delivery ID, installation, repository and explicitly supported event/action before queuing metadata. Return 202 after commit, 200 for a durable duplicate, or 204 for a signed ping that queues no work. See the [route and response contract](../github/webhook-ingress.md) for unsupported lifecycle events, replay fingerprints, secret rotation and metadata-only limitations. Detailed payloads are not retained; a future worker must fetch authoritative GitHub state.
 
 Outbound GitHub: limited to app-authorized operations; use user-to-server authorization where necessary for account attribution and verify Codex subscription ownership in an integration test. GitHub comment author identity and Codex billable identity may differ.
 

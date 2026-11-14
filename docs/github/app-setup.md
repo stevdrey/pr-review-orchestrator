@@ -2,9 +2,9 @@
 
 ## Delivered boundary
 
-The service now has an installation/repository authorization gate, a PostgreSQL membership adapter, RS256 App authentication and a repository-scoped **read-only** installation-token client. Token issuance is disabled unless `orchestrator.github.enabled=true`; the deployment allowlist is empty by default. No HTTP token endpoint, webhook receiver, installation auto-enrollment, scheduled GitHub calls, comment writer or OAuth callback is supplied. Merely starting the service never contacts GitHub.
+The service now has an installation/repository authorization gate, a PostgreSQL membership adapter, RS256 App authentication and a repository-scoped **read-only** installation-token client. Token issuance is disabled unless `orchestrator.github.enabled=true`; the deployment allowlist is empty by default. No HTTP token endpoint, installation auto-enrollment, scheduled GitHub calls, comment writer or OAuth callback is supplied. Issue #12 adds a separate opt-in [webhook receiver](webhook-ingress.md). Merely starting the service never contacts GitHub.
 
-This is the implementation and operator registration contract for [issue #11](https://github.com/stevdrey/pr-review-orchestrator/issues/11), under accepted [ADR 0002](../adr/0002-github-app-webhook-trust.md). The [registration evidence](issue-11-registration-evidence.md) records the operator-approved development App, installation on three repositories and live scoped-token checks. Remote token invalidation remains unproven; this is distinct from local authorization checks and does not certify other installations. Webhook signature/replay processing belongs to #12/#13.
+This is the implementation and operator registration contract for [issue #11](https://github.com/stevdrey/pr-review-orchestrator/issues/11), under accepted [ADR 0002](../adr/0002-github-app-webhook-trust.md). The [registration evidence](issue-11-registration-evidence.md) records the operator-approved development App, installation on three repositories and live scoped-token checks. Remote token invalidation remains unproven; this is distinct from local authorization checks and does not certify other installations. Webhook signature validation and replay-safe metadata acceptance are documented under [issue #12 ingress](webhook-ingress.md); asynchronous processing remains #13.
 
 ## Registration contract and minimum permissions
 
@@ -26,11 +26,11 @@ A later comment/notification implementation must justify and explicitly approve 
 
 ## Event subscription contract (activate only with verified ingress)
 
-When #12/#13 provide raw-body HMAC verification, payload limits, delivery deduplication and durable acceptance at a real HTTPS endpoint, configure a separate random webhook secret in a secret manager and activate SSL verification. Subscribe only to:
+Issue #12 provides raw-body HMAC verification, payload limits, delivery deduplication and durable metadata acceptance. Before activating webhooks, provision a real HTTPS endpoint using the [ingress runbook](webhook-ingress.md), configure a separate random secret in protected mounted storage and activate SSL verification. No public endpoint or live delivery is supplied by this change. Subscribe only to implemented repository event routes below; installation lifecycle handling remains a future control path.
 
 | Events | Required permission | Intended use |
 | --- | --- | --- |
-| `installation`, `installation_repositories` | Installation lifecycle events | Revoke/suspend/remove membership; never auto-approve new membership |
+| `installation`, `installation_repositories` | Installation lifecycle events | Future control path; currently rejected by ingress. Maintain local membership manually; never auto-approve new membership |
 | `pull_request` | Pull requests read | Open, ready, synchronize, reopen and close transitions |
 | `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread` | Pull requests read | Review evidence and thread state, without treating resolution as proof of a fix |
 | `issue_comment` | Issues read | General PR comments, including edits/deletions; filter out ordinary issues |
@@ -91,7 +91,7 @@ The response must name exactly the requested repository and read permissions and
 
 To rotate an App key: generate a replacement in GitHub, convert it in protected storage, atomically replace the mounted PKCS#8 file, perform a controlled read-only probe, then delete the old key from GitHub. Every subsequent issuance uses the new file without restart. An unreadable/missing replacement fails closed. Already issued installation tokens can outlive key deletion: revoke affected tokens/installation separately if compromise is suspected; deleting a signing key alone is not token revocation. There is no local token cache to purge. Keep production key rotation evidence in private operator audit storage, recording identifiers/timestamps/results rather than credentials.
 
-Webhook secret rotation is an operator contract only until #12 implements HMAC verification: stage the new secret in protected storage, coordinate the GitHub setting and receiver deployment, support only a bounded old/new overlap if explicitly implemented, then remove the old secret and verify rejection. This service currently neither consumes nor validates webhook secrets; keep webhooks inactive.
+Issue #12 implements mounted current/previous webhook secrets with per-request reload and fail-closed validation. Follow the [webhook rotation procedure](webhook-ingress.md#rotate-disable-and-recover), coordinate the GitHub setting with the receiver, keep overlap short and verify that retired secrets are rejected.
 
 ## Optional user authorization (disabled, documented contract only)
 
@@ -101,9 +101,9 @@ App comment identity does not establish Codex acceptance or subscription billing
 
 ## Verification and rollout limits
 
-- `./gradlew test --tests '*GitHub*' --tests '*RepositoryAuthorization*'` exercises paired allowlists, default-disabled configuration, RS256 signature verification, JWT lifetime, single-repository/operation scoping, key replacement, sanitized failure stack traces, invalid/expired responses, redirects/API errors, network failure and revocation during exchange. Keys/tokens are generated synthetic fixtures only.
+- `./gradlew test --tests '*GitHubAppConfiguration*' --tests '*GitHubCredentials*' --tests '*RepositoryAuthorization*'` exercises paired allowlists, default-disabled configuration, RS256 signature verification, JWT lifetime, single-repository/operation scoping, key replacement, sanitized failure stack traces, invalid/expired responses, redirects/API errors, network failure and revocation during exchange. Keys/tokens are generated synthetic fixtures only.
 - `./gradlew clean build` also runs PostgreSQL/Testcontainers tests for default-disabled membership, ACTIVE/SUSPENDED/REVOKED transitions and exact paired authorization, alongside existing migration/schema/startup checks. Missing Docker fails the build.
-- Live App registration, installation/permission consent and real scoped token minting are recorded separately in the [development registration evidence](issue-11-registration-evidence.md). They are **not verified by local tests**. Immediate remote token invalidation, remote suspension and deployed secret-manager rotation remain unverified. There are no actual GitHub or provider calls during tests. No user OAuth or webhook-HMAC behavior is claimed.
+- Live App registration, installation/permission consent and real scoped token minting are recorded separately in the [development registration evidence](issue-11-registration-evidence.md). They are **not verified by local tests**. Immediate remote token invalidation, remote suspension and deployed secret-manager rotation remain unverified. There are no actual GitHub or provider calls during tests. The issue #11 evidence does not verify user OAuth or live webhook delivery. Local webhook-HMAC tests and their limits are documented in the [ingress runbook](webhook-ingress.md).
 
 Enable only in an operator-controlled test environment after provisioning both layers and credentials. Roll back by disabling affected database memberships first, disabling `orchestrator.github.enabled`, restarting, and revoking remote credentials if needed. No schema rollback or provider spending is introduced by this increment.
 

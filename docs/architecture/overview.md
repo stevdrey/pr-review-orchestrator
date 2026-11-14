@@ -1,6 +1,6 @@
 # Architecture overview
 
-**Target architecture:** the application bootstrap, [PostgreSQL/Flyway schema](../development/database.md), paired installation/repository authorization gate and opt-in [GitHub App authentication](../github/app-setup.md) exist. The event ingestion, orchestration and dispatch components below are not yet implemented.
+**Target architecture:** the application bootstrap, [PostgreSQL/Flyway schema](../development/database.md), paired installation/repository authorization gate and opt-in [GitHub App authentication](../github/app-setup.md) exist. The [opt-in webhook ingress](../github/webhook-ingress.md) also exists: it verifies bounded raw bodies, authorizes installation/repository pairs and commits deduplicated routing metadata. Orchestration and dispatch components below are not yet implemented.
 
 ## Context
 
