@@ -2,7 +2,7 @@
 
 > Event-driven, provider-neutral pull request review orchestration.
 
-**Project status:** Initial application bootstrap. Review orchestration and GitHub integrations are planned, not yet implemented.
+**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Webhook ingestion and review orchestration remain planned.
 
 PR Review Orchestrator is an independent open-source project to coordinate GitHub pull request reviews, CI events, remediation feedback and AI agents. The first target repositories are [Dokene](https://github.com/stevdrey/dokene) and [Monada Neuron](https://github.com/stevdrey/monada-neuron), but the architecture is repository-agnostic.
 
@@ -51,13 +51,14 @@ The environment export commands above are for POSIX shells. See [local database 
 
 The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns application and database health without connection details. This does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C; `docker compose down` stops the local database and preserves its named volume.
 
-The bootstrap contains the application entry point, placeholder domain, application, ports and adapter packages, PostgreSQL/Flyway schema and database integration tests. Those packages contain no business functionality yet and their dependency boundaries are not enforced automatically. No webhook, persistence repositories, event worker, provider credentials or review automation is implemented.
+The bootstrap contains PostgreSQL/Flyway schema, database integration tests and a deny-by-default installation/repository authorization gate. The optional GitHub App client signs short-lived JWTs from a mounted key and requests single-repository, operation-scoped read tokens. See [GitHub App setup](docs/github/app-setup.md) for permission rationale, registration, allowlisting and credential rotation. GitHub credentials are unnecessary for the default-disabled configuration. An operator-approved [development App installation and live verification record](docs/github/issue-11-registration-evidence.md) is available. No webhook receiver, event worker, user OAuth flow or review automation is supplied. Package dependency boundaries are not enforced automatically.
 
 ## Documentation
 
 - [Roadmap](docs/ROADMAP.md)
 - [Architecture](docs/architecture/overview.md)
 - [Local database setup and rollback](docs/development/database.md)
+- [GitHub App registration, authorization and rotation](docs/github/app-setup.md)
 - [Review lifecycle](docs/architecture/review-lifecycle.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)

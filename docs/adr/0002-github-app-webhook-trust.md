@@ -1,6 +1,6 @@
 # ADR 0002: GitHub App, explicit actor identity and signed webhook ingress
 
-**Status:** Accepted (implementation pending)  
+**Status:** Accepted (App authentication and local authorization implemented; webhook and user authorization pending)
 **Date:** 2026-11-13
 
 ## Context

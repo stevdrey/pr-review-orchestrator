@@ -1,6 +1,6 @@
 # Integration contracts and capability verification
 
-This document describes planned boundaries, **not currently available runtime endpoints**.
+This document describes planned endpoints and adapter contracts. The [GitHub App authentication and installation authorization adapter](../github/app-setup.md) is implemented as an internal opt-in Java component; no GitHub HTTP endpoints are available yet.
 
 ## GitHub ingestion
 
