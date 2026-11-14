@@ -17,6 +17,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Signature;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
@@ -40,6 +41,7 @@ class GitHubCredentialsTest {
     private final JsonMapper json = JsonMapper.builder().build();
     private final AtomicBoolean enabled = new AtomicBoolean(true);
     private final AtomicInteger requests = new AtomicInteger();
+    private final AtomicInteger revocations = new AtomicInteger();
     private final RepositoryAuthorization authorization = new RepositoryAuthorization(Set.of(SCOPE), s -> enabled.get());
     @TempDir Path directory;
     private Path keyFile;
@@ -54,6 +56,8 @@ class GitHubCredentialsTest {
     private String requestAuthorization;
     private String requestVersion;
     private boolean revokeDuringRequest;
+    private boolean slowBody;
+    private String revokedAuthorization;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -73,8 +77,25 @@ class GitHubCredentialsTest {
             byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.getResponseHeaders().add("Location", "/redirect-target");
+            if (slowBody) {
+                exchange.sendResponseHeaders(status, 0);
+                try (var out = exchange.getResponseBody()) {
+                    out.write(bytes, 0, 1);
+                    out.flush();
+                    Thread.sleep(2_000);
+                } catch (InterruptedException | java.io.IOException ignored) {
+                    // Client abandoned the exchange at its deadline.
+                }
+                return;
+            }
             exchange.sendResponseHeaders(status, bytes.length);
             try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/installation/token", exchange -> {
+            revocations.incrementAndGet();
+            revokedAuthorization = exchange.getRequestMethod() + " " + exchange.getRequestHeaders().getFirst("Authorization");
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
         });
         server.start();
         tokens = new GitHubInstallationTokens(authorization, jwt, CLOCK,
@@ -135,8 +156,11 @@ class GitHubCredentialsTest {
     @Test
     void rechecksRevocationBeforeReleasingIssuedToken() {
         revokeDuringRequest = true;
-        assertSanitized(assertThrows(IllegalStateException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
+        // A denial stays a denial (not retryable unavailability), and the minted token is revoked remotely.
+        assertSanitized(assertThrows(SecurityException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
         assertEquals(1, requests.get());
+        assertEquals(1, revocations.get());
+        assertEquals("DELETE Bearer " + TOKEN, revokedAuthorization);
     }
 
     @ParameterizedTest
@@ -146,6 +170,7 @@ class GitHubCredentialsTest {
         response = "fixture-private-key-material-do-not-log " + TOKEN;
         assertSanitized(assertThrows(IllegalStateException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
         assertEquals(1, requests.get());
+        assertEquals(0, revocations.get());
     }
 
     @ParameterizedTest
@@ -153,6 +178,7 @@ class GitHubCredentialsTest {
     void expiredNearlyExpiredAndMalformedCredentialsAreRejected(String expiry) {
         response = response(expiry, 1001, "read");
         assertSanitized(assertThrows(IllegalStateException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
+        assertEquals(1, revocations.get());
     }
 
     @Test
@@ -160,10 +186,30 @@ class GitHubCredentialsTest {
         for (String bad : new String[] {response("2026-11-14T01:00:00Z", 2002, "read"),
                 response("2026-11-14T01:00:00Z", 1001, "write"), "{}", "not-json " + TOKEN,
                 response.replace(TOKEN, ""), response.replace(TOKEN, "bad\\ntoken"),
+                response.replace("\"" + TOKEN + "\"", "1234"),
                 response.replace("\"metadata\":\"read\"", "\"contents\":\"write\"")}) {
             response = bad;
             assertSanitized(assertThrows(IllegalStateException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
         }
+        // Only the three responses carrying a well-formed live token (wrong repository, write, extra permission) are revoked.
+        assertEquals(3, revocations.get());
+    }
+
+    @Test
+    void oversizedResponseBodyIsRejected() {
+        response = response("2026-11-14T01:00:00Z", 1001, "read")
+                .replace("\"repositories\"", "\"padding\":\"" + "x".repeat(GitHubInstallationTokens.MAX_BODY_BYTES) + "\",\"repositories\"");
+        assertSanitized(assertThrows(IllegalStateException.class, () -> tokens.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
+    }
+
+    @Test
+    void slowResponseBodyIsBoundedByTheExchangeDeadline() {
+        slowBody = true;
+        var bounded = new GitHubInstallationTokens(authorization, jwt, CLOCK,
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/"), Duration.ofMillis(200));
+        long started = System.nanoTime();
+        assertSanitized(assertThrows(IllegalStateException.class, () -> bounded.issue(SCOPE, GitHubReadOperation.PULL_REQUESTS)));
+        assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofMillis(1_500)) < 0);
     }
 
     @Test

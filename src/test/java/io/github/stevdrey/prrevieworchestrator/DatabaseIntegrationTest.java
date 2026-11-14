@@ -97,11 +97,12 @@ class DatabaseIntegrationTest {
         // Share this test's uncommitted connection; fixtures still roll back after every test.
         var authority = new JdbcInstallationAuthorization(new JdbcTemplate(new SingleConnectionDataSource(connection, true)));
         var scope = new RepositoryScope(101, 1001);
-        var authorization = new RepositoryAuthorization(Set.of(scope, new RepositoryScope(101, 3003)), authority);
+        var authorization = new RepositoryAuthorization(
+                Set.of(scope, new RepositoryScope(101, 3003), new RepositoryScope(202, 1001)), authority);
         assertThrows(SecurityException.class, () -> authorization.requireAuthorized(scope));
         execute("UPDATE installation_repositories SET enabled = true WHERE installation_id = 101 AND repository_id = 1001");
         authorization.requireAuthorized(scope);
-        // A row for the repository in another installation is never sufficient.
+        // Allowlisted crossed pair: the disabled (202, 1001) row must not borrow the enabled (101, 1001) row.
         assertThrows(SecurityException.class, () -> authorization.requireAuthorized(new RepositoryScope(202, 1001)));
         assertThrows(SecurityException.class, () -> authorization.requireAuthorized(new RepositoryScope(101, 3003)));
         for (String status : new String[] {"SUSPENDED", "REVOKED"}) {
