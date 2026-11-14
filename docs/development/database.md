@@ -28,7 +28,7 @@ Compose loads `.env` automatically. Spring Boot does not: export the trusted loc
 
 Change `DB_PORT` in `.env` if occupied; sourcing the example derives the JDBC URL from it and `DB_NAME`. Without `.env`, Compose uses the same development defaults. The application has no credential fallback. Never copy these settings to a shared or production environment. `.env`, local data and backup directories are ignored by Git. Do not put real credentials or production data in fixtures or examples.
 
-Compose and tests pin PostgreSQL 17.11 by image digest. Upgrade the digest in both `compose.yaml` and `DatabaseIntegrationTest` together and rerun migration tests. The `postgres-data` named volume persists across `docker compose down` and subsequent starts. PostgreSQL bootstrap variables initialize an empty volume only: changing the username, password or database name does not modify an existing database.
+Compose and tests pin PostgreSQL 17.11 by image digest. `compose.yaml` is the single source: the Gradle test task reads its `image:` value and passes it to `DatabaseIntegrationTest`, failing if no digest-pinned postgres image is found. Upgrade the digest there and rerun migration tests. The `postgres-data` named volume persists across `docker compose down` and subsequent starts. PostgreSQL bootstrap variables initialize an empty volume only: changing the username, password or database name does not modify an existing database.
 
 `curl http://localhost:8080/actuator/health` reports `UP` after successful database startup/migration. Connection details are hidden. A database outage makes aggregate health fail; this endpoint does not prove review readiness or GitHub access.
 
@@ -41,18 +41,18 @@ Flyway runs `src/main/resources/db/migration/V1__orchestration_foundation.sql` o
 | `installations` | Stable installation/account IDs, lifecycle status and policy version |
 | `installation_repositories` | Explicit repository membership; disabled by default |
 | `review_cycles` | PR number, head SHA, provider/stage/iteration and state |
-| `inbox_events` | Unique GitHub delivery key, payload digest/reference, correlation, verification timestamp and retry metadata |
-| `findings` | Separate actionable findings with comment/review/thread provenance, reviewed SHA and disposition evidence |
-| `outbox_commands` | Unique command key, cycle, expected SHA, provider and bounded retry metadata |
+| `inbox_events` | Unique GitHub delivery key, payload digest/reference, correlation, verification timestamp, retry and lease metadata; no foreign keys |
+| `findings` | Separate actionable findings with comment/review/thread provenance, per-source ordinal key, reviewed SHA and disposition evidence |
+| `outbox_commands` | Unique command key, cycle, expected SHA, provider, bounded retry and lease metadata |
 | `audit_entries` | Scoped actor/action/outcome, correlation and evidence reference |
 
-UUID record/correlation IDs and deterministic command keys are supplied by future application code. Timestamps use `timestamptz`; application updates must maintain `updated_at`. SHA fields accept full lowercase 40- or 64-character hex commit IDs. Composite references bind findings and commands to a cycle's installation, repository and SHA. Audit records may be installation/repository-level, but cycle-specific records must include a matching repository and SHA. Installation-level events may omit repository/SHA. No cascading deletes remove evidence implicitly.
+UUID record/correlation IDs and deterministic command keys are supplied by future application code. Timestamps use `timestamptz`; a `BEFORE UPDATE` trigger maintains `updated_at` on installations, review cycles and findings. SHA fields accept full lowercase 40- or 64-character hex commit IDs. Composite references bind findings and commands to a cycle's installation, repository and SHA. Audit records may be installation/repository-level, but cycle-specific records must include a matching repository and SHA. Inbox events have no foreign keys: a signature-verified delivery is durably recorded even when its installation or repository membership is not stored yet (for example `installation.created`, or a `pull_request` arriving before membership sync). Installation-level events may omit repository/SHA. Inbox rows are therefore not authorized input; workers must recheck installation/repository authorization before processing. Referencing foreign-key columns are indexed. No cascading deletes remove evidence implicitly.
 
 A repeated Flyway migrate validates checksums and applies zero migrations once V1 is recorded; the DDL is intentionally not wrapped in `IF NOT EXISTS`, which could hide drift. Keep applied migrations immutable and add `V2__...sql`, etc. Baseline-on-migrate is off: an unexpected existing nonempty schema is not silently adopted. Flyway clean is disabled. Failed PostgreSQL transactional migrations roll back; investigate and correct the cause before retrying, rather than deleting history or disabling validation.
 
-Delivery keys deduplicate transport retries; command keys are a separate side-effect identity. Several findings can share one source comment/review and have independent dispositions. A resolved thread leaves a finding open. `VERIFIED_FIXED` requires an evidence commit, verification time, actor and reason; these fields record evidence but cannot establish its correctness. A general issue comment/review cannot acquire a thread-resolution flag. Application policy must still validate dispositions, freeze policy/budget context, authorize every action and compare the expected SHA with current remote state.
+Delivery keys deduplicate transport retries; command keys are a separate side-effect identity. Several findings can share one source comment/review and have independent dispositions; `(review_cycle_id, source_provider, source_kind, source_id, source_ordinal)` is unique, so re-ingesting the same source finding is rejected instead of duplicated. A resolved thread leaves a finding open. `VERIFIED_FIXED` requires an evidence commit different from the reviewed SHA, verification time, actor and reason. Evidence fields must be cleared when a finding leaves `VERIFIED_FIXED`, and an `OPEN` finding carries no disposition; these fields record evidence but cannot establish its correctness. A general issue comment/review cannot acquire a thread-resolution flag. Application policy must still validate dispositions, freeze policy/budget context, authorize every action and compare the expected SHA with current remote state.
 
-The retry ceiling defaults to five storage attempts and is not a review-iteration or spending policy. There is no dispatcher to claim rows, increment attempts, recover leases or perform side effects yet. Likewise, these foreign keys are integrity constraints, not row-level tenant security or an authorization check. Full source, webhook payloads, tokens and review bodies are not stored here; reference storage and retention must be designed before ingestion.
+The retry ceiling defaults to five storage attempts and is not a review-iteration or spending policy. `PROCESSING` rows must carry `locked_by` and `locked_until` (indexed for expired-lease recovery), and terminal statuses require `processed_at`/`completed_at`. There is no dispatcher to claim rows, increment attempts, recover leases or perform side effects yet. Likewise, these foreign keys are integrity constraints, not row-level tenant security or an authorization check. Full source, webhook payloads, tokens and review bodies are not stored here; reference storage and retention must be designed before ingestion.
 
 ## Verify
 
@@ -73,11 +73,14 @@ mkdir -p .data
 docker compose exec -T postgres sh -c 'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > .data/local.backup.dump
 ```
 
-Keep backups private and verify restore before relying on them. To restore into a **fresh empty database** (application stopped), using the same local configuration:
+Keep backups private and verify restore before relying on them. Restore into a **new empty database** rather than over the migrated `DB_NAME` database (restoring over existing objects fails with `--exit-on-error`). With the application stopped:
 
 ```sh
-docker compose exec -T postgres sh -c 'exec pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --exit-on-error' < .data/local.backup.dump
+docker compose exec -T postgres sh -c 'exec createdb -U "$POSTGRES_USER" restore_verification'
+docker compose exec -T postgres sh -c 'exec pg_restore -U "$POSTGRES_USER" -d restore_verification --exit-on-error' < .data/local.backup.dump
 ```
+
+Point the application at it by setting `DB_URL=jdbc:postgresql://127.0.0.1:${DB_PORT}/restore_verification` (or update `DB_NAME`/`DB_URL` in `.env` and re-export).
 
 Restore the matching application revision and validate Flyway history before accepting writes. There is no automatic down migration. In a data-bearing environment, stop writers, preserve a verified backup and use a reviewed forward migration or restore into a new database. Reverting Java code alone does not undo schema changes. Do not use `repair`, baseline, or edits to V1 to conceal checksum failures.
 
@@ -95,9 +98,9 @@ The next application start reapplies V1. Never use this reset procedure against 
 Verified locally on 2026-11-13 with Java 27, Docker Engine 29.9.3, Compose 5.7.1 and PostgreSQL 17.11:
 
 - `docker compose config --quiet` and `docker compose --env-file .env.example config --quiet`: passed.
-- `./gradlew test --tests '*DatabaseIntegrationTest'`: passed. After final schema review, `./gradlew clean build` passed with 8 tests, 0 failures and 0 skipped.
+- `./gradlew test --tests '*DatabaseIntegrationTest'`: passed. After final schema review, `./gradlew clean build` passed with 10 tests, 0 failures and 0 skipped.
 - `docker compose -p pro-issue10-verification --env-file .env.example up -d --wait`: healthy. With the example exported, both `./gradlew bootRun --args='--server.port=18081'` and the final `java -jar build/libs/pr-review-orchestrator-0.1.0-SNAPSHOT.jar --server.port=18081` started, applied V1 and returned `UP` from `curl --fail --silent http://localhost:18081/actuator/health`. Verification processes were stopped intentionally afterward.
-- Using that isolated Compose project, a synthetic installation survived `down` followed by `up -d --wait`. The documented `pg_dump --format=custom` / `pg_restore --exit-on-error` flow restored the record and successful V1 history into a fresh `restore_verification` database. The final schema was used; verification containers, volume and backup were removed afterward.
+- Using that isolated Compose project, a synthetic installation survived `down` followed by `up -d --wait`. The documented `pg_dump --format=custom`, `createdb restore_verification` and `pg_restore --exit-on-error` commands restored the record and successful V1 history into that new database. The final schema was used; verification containers, volume and backup were removed afterward.
 - `env -u DB_URL -u DB_USER -u DB_PASSWORD timeout 20s java -jar build/libs/pr-review-orchestrator-0.1.0-SNAPSHOT.jar --server.port=18082`: exited 1 during datasource initialization, as expected without configuration.
 - `git diff --check`: passed. Examples and fixtures contain public development values and synthetic metadata only; `.env` and `.data/local.backup.dump` remain ignored.
 

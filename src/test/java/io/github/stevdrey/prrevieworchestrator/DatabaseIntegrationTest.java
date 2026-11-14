@@ -12,6 +12,7 @@ import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.UUID;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -36,8 +38,10 @@ class DatabaseIntegrationTest {
     private static final String NEXT_HEAD = "b".repeat(40);
 
     @Container
-    static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer(DockerImageName.parse(
-            "postgres@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24"));
+    static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer(DockerImageName.parse(Objects.requireNonNull(
+            System.getProperty("test.postgres.image"), "test.postgres.image is set by Gradle from compose.yaml"))
+            // Testcontainers does not parse tag+digest references as the plain "postgres" repository.
+            .asCompatibleSubstituteFor("postgres"));
 
     @DynamicPropertySource
     static void databaseProperties(DynamicPropertyRegistry registry) {
@@ -95,15 +99,29 @@ class DatabaseIntegrationTest {
     }
 
     @Test
-    void emptyDatabaseMigratesAndRepeatedStartupDoesNotReapplyMigration() throws SQLException {
-        // Spring Boot has already migrated this fresh container before creating the context.
-        assertEquals("1", flyway.info().current().getVersion().toString());
+    void migrationRecordsOnlyV1AndSecondStartupIsNoOp() throws SQLException {
+        // Spring Boot migrated this fresh container before creating the context. A single SQL history row
+        // (no BASELINE/SCHEMA row) shows Flyway applied V1 to an empty schema rather than adopting one.
+        String history = "SELECT count(*) FROM flyway_schema_history WHERE version = '1' AND type = 'SQL' AND success";
+        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(1, count(history));
+        int checksum = count("SELECT checksum FROM flyway_schema_history");
         assertTrue(flyway.validateWithResult().validationSuccessful);
-        assertEquals(0, flyway.migrate().migrationsExecuted);
-        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE success"));
-        assertEquals(2, count("SELECT count(*) FROM installations"));
         assertTrue(flyway.getConfiguration().isCleanDisabled());
         assertThrows(FlywayException.class, flyway::clean);
+
+        // Boot a second, independent application against the already-migrated database.
+        try (var restarted = new SpringApplicationBuilder(PrReviewOrchestratorApplication.class)
+                // Command-line arguments outrank application.yaml's ${DB_*} placeholders.
+                .run("--server.port=0",
+                        "--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
+                        "--spring.datasource.username=" + POSTGRES.getUsername(),
+                        "--spring.datasource.password=" + POSTGRES.getPassword())) {
+            assertTrue(restarted.isRunning());
+        }
+        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(1, count(history));
+        assertEquals(checksum, count("SELECT checksum FROM flyway_schema_history"));
     }
 
     @Test
@@ -130,9 +148,6 @@ class DatabaseIntegrationTest {
         reject("23503", () -> insertCommand(UUID.randomUUID(), "stale", NEXT_HEAD));
         reject("23503", () -> execute("UPDATE review_cycles SET repository_id = 9999 WHERE id = ?", cycleId));
 
-        UUID event = UUID.randomUUID();
-        insertEvent(event, UUID.randomUUID().toString());
-        reject("23503", () -> execute("UPDATE inbox_events SET repository_id = 9999 WHERE id = ?", event));
 
         UUID audit = UUID.randomUUID();
         insertAudit(audit);
@@ -144,7 +159,13 @@ class DatabaseIntegrationTest {
     void generalCommentsAndThreadResolutionRemainSeparateFromVerifiedFixes() throws SQLException {
         UUID general = insertFinding("ISSUE_COMMENT", null);
         UUID second = insertFinding("ISSUE_COMMENT", null);
-        execute("UPDATE findings SET source_id = (SELECT source_id FROM findings WHERE id = ?) WHERE id = ?", general, second);
+        reject("23505", () -> execute(
+                "UPDATE findings SET source_id = (SELECT source_id FROM findings WHERE id = ?) WHERE id = ?", general, second));
+        execute("""
+                UPDATE findings SET source_id = (SELECT source_id FROM findings WHERE id = ?), source_ordinal = 1
+                WHERE id = ?
+                """, general, second);
+        reject("23514", () -> execute("UPDATE findings SET disposition_actor = 'fixture-reviewer' WHERE id = ?", general));
         execute("UPDATE findings SET status = 'ACKNOWLEDGED' WHERE id = ?", second);
         assertEquals(1, count("SELECT count(*) FROM findings WHERE id = ? AND status = 'OPEN'", general));
         reject("23514", () -> execute("UPDATE findings SET thread_resolved = true WHERE id = ?", general));
@@ -159,11 +180,18 @@ class DatabaseIntegrationTest {
                 UPDATE findings SET status = 'VERIFIED_FIXED', disposition_actor = 'fixture-reviewer',
                     disposition_reason = 'Rechecked changed code' WHERE id = ?
                 """, inline));
-        execute("""
+        String verify = """
                 UPDATE findings SET status = 'VERIFIED_FIXED', evidence_sha = ?, verified_at = now(),
                     disposition_actor = 'fixture-reviewer', disposition_reason = 'Rechecked changed code' WHERE id = ?
-                """, NEXT_HEAD, inline);
+                """;
+        reject("23514", () -> execute(verify, HEAD, inline));
+        execute(verify, NEXT_HEAD, inline);
         assertEquals(1, count("SELECT count(*) FROM findings WHERE status = 'VERIFIED_FIXED'"));
+        reject("23514", () -> execute("UPDATE findings SET status = 'OPEN' WHERE id = ?", inline));
+        execute("""
+                UPDATE findings SET status = 'OPEN', evidence_sha = NULL, verified_at = NULL,
+                    disposition_actor = NULL, disposition_reason = NULL WHERE id = ?
+                """, inline);
     }
 
     @Test
@@ -182,7 +210,41 @@ class DatabaseIntegrationTest {
     }
 
     @Test
-    void installationLevelEventsAndAuditDoNotRequireRepository() throws SQLException {
+    void processingRequiresLeaseAndTerminalStatusRequiresTimestamp() throws SQLException {
+        UUID event = UUID.randomUUID();
+        insertEvent(event, UUID.randomUUID().toString());
+        reject("23514", () -> execute("UPDATE inbox_events SET status = 'PROCESSING' WHERE id = ?", event));
+        execute("""
+                UPDATE inbox_events SET status = 'PROCESSING', attempts = 1, locked_by = 'fixture-worker',
+                    locked_until = now() + interval '1 minute' WHERE id = ?
+                """, event);
+        assertEquals(1, count("SELECT count(*) FROM inbox_events WHERE status = 'PROCESSING' AND locked_until < now() + interval '2 minutes'"));
+        reject("23514", () -> execute("UPDATE inbox_events SET status = 'PROCESSED' WHERE id = ?", event));
+        reject("23514", () -> execute("UPDATE inbox_events SET processed_at = now() WHERE id = ?", event));
+        execute("UPDATE inbox_events SET status = 'PROCESSED', processed_at = now() WHERE id = ?", event);
+
+        UUID command = UUID.randomUUID();
+        insertCommand(command, "leased-command", HEAD);
+        reject("23514", () -> execute("UPDATE outbox_commands SET status = 'PROCESSING' WHERE id = ?", command));
+        reject("23514", () -> execute("UPDATE outbox_commands SET status = 'SUCCEEDED' WHERE id = ?", command));
+        execute("UPDATE outbox_commands SET status = 'SUCCEEDED', completed_at = now() WHERE id = ?", command);
+    }
+
+    @Test
+    void updatedAtIsMaintainedByTrigger() throws SQLException {
+        String stale = "2000-01-01T00:00:00Z";
+        execute("UPDATE installations SET updated_at = ?::timestamptz WHERE installation_id = 101", stale);
+        execute("UPDATE review_cycles SET updated_at = ?::timestamptz WHERE id = ?", stale, cycleId);
+        UUID finding = insertFinding("ISSUE_COMMENT", null);
+        execute("UPDATE findings SET updated_at = ?::timestamptz WHERE id = ?", stale, finding);
+        // The trigger overrides even explicit values, so every UPDATE path refreshes updated_at.
+        assertEquals(0, count("SELECT count(*) FROM installations WHERE installation_id = 101 AND updated_at <= ?::timestamptz", stale));
+        assertEquals(0, count("SELECT count(*) FROM review_cycles WHERE id = ? AND updated_at <= ?::timestamptz", cycleId, stale));
+        assertEquals(0, count("SELECT count(*) FROM findings WHERE id = ? AND updated_at <= ?::timestamptz", finding, stale));
+    }
+
+    @Test
+    void inboxRecordsUnknownOrInstallationLevelEventsAndAuditNeedsNoRepository() throws SQLException {
         execute("""
                 INSERT INTO inbox_events (id, delivery_id, event_type, installation_id, payload_sha256, correlation_id, verified_at)
                 VALUES (?, ?, 'installation', 101, ?, ?, now())
@@ -191,7 +253,14 @@ class DatabaseIntegrationTest {
                 INSERT INTO audit_entries (id, installation_id, correlation_id, actor, action, outcome)
                 VALUES (?, 101, ?, 'fixture-operator', 'INSTALLATION_SUSPENDED', 'RECORDED')
                 """, UUID.randomUUID(), UUID.randomUUID());
+        // Verified deliveries are recorded before membership exists (e.g. installation.created, out-of-order events).
+        execute("""
+                INSERT INTO inbox_events (id, delivery_id, event_type, installation_id, repository_id, payload_sha256,
+                    correlation_id, verified_at)
+                VALUES (?, ?, 'pull_request', 303, 9999, ?, ?, now())
+                """, UUID.randomUUID(), UUID.randomUUID().toString(), "c".repeat(64), UUID.randomUUID());
         assertEquals(1, count("SELECT count(*) FROM inbox_events WHERE repository_id IS NULL"));
+        assertEquals(1, count("SELECT count(*) FROM inbox_events WHERE installation_id = 303"));
         assertEquals(1, count("SELECT count(*) FROM audit_entries WHERE repository_id IS NULL"));
     }
 

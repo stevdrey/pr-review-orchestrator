@@ -2,7 +2,7 @@ name: pr-review-orchestrator
 
 services:
   postgres:
-    # PostgreSQL 17.11; keep this digest in sync with the integration test.
+    # PostgreSQL 17.11. Single source: the Gradle test task passes this image to the integration tests.
     image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     environment:
       POSTGRES_DB: ${DB_NAME:-pr_review_orchestrator}
