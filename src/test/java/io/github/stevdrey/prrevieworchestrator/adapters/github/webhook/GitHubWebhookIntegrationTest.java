@@ -275,6 +275,77 @@ class GitHubWebhookIntegrationTest {
     }
 
     @Test
+    void reviewThreadNodeIdsAreAcceptedForBothActionsWithoutNumericIds() throws Exception {
+        // Routing fields from Octokit's resolved/unresolved schemas: node_id + comments, no thread.id.
+        // https://github.com/octokit/webhooks/tree/main/payload-schemas/api.github.com/pull_request_review_thread
+        for (String action : new String[] {"resolved", "unresolved"}) {
+            byte[] body = relatedPullRequest(action, "\"thread\":{\"node_id\":\"PRRT_fixture\",\"comments\":[]}");
+            String id = UUID.randomUUID().toString();
+            var response = send("pull_request_review_thread", id, body);
+            assertEquals(202, response.statusCode(), response.body());
+            var row = jdbc.queryForMap("SELECT * FROM inbox_events WHERE delivery_id = ?", id);
+            assertEquals("pull_request_review_thread", row.get("event_type"));
+            assertEquals(action, row.get("event_action"));
+            assertEquals(7, row.get("pr_number"));
+            assertEquals(HEAD, row.get("head_sha"));
+            assertEquals(200, send("pull_request_review_thread", id, body).statusCode());
+        }
+        assertEquals(2, count("inbox_events"));
+        assertEquals(0, count("findings"));
+    }
+
+    @Test
+    void missingNonStringOrBlankThreadNodeIdsNeverQueue() throws Exception {
+        for (String metadata : new String[] {
+                "\"thread\":{\"id\":3,\"comments\":[]}",
+                "\"thread\":{\"node_id\":null,\"comments\":[]}",
+                "\"thread\":{\"node_id\":3,\"comments\":[]}",
+                "\"thread\":{\"node_id\":\"\",\"comments\":[]}",
+                "\"thread\":{\"node_id\":\"   \",\"comments\":[]}"}) {
+            assertEquals(400, send("pull_request_review_thread", UUID.randomUUID().toString(),
+                    relatedPullRequest("resolved", metadata)).statusCode(), metadata);
+        }
+        assertEquals(0, count("inbox_events"));
+    }
+
+    @Test
+    void editedReviewOrCommentCannotBeRelabeledAsPullRequestThroughUnsignedHeader() throws Exception {
+        for (String type : new String[] {"pull_request_review", "pull_request_review_comment"}) {
+            String metadata = type.equals("pull_request_review") ? "\"review\":{\"id\":1}" : "\"comment\":{\"id\":2}";
+            byte[] body = relatedPullRequest("edited", metadata);
+            String id = UUID.randomUUID().toString();
+            // HMAC covers the shared action/PR fields, but not the event header. Reviews lack a root PR number.
+            assertEquals(400, send("pull_request", id, body).statusCode());
+            assertEquals(202, send(type, id, body).statusCode());
+        }
+        byte[] mismatched = new String(pullRequest("edited", HEAD), StandardCharsets.UTF_8)
+                .replace("\"number\":7,\"installation\"", "\"number\":8,\"installation\"").getBytes(StandardCharsets.UTF_8);
+        assertEquals(400, send("pull_request", UUID.randomUUID().toString(), mismatched).statusCode());
+        assertEquals(2, count("inbox_events"));
+    }
+
+    @Test
+    void deferredCommitWorkCannotOutliveTheConfiguredDatabaseTransactionBudget() throws Exception {
+        jdbc.execute("""
+                CREATE FUNCTION delay_fixture_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN PERFORM pg_sleep(4); RETURN NEW; END; $$
+                """);
+        jdbc.execute("""
+                CREATE CONSTRAINT TRIGGER delay_fixture_commit AFTER INSERT ON inbox_events
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION delay_fixture_commit()
+                """);
+        try {
+            var response = send("pull_request", UUID.randomUUID().toString(), pullRequest("opened", HEAD));
+            assertEquals(503, response.statusCode(), response.body());
+            assertThat(response.headers().firstValue("X-Correlation-ID")).isEmpty();
+            assertEquals(0, count("inbox_events"));
+        } finally {
+            jdbc.execute("DROP TRIGGER delay_fixture_commit ON inbox_events");
+            jdbc.execute("DROP FUNCTION delay_fixture_commit()");
+        }
+    }
+
+    @Test
     void eventRoutesPreserveDistinctReviewCommentThreadAndCiMetadata() throws Exception {
         String common = "\"installation\":{\"id\":101},\"repository\":{\"id\":1001}";
         String pull = "\"pull_request\":{\"number\":7,\"head\":{\"sha\":\"" + HEAD + "\"}}";
@@ -285,7 +356,7 @@ class GitHubWebhookIntegrationTest {
             switch (type) {
                 case "pull_request_review" -> { action = "submitted"; metadata = pull + ",\"review\":{\"id\":1}"; }
                 case "pull_request_review_comment" -> { action = "created"; metadata = pull + ",\"comment\":{\"id\":2}"; }
-                case "pull_request_review_thread" -> { action = "resolved"; metadata = pull + ",\"thread\":{\"id\":3}"; }
+                case "pull_request_review_thread" -> { action = "resolved"; metadata = pull + ",\"thread\":{\"node_id\":\"PRRT_fixture\",\"comments\":[]}"; }
                 case "issue_comment" -> { action = "created"; metadata = "\"issue\":{\"number\":7,\"pull_request\":{}},\"comment\":{\"id\":4}"; }
                 default -> { action = "completed"; metadata = "\"" + type + "\":{\"id\":5,\"head_sha\":\"" + HEAD + "\"}"; }
             }
@@ -327,8 +398,14 @@ class GitHubWebhookIntegrationTest {
                 : HttpRequest.BodyPublishers.ofByteArray(body));
     }
 
-    private static byte[] pullRequest(String action, String head) {
+    private static byte[] relatedPullRequest(String action, String metadata) {
         return ("{\"action\":\"" + action + "\",\"installation\":{\"id\":101},\"repository\":{\"id\":1001},"
+                + "\"pull_request\":{\"number\":7,\"head\":{\"sha\":\"" + HEAD + "\"}}," + metadata + "}")
+                .getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] pullRequest(String action, String head) {
+        return ("{\"action\":\"" + action + "\",\"number\":7,\"installation\":{\"id\":101},\"repository\":{\"id\":1001},"
                 + "\"pull_request\":{\"number\":7,\"head\":{\"sha\":\"" + head + "\"},\"title\":\"café 🌎\"}}")
                 .getBytes(StandardCharsets.UTF_8);
     }

@@ -23,6 +23,9 @@ public class JdbcDeliveryInbox implements DeliveryInbox {
     @Override
     public Receipt accept(VerifiedDelivery event) {
         return transactions.execute(status -> {
+            // JDBC and PostgreSQL statement timeouts do not cover deferred COMMIT work.
+            // PostgreSQL 17's transaction timeout covers it and resets at transaction end.
+            jdbc.execute("SET LOCAL transaction_timeout = '3s'");
             int inserted = jdbc.update("""
                     INSERT INTO inbox_events (id, delivery_id, event_type, event_action, installation_id,
                         repository_id, pr_number, head_sha, payload_sha256, correlation_id, verified_at)

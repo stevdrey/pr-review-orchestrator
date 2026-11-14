@@ -5,6 +5,10 @@ spring:
     password: ${DB_PASSWORD}
     hikari:
       connection-timeout: 2000
+      data-source-properties:
+        connectTimeout: 2
+        socketTimeout: 3
+        cancelSignalTimeout: 1
   jdbc:
     template:
       query-timeout: 2s

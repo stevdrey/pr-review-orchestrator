@@ -56,9 +56,15 @@ final class GitHubWebhookPayload {
             pr = number(pull.path("number"));
             sha = sha(pull.path("head").path("sha"));
             switch (type) {
+                // The event header is unsigned. Unlike review/comment payloads, PR events also
+                // carry a root number; require it to agree before accepting this route.
+                case "pull_request" -> require(number(root.path("number")) == pr);
                 case "pull_request_review" -> positiveId(root.path("review").path("id"));
                 case "pull_request_review_comment" -> positiveId(root.path("comment").path("id"));
-                case "pull_request_review_thread" -> positiveId(root.path("thread").path("id"));
+                case "pull_request_review_thread" -> {
+                    JsonNode nodeId = root.path("thread").path("node_id");
+                    require(nodeId.isString() && !nodeId.asText().isBlank());
+                }
                 default -> { }
             }
         } else if (type.equals("issue_comment")) {

@@ -25,18 +25,18 @@ Equivalent enablement variables are `ORCHESTRATOR_GITHUB_WEBHOOK_ENABLED=true` a
 
 Configure the App webhook URL to the HTTPS ingress URL and select JSON. Terminate TLS at a trusted proxy; set connection/body-read timeouts, request/rate/concurrency limits and the same body cap there. The application caps both declared and streamed bodies, including chunked uploads. JSON media type must be `application/json`, with UTF-8 if a charset is specified; compressed bodies are rejected. Do not configure proxy/request tracing to log bodies or signature headers.
 
-The local default body cap is 1 MiB, deliberately below GitHub's maximum; increase it within the configured bound if required by observed deliveries. PostgreSQL pool acquisition is bounded to 2 seconds, ordinary JDBC statements to 2 seconds, and inbox transactions to 3 seconds. These controls leave room for acknowledgements within GitHub's recommended 10-second response window under normal load; they are not a load-tested end-to-end latency guarantee.
+The local default body cap is 1 MiB, deliberately below GitHub's maximum; increase it within the configured bound if required by observed deliveries. Pool acquisition and JDBC connection establishment default to 2 seconds, ordinary JDBC statements to 2 seconds, socket reads to 3 seconds and cancel connections to 1 second. Inbox uses a 3-second Spring transaction timeout plus PostgreSQL 17's transaction-local `transaction_timeout=3s`, which also covers deferred pre-commit work. A driver socket timeout bounds waiting for the commit response; its outcome can be ambiguous and safe redelivery must use deduplication. These driver defaults also apply to startup/migration connections; deployment configuration may override them, and pgJDBC URL parameters take precedence over datasource properties. These controls leave room for acknowledgements within GitHub's recommended 10-second response window under normal load; they are not a load-tested end-to-end latency guarantee.
 
 ## Routes and stored evidence
 
-All routes require one UUID `X-GitHub-Delivery`, one `X-GitHub-Event` and one valid `X-Hub-Signature-256`. HMAC-SHA256 uses exact raw bytes and constant-time digest comparison **before JSON parsing**. Duplicate JSON fields and trailing JSON values are rejected. Repository events require positive integral installation/repository IDs, and the configured pair must have an ACTIVE installation and enabled membership in PostgreSQL.
+All routes require one UUID `X-GitHub-Delivery`, one `X-GitHub-Event` and one valid `X-Hub-Signature-256`. HMAC-SHA256 uses exact raw bytes and constant-time digest comparison **before JSON parsing**. Duplicate JSON fields and trailing JSON values are rejected. The `pull_request` route requires its root `number` to match `pull_request.number`, distinguishing it from edited review/comment payloads even if an unsigned event header is changed. Repository events require positive integral installation/repository IDs, and the configured pair must have an ACTIVE installation and enabled membership in PostgreSQL.
 
 | Event | Accepted actions | Additional routing evidence |
 | --- | --- | --- |
-| `pull_request` | opened, ready_for_review, synchronize, reopened, closed, edited, converted_to_draft | PR number and observed head SHA |
+| `pull_request` | opened, ready_for_review, synchronize, reopened, closed, edited, converted_to_draft | Matching root/nested PR numbers and observed head SHA |
 | `pull_request_review` | submitted, edited, dismissed | PR number/head SHA; valid review ID required |
 | `pull_request_review_comment` | created, edited, deleted | PR number/head SHA; valid comment ID required |
-| `pull_request_review_thread` | resolved, unresolved | PR number/head SHA; valid thread ID required |
+| `pull_request_review_thread` | resolved, unresolved | PR number/head SHA; nonblank string `thread.node_id` required (not numeric `thread.id`) |
 | `issue_comment` | created, edited, deleted | PR-linked issue number and valid comment ID; head SHA remains unknown |
 | `check_run` | created, completed, rerequested, requested_action | Check ID required; observed head SHA |
 | `check_suite` | completed, requested, rerequested | Suite ID required; observed head SHA |
@@ -78,11 +78,11 @@ V2 is additive; back up before migration. Prefer disabling ingress or rolling ba
 
 ## Verification
 
-- `./gradlew test --tests '*GitHubWebhook*'`: generated/local fixture secrets, HTTP against a real Spring Boot server and disposable PostgreSQL, raw UTF-8 tampering, malformed signatures/JSON/metadata, strict media types, declared/chunked size limits, missing/disabled/suspended/revoked/crossed membership, unavailable authority, missing rotated secret, explicit route coverage, exact/renamed replay, concurrent duplicate delivery, restart persistence, out-of-order SHAs and deferred commit failure with no successful acknowledgement.
+- `./gradlew test --tests '*GitHubWebhook*'`: generated/local fixture secrets, HTTP against a real Spring Boot server and disposable PostgreSQL, raw UTF-8 tampering, malformed signatures/JSON/metadata, strict media types, declared/chunked size limits, missing/disabled/suspended/revoked/crossed membership, unavailable authority, missing rotated secret, explicit route coverage (including both thread actions using `node_id` and rejection of relabeled review/comment events), exact/renamed replay, concurrent duplicate delivery, restart persistence, out-of-order SHAs and deferred commit failure/timeout with no successful acknowledgement.
 - `./gradlew clean build`: also verifies existing credentials/authorization/schema behavior, V1→V2 upgrade preserving legacy evidence, migration checksums and second-startup no-op behavior.
 
-Local evidence (2026-11-13): `./gradlew clean build --console=plain` passed with **58 tests, 0 failures/errors and 0 skipped**, including 16 webhook tests. `docker compose --env-file .env.example config --quiet` and `git diff --check` also passed.
+Local evidence after PR #46 review fixes (2026-11-14): `./gradlew clean build --console=plain` passed with **62 tests, 0 failures/errors and 0 skipped**, including 20 webhook tests. `docker compose --env-file .env.example config --quiet` and `git diff --check` also passed.
 
 Fixtures are synthetic and sanitized. Local tests do not prove live GitHub delivery, production latency, proxy/TLS setup, production retention, worker retries or review orchestration.
 
-Protocol references: [GitHub signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [event payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks).
+Protocol references: [PostgreSQL transaction timeouts](https://www.postgresql.org/docs/17/runtime-config-client.html#GUC-TRANSACTION-TIMEOUT), [pgJDBC timeout parameters](https://jdbc.postgresql.org/documentation/use/#connection-parameters), [GitHub signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [event payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks).
