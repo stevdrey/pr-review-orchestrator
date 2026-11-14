@@ -4,7 +4,9 @@
 
 `./gradlew clean build` runs `DatabaseIntegrationTest` against disposable PostgreSQL 17.11 using Testcontainers. It covers Spring Boot migration from an empty database (single V1 history row, no baseline), checksum validation and a no-op second application startup against the migrated database, disabled clean, application/database health, duplicate delivery/command/cycle keys, installation/repository/SHA references, finding idempotency keys, comment/thread distinctions, explicit fix evidence distinct from the reviewed SHA, retry bounds, processing leases and terminal timestamps, trigger-maintained `updated_at`, inbox recording of installation-level and not-yet-known installation/repository events and transactional rollback of event/command/audit writes. Missing Docker is a failure, not a skipped test. Tests read the pinned image digest from `compose.yaml`.
 
-This verifies schema constraints and startup wiring, not a production inbox worker, webhook authorization, runtime budget enforcement or a complete review lifecycle. The remaining strategy below is planned.
+Issue #11 adds `RepositoryAuthorizationTest`, `GitHubAppConfigurationTest` and `GitHubCredentialsTest` for paired allowlists, live denial/unavailable authority, default-disabled startup, RS256 JWT signatures/lifetime, per-operation repository-scoped tokens, atomic key replacement, redacted failures, redirect/API/network errors, malformed/expired/over-scoped credentials and revocation during token exchange. `DatabaseIntegrationTest` also exercises the JDBC authorization adapter across enabled/disabled and ACTIVE/SUSPENDED/REVOKED states. The focused command is `./gradlew test --tests '*GitHub*' --tests '*RepositoryAuthorization*'`; it uses local HTTP fixtures and generated keys, without GitHub credentials or Docker.
+
+These tests verify schema, startup wiring and local authorization/credential boundaries, not live App registration/installation, remote revocation, user OAuth, webhook authorization, a production inbox worker, runtime budget enforcement or a complete review lifecycle. The remaining strategy below is planned.
 
 ## Contract tests
 

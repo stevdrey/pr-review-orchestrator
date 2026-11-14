@@ -1,6 +1,6 @@
 # Roadmap
 
-**Status:** Initial implementation. The Java service bootstrap and PostgreSQL/Flyway schema are present, with a local Compose database and integration tests. Webhook ingestion and dispatch remain planned. Issue trackers are the source of truth for implementation.
+**Status:** Initial implementation. The Java service bootstrap, PostgreSQL/Flyway schema and opt-in GitHub App authentication/installation authorization are present, with a local Compose database and integration tests. [App registration and rotation](github/app-setup.md) have an operator runbook; live registration/installation is not certified by the local implementation. Webhook ingestion and dispatch remain planned. Issue trackers are the source of truth for implementation.
 
 ## Milestones
 

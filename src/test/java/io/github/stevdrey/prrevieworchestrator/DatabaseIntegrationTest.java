@@ -5,6 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.jayway.jsonpath.JsonPath;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcInstallationAuthorization;
+import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -13,6 +16,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
@@ -26,6 +30,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -84,6 +90,28 @@ class DatabaseIntegrationTest {
                 connection.close();
             }
         }
+    }
+
+    @Test
+    void authorizationRequiresAllowlistActiveInstallationAndEnabledRepository() throws SQLException {
+        // Share this test's uncommitted connection; fixtures still roll back after every test.
+        var authority = new JdbcInstallationAuthorization(new JdbcTemplate(new SingleConnectionDataSource(connection, true)));
+        var scope = new RepositoryScope(101, 1001);
+        var authorization = new RepositoryAuthorization(Set.of(scope, new RepositoryScope(101, 3003)), authority);
+        assertThrows(SecurityException.class, () -> authorization.requireAuthorized(scope));
+        execute("UPDATE installation_repositories SET enabled = true WHERE installation_id = 101 AND repository_id = 1001");
+        authorization.requireAuthorized(scope);
+        // A row for the repository in another installation is never sufficient.
+        assertThrows(SecurityException.class, () -> authorization.requireAuthorized(new RepositoryScope(202, 1001)));
+        assertThrows(SecurityException.class, () -> authorization.requireAuthorized(new RepositoryScope(101, 3003)));
+        for (String status : new String[] {"SUSPENDED", "REVOKED"}) {
+            execute("UPDATE installations SET status = ? WHERE installation_id = 101", status);
+            assertThrows(SecurityException.class, () -> authorization.requireAuthorized(scope));
+        }
+        execute("UPDATE installations SET status = 'ACTIVE' WHERE installation_id = 101");
+        authorization.requireAuthorized(scope);
+        execute("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101 AND repository_id = 1001");
+        assertThrows(SecurityException.class, () -> authorization.requireAuthorized(scope));
     }
 
     @Test

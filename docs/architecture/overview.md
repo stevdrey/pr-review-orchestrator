@@ -1,6 +1,6 @@
 # Architecture overview
 
-**Target architecture:** the application bootstrap and [PostgreSQL/Flyway schema](../development/database.md) exist. The orchestration components below are not yet implemented.
+**Target architecture:** the application bootstrap, [PostgreSQL/Flyway schema](../development/database.md), paired installation/repository authorization gate and opt-in [GitHub App authentication](../github/app-setup.md) exist. The event ingestion, orchestration and dispatch components below are not yet implemented.
 
 ## Context
 
