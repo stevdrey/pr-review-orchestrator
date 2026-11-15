@@ -145,7 +145,8 @@ class GitHubWebhookIntegrationTest {
                     GitHubWebhookSecurityTest.sign(SECRET, oversized), "application/json", chunked)).statusCode());
         }
         byte[] body = pullRequest("opened", HEAD);
-        for (String media : new String[] {"text/plain", "application/*", "application/json; charset=UTF-16"}) {
+        for (String media : new String[] {"text/plain", "application/*", "application/json; charset=UTF-16",
+                "application/json; charset=bogus", ";;"}) {
             assertEquals(415, send(request(port, "pull_request", UUID.randomUUID().toString(), body,
                     GitHubWebhookSecurityTest.sign(SECRET, body), media, false)).statusCode());
         }
@@ -371,10 +372,10 @@ class GitHubWebhookIntegrationTest {
     }
 
     @Test
-    void signedPingHasNoWorkAndUnsupportedTypesOrActionsCannotQueue() throws Exception {
+    void signedPingAndUnroutedEventsAreAcknowledgedWithoutQueueing() throws Exception {
         assertEquals(204, send("ping", UUID.randomUUID().toString(), "{\"hook_id\":123}".getBytes(StandardCharsets.UTF_8)).statusCode());
-        assertEquals(422, send("push", UUID.randomUUID().toString(), pullRequest("opened", HEAD)).statusCode());
-        assertEquals(422, send("pull_request", UUID.randomUUID().toString(), pullRequest("unknown_action", HEAD)).statusCode());
+        assertEquals(204, send("push", UUID.randomUUID().toString(), pullRequest("opened", HEAD)).statusCode());
+        assertEquals(204, send("pull_request", UUID.randomUUID().toString(), pullRequest("unknown_action", HEAD)).statusCode());
         assertEquals(0, count("inbox_events"));
     }
 

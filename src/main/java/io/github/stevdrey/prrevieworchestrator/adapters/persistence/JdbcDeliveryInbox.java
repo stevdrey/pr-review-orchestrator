@@ -4,6 +4,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.VerifiedDelivery;
 import io.github.stevdrey.prrevieworchestrator.ports.DeliveryInbox;
 import java.sql.Timestamp;
 import java.util.UUID;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -21,11 +22,26 @@ public class JdbcDeliveryInbox implements DeliveryInbox {
     }
 
     @Override
-    public Receipt accept(VerifiedDelivery event) {
+    public void requireCapabilities() {
+        // PostgreSQL 17 introduced transaction_timeout; fail startup rather than every delivery.
+        String setting = jdbc.queryForObject("SELECT current_setting('transaction_timeout', true)", String.class);
+        if (setting == null) {
+            throw new IllegalStateException("PostgreSQL 17+ transaction_timeout is required for webhook ingress");
+        }
+    }
+
+    @Override
+    public Receipt accept(VerifiedDelivery event, Runnable precondition) {
         return transactions.execute(status -> {
             // JDBC and PostgreSQL statement timeouts do not cover deferred COMMIT work.
             // PostgreSQL 17's transaction timeout covers it and resets at transaction end.
             jdbc.execute("SET LOCAL transaction_timeout = '3s'");
+            // Bound waiting for the commit response on this connection only; Hikari resets it on return.
+            jdbc.execute((ConnectionCallback<Void>) connection -> {
+                connection.setNetworkTimeout(Runnable::run, 3_000);
+                return null;
+            });
+            precondition.run();
             int inserted = jdbc.update("""
                     INSERT INTO inbox_events (id, delivery_id, event_type, event_action, installation_id,
                         repository_id, pr_number, head_sha, payload_sha256, correlation_id, verified_at)

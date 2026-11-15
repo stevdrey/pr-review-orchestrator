@@ -6,11 +6,13 @@ import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.regex.Pattern;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /** Reload mounted secrets per delivery, permitting atomic replacement without keeping old keys cached. */
 public final class GitHubWebhookSignature {
+    private static final Pattern SIGNATURE = Pattern.compile("sha256=[0-9a-fA-F]{64}");
     private final Path current;
     private final Path previous;
 
@@ -24,7 +26,7 @@ public final class GitHubWebhookSignature {
     }
 
     public boolean verify(String signature, byte[] body) {
-        if (signature == null || !signature.matches("sha256=[0-9a-fA-F]{64}")) {
+        if (signature == null || !SIGNATURE.matcher(signature).matches()) {
             return false;
         }
         byte[] supplied = HexFormat.of().parseHex(signature.substring(7));
@@ -37,7 +39,7 @@ public final class GitHubWebhookSignature {
 
     private static byte[] readSecret(Path path) {
         if (path == null) {
-            throw new IllegalStateException("A readable mounted webhook secret of 32 to 4096 bytes is required");
+            throw new WebhookUnavailableException("A readable mounted webhook secret of 32 to 4096 bytes is required");
         }
         try (var input = Files.newInputStream(path)) {
             byte[] secret = input.readNBytes(4097);
@@ -46,7 +48,7 @@ public final class GitHubWebhookSignature {
             }
             return secret;
         } catch (IOException | SecurityException ignored) {
-            throw new IllegalStateException("A readable mounted webhook secret of 32 to 4096 bytes is required");
+            throw new WebhookUnavailableException("A readable mounted webhook secret of 32 to 4096 bytes is required");
         }
     }
 
@@ -56,7 +58,7 @@ public final class GitHubWebhookSignature {
             mac.init(new SecretKeySpec(secret, "HmacSHA256"));
             return mac.doFinal(body);
         } catch (GeneralSecurityException ignored) {
-            throw new IllegalStateException("Webhook signature service unavailable");
+            throw new WebhookUnavailableException("Webhook signature service unavailable");
         }
     }
 }

@@ -69,7 +69,10 @@ class GitHubWebhookSecurityTest {
         var runner = new ApplicationContextRunner().withUserConfiguration(GitHubWebhookConfiguration.class,
                         GitHubWebhookController.class)
                 .withBean(RepositoryAuthorization.class, () -> new RepositoryAuthorization(Set.of(), scope -> false))
-                .withBean(DeliveryInbox.class, () -> delivery -> new DeliveryInbox.Receipt(false, delivery.correlationId()));
+                .withBean(DeliveryInbox.class, () -> (delivery, precondition) -> {
+                    precondition.run();
+                    return new DeliveryInbox.Receipt(false, delivery.correlationId());
+                });
         runner.run(context -> assertThat(context).hasNotFailed()
                 .doesNotHaveBean(GitHubWebhookController.class).doesNotHaveBean(GitHubWebhookSignature.class));
         runner.withPropertyValues("orchestrator.github.webhook.enabled=true")

@@ -30,7 +30,7 @@ Issue #12 provides raw-body HMAC verification, payload limits, delivery deduplic
 
 | Events | Required permission | Intended use |
 | --- | --- | --- |
-| `installation`, `installation_repositories` | Installation lifecycle events | Future control path; currently rejected by ingress. Maintain local membership manually; never auto-approve new membership |
+| `installation`, `installation_repositories` | Installation lifecycle events | Future control path; currently acknowledged with 204 and not queued by ingress. Maintain local membership manually; never auto-approve new membership |
 | `pull_request` | Pull requests read | Open, ready, synchronize, reopen and close transitions |
 | `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread` | Pull requests read | Review evidence and thread state, without treating resolution as proof of a fix |
 | `issue_comment` | Issues read | General PR comments, including edits/deletions; filter out ordinary issues |

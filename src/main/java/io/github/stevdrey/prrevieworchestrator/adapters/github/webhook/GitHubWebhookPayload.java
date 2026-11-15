@@ -4,11 +4,12 @@ import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.domain.VerifiedDelivery;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.time.Instant;
+import java.time.Clock;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
@@ -16,6 +17,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 /** Explicit metadata routes, without interpretation of comment text, conclusions or review verdicts. */
 final class GitHubWebhookPayload {
+    private static final Pattern SHA = Pattern.compile("[0-9a-f]{40}|[0-9a-f]{64}");
     private static final JsonMapper JSON = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
@@ -39,7 +41,7 @@ final class GitHubWebhookPayload {
         }
     }
 
-    static VerifiedDelivery route(String type, String deliveryId, JsonNode root, byte[] body) {
+    static VerifiedDelivery route(String type, String deliveryId, JsonNode root, byte[] body, Clock clock) {
         if (!ACTIONS.containsKey(type)) {
             throw new UnsupportedEvent();
         }
@@ -80,7 +82,7 @@ final class GitHubWebhookPayload {
             sha = sha(check.path("head_sha"));
         }
         return new VerifiedDelivery(UUID.randomUUID(), deliveryId, type, action, scope, pr, sha,
-                hash(body), UUID.randomUUID(), Instant.now());
+                hash(body), UUID.randomUUID(), clock.instant());
     }
 
     private static long positiveId(JsonNode node) {
@@ -95,7 +97,7 @@ final class GitHubWebhookPayload {
     }
 
     private static String sha(JsonNode node) {
-        require(node.isString() && node.asText().matches("([0-9a-f]{40}|[0-9a-f]{64})"));
+        require(node.isString() && SHA.matcher(node.asText()).matches());
         return node.asText();
     }
 
@@ -103,7 +105,7 @@ final class GitHubWebhookPayload {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
         } catch (NoSuchAlgorithmException failure) {
-            throw new IllegalStateException("Payload digest unavailable");
+            throw new WebhookUnavailableException("Payload digest unavailable");
         }
     }
 

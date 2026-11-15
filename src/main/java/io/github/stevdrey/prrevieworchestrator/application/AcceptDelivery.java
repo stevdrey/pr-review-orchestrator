@@ -13,8 +13,12 @@ public final class AcceptDelivery {
         this.inbox = inbox;
     }
 
+    public void requireCapabilities() {
+        inbox.requireCapabilities();
+    }
+
     public DeliveryInbox.Receipt accept(VerifiedDelivery delivery) {
-        authorization.requireAuthorized(delivery.scope());
-        return inbox.accept(delivery);
+        // Authorize inside the inbox transaction so a concurrent revocation cannot race the commit.
+        return inbox.accept(delivery, () -> authorization.requireAuthorized(delivery.scope()));
     }
 }

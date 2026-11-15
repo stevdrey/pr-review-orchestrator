@@ -25,7 +25,7 @@ Equivalent enablement variables are `ORCHESTRATOR_GITHUB_WEBHOOK_ENABLED=true` a
 
 Configure the App webhook URL to the HTTPS ingress URL and select JSON. Terminate TLS at a trusted proxy; set connection/body-read timeouts, request/rate/concurrency limits and the same body cap there. The application caps both declared and streamed bodies, including chunked uploads. JSON media type must be `application/json`, with UTF-8 if a charset is specified; compressed bodies are rejected. Do not configure proxy/request tracing to log bodies or signature headers.
 
-The local default body cap is 1 MiB, deliberately below GitHub's maximum; increase it within the configured bound if required by observed deliveries. Pool acquisition and JDBC connection establishment default to 2 seconds, ordinary JDBC statements to 2 seconds, socket reads to 3 seconds and cancel connections to 1 second. Inbox uses a 3-second Spring transaction timeout plus PostgreSQL 17's transaction-local `transaction_timeout=3s`, which also covers deferred pre-commit work. A driver socket timeout bounds waiting for the commit response; its outcome can be ambiguous and safe redelivery must use deduplication. These driver defaults also apply to startup/migration connections; deployment configuration may override them, and pgJDBC URL parameters take precedence over datasource properties. These controls leave room for acknowledgements within GitHub's recommended 10-second response window under normal load; they are not a load-tested end-to-end latency guarantee.
+The local default body cap is 1 MiB, deliberately below GitHub's maximum; increase it within the configured bound if required by observed deliveries. Pool acquisition and JDBC connection establishment default to 2 seconds and cancel connections to 1 second; no global socket-read or statement timeout is set, so Flyway migrations are not cut off. Repository authorization and the inbox write share one transaction and connection: a 3-second Spring transaction timeout bounds its statements, PostgreSQL 17's transaction-local `transaction_timeout=3s` also covers deferred pre-commit work, and a connection-scoped 3-second network timeout (reset when the connection returns to the pool) bounds waiting for the commit response. That outcome can be ambiguous, and safe redelivery must use deduplication. When ingress is enabled, startup fails unless the database supports `transaction_timeout` (PostgreSQL 17+). Deployment configuration may override the driver defaults, and pgJDBC URL parameters take precedence over datasource properties. These controls leave room for acknowledgements within GitHub's recommended 10-second response window under normal load; they are not a load-tested end-to-end latency guarantee.
 
 ## Routes and stored evidence
 
@@ -45,7 +45,7 @@ All routes require one UUID `X-GitHub-Delivery`, one `X-GitHub-Event` and one va
 
 Inbox rows preserve delivery ID, event type/action, installation/repository IDs, optional PR number/head SHA, payload SHA-256, server-generated correlation ID and verification time. They start `PENDING` with zero attempts. Raw bodies, titles, comments, signatures and secrets are neither persisted nor echoed. `payload_ref` remains null; detailed source IDs/text are not retained. A future worker must reconcile authoritative GitHub state rather than expect the original event body to be available. A resolved thread is just an observation, never proof of a fix. Out-of-order events retain their own observed SHA and do not overwrite review state.
 
-Installation lifecycle events, ordinary issue comments, push events and unlisted actions are rejected; there is no automatic enrollment, membership sync or revocation handler. Operators must maintain local installation status/membership using the App runbook. Future workers must reauthorize and reconcile current remote state/SHA before processing and before any side effect.
+Installation lifecycle events, ordinary issue comments, push events and unlisted actions are acknowledged with 204 and not queued; there is no automatic enrollment, membership sync or revocation handler. Operators must maintain local installation status/membership using the App runbook. Future workers must reauthorize and reconcile current remote state/SHA before processing and before any side effect.
 
 ## Responses and replay
 
@@ -53,14 +53,13 @@ Installation lifecycle events, ordinary issue comments, push events and unlisted
 | --- | --- |
 | 202 | New authorized observation committed durably; `X-Correlation-ID` identifies it |
 | 200 | Exact retry or replay of an already committed observation; original correlation ID, no new work |
-| 204 | Authenticated ping; no actionable work accepted |
+| 204 | Authenticated ping, unsupported event/action or an issue comment unrelated to a PR; no work accepted |
 | 400 | Missing/malformed/ambiguous headers, malformed JSON or invalid routing metadata |
 | 401 | Missing, malformed or invalid SHA-256 signature |
-| 403 | Repository authorization denied, including unavailable authorization authority |
+| 403 | Repository authorization denied, including unavailable authorization authority; membership rows are share-locked until the inbox commit |
 | 409 | Previously used delivery identity conflicts with stored event/scope/hash |
 | 413 | Declared or streamed body exceeds the configured limit |
 | 415 | Unsupported media type, charset or content encoding |
-| 422 | Unsupported event/action or an issue comment unrelated to a PR |
 | 503 | Secret, inbox write or transaction commit unavailable; no successful acceptance acknowledgement |
 
 PostgreSQL unique delivery IDs serialize retries across instances/restarts. V2 adds a partial unique index on installation/repository/raw-payload hash for new ingress rows, so a captured body replayed with a different delivery ID cannot create another observation. The fingerprint deliberately excludes the event header because GitHub's signature covers the body, not headers. Conflicting event headers fail with 409 if they pass route validation. Exact byte-identical observations in the same scope are therefore coalesced even under different delivery IDs; replay aliases are not stored as separate rows. Existing V1 rows keep null routing columns and retain their original evidence.
