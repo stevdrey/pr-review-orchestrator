@@ -60,16 +60,8 @@ public final class DurableDispatcher {
     }
 
     private void handle(Lease lease, RuntimeException failure) {
-        ErrorCode code = ErrorCode.INTERNAL_ERROR;
-        boolean retryable = true;
-        if (failure instanceof SecurityException) {
-            code = ErrorCode.AUTHORIZATION_DENIED;
-            retryable = false;
-        } else if (failure instanceof Failure known) {
-            code = known.code();
-            retryable = known.retryable();
-        }
-        if (queue.fail(lease, code, retryable)) report(lease, code.name());
+        Failure safe = Failure.sanitized(failure);
+        if (queue.fail(lease, safe.code(), safe.retryable())) report(lease, safe.code().name());
     }
 
     private static void report(Lease lease, String outcome) {

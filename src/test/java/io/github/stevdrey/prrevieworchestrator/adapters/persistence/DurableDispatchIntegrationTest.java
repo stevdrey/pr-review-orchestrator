@@ -17,8 +17,11 @@ import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.TransientDataAccessResourceException;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.testcontainers.junit.jupiter.Container;
@@ -222,6 +225,58 @@ class DurableDispatchIntegrationTest {
         assertEquals(0, gateway.reads.get());
         assertEquals(0, gateway.writes.get());
         assertEquals(1, count("outbox_commands", "status = 'DEAD' AND last_error_code = 'AUTHORIZATION_DENIED'"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true, 1", "true, 2", "false, 1", "false, 2"})
+    void authorizationOutageRetriesAndRecoversAfterRestart(boolean inbox, int failedCheck) {
+        UUID eventId = event(FIRST, HEAD);
+        if (!inbox) dispatcher().processEvent();
+        String table = inbox ? "inbox_events" : "outbox_commands";
+        UUID id = inbox ? eventId : jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        var checks = new AtomicInteger();
+        var liveMembership = new JdbcInstallationAuthorization(jdbc);
+        authorization = new RepositoryAuthorization(Set.of(FIRST), scope -> {
+            if (checks.incrementAndGet() == failedCheck) {
+                throw new TransientDataAccessResourceException("synthetic-secret-authority-diagnostics");
+            }
+            return liveMembership.isActiveAndEnabled(scope);
+        });
+
+        if (inbox) dispatcher().processEvent(); else dispatcher().processCommand();
+
+        assertEquals(0, gateway.writes.get(), "Uncertain authorization must block effects");
+        assertEquals("PENDING", status(table, id));
+        assertEquals(1, count(table, "attempts = 1 AND last_error_code = 'AUTHORIZATION_UNAVAILABLE'"));
+        assertEquals(1, count("queue_transitions", "outcome = 'RETRY' AND error_code = 'AUTHORIZATION_UNAVAILABLE'"));
+        assertTrue(liveMembership.isActiveAndEnabled(FIRST));
+        if (inbox) assertEquals(0, count("outbox_commands", "true"));
+
+        // Persisted retry state survives replacement of the queue/dispatcher after the authority recovers.
+        queue = newQueue();
+        ready(table);
+        if (inbox) dispatcher().processEvent();
+        dispatcher().processCommand();
+        assertEquals(inbox ? "PROCESSED" : "SUCCEEDED", status(table, id));
+        assertEquals(1, count(table, "attempts = 2"));
+        assertEquals(1, gateway.writes.get());
+    }
+
+    @Test
+    void persistentAuthorizationOutageStopsAtRetryCeilingWithoutPlanning() {
+        event(FIRST, HEAD);
+        authorization = new RepositoryAuthorization(Set.of(FIRST), scope -> {
+            throw new TransientDataAccessResourceException("synthetic-secret-authority-diagnostics");
+        });
+        var dispatcher = dispatcher(event -> { fail("Unavailable authority must block planning"); return List.of(); });
+        for (int i = 0; i < 5; i++) {
+            ready("inbox_events");
+            assertTrue(dispatcher.processEvent());
+        }
+        assertEquals(1, count("queue_dead_letters", "attempts = 5 AND last_error_code = 'AUTHORIZATION_UNAVAILABLE'"));
+        assertEquals(0, count("outbox_commands", "true"));
+        assertEquals(0, gateway.writes.get());
+        assertFalse(dispatcher.processEvent());
     }
 
     @Test

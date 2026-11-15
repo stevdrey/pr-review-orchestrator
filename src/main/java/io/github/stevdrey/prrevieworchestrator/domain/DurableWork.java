@@ -9,7 +9,7 @@ public final class DurableWork {
 
     public enum Queue { INBOX, OUTBOX }
     public enum ErrorCode {
-        INTERNAL_ERROR, AUTHORIZATION_DENIED, INVALID_EVENT, UNSUPPORTED_COMMAND,
+        INTERNAL_ERROR, AUTHORIZATION_DENIED, AUTHORIZATION_UNAVAILABLE, INVALID_EVENT, UNSUPPORTED_COMMAND,
         REMOTE_UNAVAILABLE, REMOTE_UNCERTAIN, LEASE_EXHAUSTED
     }
     public enum Outcome { SUCCEEDED, CANCELLED }
@@ -72,5 +72,13 @@ public final class DurableWork {
         }
         public ErrorCode code() { return code; }
         public boolean retryable() { return retryable; }
+
+        /** Copy only safe metadata, dropping causes/suppressed exceptions even from a known Failure. */
+        public static Failure sanitized(RuntimeException failure) {
+            if (failure instanceof Failure known) return new Failure(known.code(), known.retryable());
+            if (failure instanceof AuthorizationUnavailable) return new Failure(ErrorCode.AUTHORIZATION_UNAVAILABLE, true);
+            if (failure instanceof SecurityException) return new Failure(ErrorCode.AUTHORIZATION_DENIED, false);
+            return new Failure(ErrorCode.INTERNAL_ERROR, true);
+        }
     }
 }

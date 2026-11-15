@@ -30,13 +30,19 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     private <T> T transaction(Supplier<T> operation) {
         return transactions.execute(status -> {
-            jdbc.execute("SET LOCAL transaction_timeout = '10s'");
-            jdbc.execute("SET LOCAL statement_timeout = '9s'");
-            jdbc.execute((ConnectionCallback<Void>) connection -> {
-                connection.setNetworkTimeout(Runnable::run, 10_000);
-                return null;
-            });
-            return operation.get();
+            try {
+                jdbc.execute("SET LOCAL transaction_timeout = '10s'");
+                jdbc.execute("SET LOCAL statement_timeout = '9s'");
+                jdbc.execute((ConnectionCallback<Void>) connection -> {
+                    connection.setNetworkTimeout(Runnable::run, 10_000);
+                    return null;
+                });
+                return operation.get();
+            } catch (RuntimeException failure) {
+                // Spring may log the callback exception during rollback (including rollback failure).
+                // Normalize before handing control back to TransactionTemplate, without a raw cause.
+                throw Failure.sanitized(failure);
+            }
         });
     }
 
