@@ -211,6 +211,64 @@ class DurableDispatchIntegrationTest {
         assertEquals(0, count("review_cycles", "head_sha = '" + NEXT + "'"));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void uncertainEffectRemainsReconcilableUntilAppliedAfterHeadAdvance(boolean headAdvanced) {
+        event(FIRST, HEAD);
+        dispatcher().processEvent();
+        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        gateway.loseResponse = true;
+        dispatcher().processCommand();
+        assertEquals("PENDING", status("outbox_commands", command));
+        assertEquals(1, gateway.writes.get());
+
+        gateway.head = headAdvanced ? NEXT : HEAD;
+        gateway.unknown = true;
+        queue = newQueue();
+        ready("outbox_commands");
+        assertTrue(dispatcher().processCommand());
+
+        assertEquals("PENDING", status("outbox_commands", command));
+        assertEquals(1, count("outbox_commands", "attempts = 2 AND last_error_code = 'REMOTE_UNCERTAIN'"));
+        assertEquals(1, gateway.writes.get(), "Unsettled effects must be reconciled without another write");
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'RETRY' AND error_code = 'REMOTE_UNCERTAIN'", Integer.class, command));
+
+        gateway.unknown = false;
+        queue = newQueue();
+        ready("outbox_commands");
+        assertTrue(dispatcher().processCommand());
+        assertEquals("SUCCEEDED", status("outbox_commands", command));
+        assertEquals(1, gateway.writes.get());
+        assertEquals(1, count("outbox_commands", "attempts = 3 AND expected_head_sha = '" + HEAD + "' AND last_error_code IS NULL"));
+        assertEquals(INTENT.key(FIRST), jdbc.queryForObject("SELECT command_key FROM outbox_commands WHERE id = ?", String.class, command));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'SUCCEEDED'", Integer.class, command));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'CANCELLED'", Integer.class, command));
+        assertEquals(0, count("review_cycles", "head_sha = '" + NEXT + "'"));
+    }
+
+    @Test
+    void uncertainEffectOnStaleHeadDeadLettersWithUncertaintyAfterRetryCeiling() {
+        event(FIRST, HEAD);
+        dispatcher().processEvent();
+        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        gateway.loseResponse = true;
+        dispatcher().processCommand();
+        gateway.head = NEXT;
+        gateway.unknown = true;
+        for (int attempt = 2; attempt <= 5; attempt++) {
+            queue = newQueue();
+            ready("outbox_commands");
+            assertTrue(dispatcher().processCommand());
+            assertEquals(attempt == 5 ? "DEAD" : "PENDING", status("outbox_commands", command));
+            assertEquals("REMOTE_UNCERTAIN", jdbc.queryForObject("SELECT last_error_code FROM outbox_commands WHERE id = ?", String.class, command));
+            assertEquals(1, gateway.writes.get());
+        }
+        assertEquals(1, count("queue_dead_letters", "queue = 'OUTBOX' AND attempts = 5 AND last_error_code = 'REMOTE_UNCERTAIN' AND completed_at IS NOT NULL"));
+        assertEquals(INTENT.key(FIRST), jdbc.queryForObject("SELECT command_key FROM outbox_commands WHERE id = ?", String.class, command));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'CANCELLED'", Integer.class, command));
+        assertFalse(dispatcher().processCommand());
+    }
+
     @Test
     void crashAfterRemoteAcceptBeforeLocalCommitIsReconciled() {
         event(FIRST, HEAD);

@@ -21,11 +21,13 @@ The initial cycle uses iteration 1. Review-loop iteration, policy/budget reserva
 | Evidence | Dispatcher behavior |
 | --- | --- |
 | Effect already applied, including after the current head changes | `SUCCEEDED` for the original command/SHA; no repeated write |
-| Otherwise, current SHA differs from expected SHA | `CANCELLED`; no write |
+| Effect is unknown, ambiguous or not yet settled, for any current SHA | Retry reconciliation with `REMOTE_UNCERTAIN`; at the attempt ceiling, `DEAD` with that code; no write |
+| Effect is authoritatively absent and current SHA differs from expected SHA | `CANCELLED`; no write |
 | Current SHA matches and effect is authoritatively absent | Call the approved gateway under the held authorization locks |
-| Current SHA matches and effect is unknown, ambiguous or not yet settled | Retry reconciliation; no write |
 
 Evaluate these rows in order: confirmed remote execution remains durable evidence even after a new PR head supersedes the command's expected SHA. `SUCCEEDED` records the effect for that original key/SHA; it does not establish a clean review or any other verdict for the new head.
+
+A changed head prevents another write but does not prove that an earlier attempted effect is absent. Preserve `UNKNOWN` across head changes and restarts until authoritative reconciliation settles it or the existing retry ceiling produces a `REMOTE_UNCERTAIN` dead letter. Only authoritative `ABSENT` evidence permits stale-head cancellation.
 
 Gateway calls together must finish within the 10-second database transaction deadline, using strict provider request deadlines. An executing gateway must enforce remote idempotency, fresh SHA at the actual effect boundary, and all required action, approval and budget gates. The initial dispatcher SHA read cannot atomically fence a later GitHub head change. A gateway that cannot implement those guarantees must refuse execution. There is no generic GitHub write, OAuth, merge, AI prompt or billable provider implementation in this increment.
 
@@ -77,3 +79,5 @@ Local verification on 2026-11-14 (Java 27, disposable PostgreSQL 17.11): the ini
 After the two PR #47 review fixes, the focused command covering dispatch, authorization, logging and database tests passed 41 tests. The subsequent `./gradlew clean build` passed 91 tests with 0 failures, 0 errors and 0 skipped; Compose validation and `git diff --check` also passed. The added V3-to-V4 upgrade fixture was included in that full build. Failure injection exercises actual PostgreSQL queue persistence and Spring transaction/rollback logging, without claiming a live infrastructure outage or remote provider run.
 
 The applied-effect reconciliation regression was reproduced on `1ba669dc3308951dc6ccc8749d9eb9759147314b`: both lost-response and deferred-commit-failure cases incorrectly ended as `CANCELLED` after the PR head advanced. Giving confirmed `APPLIED` evidence precedence fixed both cases. `./gradlew test --tests '*DurableDispatchIntegrationTest'` passed all 21 dispatch integration cases, and `./gradlew clean build` passed 92 tests with 0 failures, 0 errors and 0 skipped. Compose validation and diff checks passed. The tests verify the original command key/SHA and successful journal outcome, no repeated write and no review cycle for the newer SHA.
+
+On 2026-11-15, the uncertain-effect/head-advance regressions reproduced premature cancellation at `40cf702736969b4a4f4d2f0dbdd2f2a01176e0d1`: the unchanged-head control passed while both stale-head cases failed. Checking `UNKNOWN` before stale-head cancellation preserves reconciliation through later `APPLIED` settlement or the existing `DEAD/REMOTE_UNCERTAIN` attempt ceiling. All 24 dispatch integration cases and the complete 95-test build passed, with 0 failures, errors or skipped tests. Compose validation and diff checks passed. Regression assertions cover persisted retry/error metadata, the original key/SHA, no cancellation journal entry, no repeated write, no newer-head review cycle and no automatic redrive after exhaustion. No schema change or live provider test was required.
