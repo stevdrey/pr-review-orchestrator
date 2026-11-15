@@ -182,7 +182,8 @@ class GitHubWebhookIntegrationTest {
         byte[] body = pullRequest("opened", HEAD);
         jdbc.execute("ALTER TABLE installations RENAME TO unavailable_installations_fixture");
         try {
-            assertEquals(403, send("pull_request", UUID.randomUUID().toString(), body).statusCode());
+            // An unavailable authority fails closed but stays redeliverable, distinct from a 403 denial.
+            assertEquals(503, send("pull_request", UUID.randomUUID().toString(), body).statusCode());
         } finally {
             jdbc.execute("ALTER TABLE unavailable_installations_fixture RENAME TO installations");
         }

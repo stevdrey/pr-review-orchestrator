@@ -56,11 +56,11 @@ Installation lifecycle events, ordinary issue comments, push events and unlisted
 | 204 | Authenticated ping, unsupported event/action or an issue comment unrelated to a PR; no work accepted |
 | 400 | Missing/malformed/ambiguous headers, malformed JSON or invalid routing metadata |
 | 401 | Missing, malformed or invalid SHA-256 signature |
-| 403 | Repository authorization denied, including unavailable authorization authority; membership rows are share-locked until the inbox commit |
+| 403 | Repository authorization denied; membership rows are share-locked until the inbox commit |
 | 409 | Previously used delivery identity conflicts with stored event/scope/hash |
 | 413 | Declared or streamed body exceeds the configured limit |
 | 415 | Unsupported media type, charset or content encoding |
-| 503 | Secret, inbox write or transaction commit unavailable; no successful acceptance acknowledgement |
+| 503 | Secret, authorization authority, inbox write or transaction commit unavailable; no successful acceptance acknowledgement |
 
 PostgreSQL unique delivery IDs serialize retries across instances/restarts. V2 adds a partial unique index on installation/repository/raw-payload hash for new ingress rows, so a captured body replayed with a different delivery ID cannot create another observation. The fingerprint deliberately excludes the event header because GitHub's signature covers the body, not headers. Conflicting event headers fail with 409 if they pass route validation. Exact byte-identical observations in the same scope are therefore coalesced even under different delivery IDs; replay aliases are not stored as separate rows. Existing V1 rows keep null routing columns and retain their original evidence.
 

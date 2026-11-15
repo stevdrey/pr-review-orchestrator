@@ -3,6 +3,7 @@ package io.github.stevdrey.prrevieworchestrator.application;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationUnavailable;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
@@ -41,9 +42,9 @@ class RepositoryAuthorizationTest {
         var unavailable = new RepositoryAuthorization(Set.of(scope), ignored -> {
             throw new IllegalStateException("fixture-secret-database-diagnostics");
         });
-        var failure = assertThrows(SecurityException.class, () -> unavailable.requireAuthorized(scope));
+        var failure = assertThrows(AuthorizationUnavailable.class, () -> unavailable.requireAuthorized(scope));
         assertNull(failure.getCause());
-        assertEquals("Repository authorization denied", failure.getMessage());
+        assertEquals("Repository authorization unavailable", failure.getMessage());
     }
 
     @Test

@@ -2,7 +2,7 @@
 
 > Event-driven, provider-neutral pull request review orchestration.
 
-**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; event dispatch and review orchestration remain planned.
+**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; durable dispatch infrastructure now exists behind an opt-in switch requiring approved planning/command adapters. Live review orchestration remains planned.
 
 PR Review Orchestrator is an independent open-source project to coordinate GitHub pull request reviews, CI events, remediation feedback and AI agents. The first target repositories are [Dokene](https://github.com/stevdrey/dokene) and [Monada Neuron](https://github.com/stevdrey/monada-neuron), but the architecture is repository-agnostic.
 
@@ -51,13 +51,14 @@ The environment export commands above are for POSIX shells. See [local database 
 
 The Gradle wrapper downloads its pinned distribution on first use. Library dependencies are resolved from Maven Central and the Spring Boot Gradle plugin from the Gradle Plugin Portal; both are pinned by committed lockfiles (`gradle.lockfile`, `buildscript-gradle.lockfile`). On Windows use `gradlew.bat`. Once running, `curl http://localhost:8080/actuator/health` returns application and database health without connection details. This does not verify GitHub connectivity or review readiness. Stop the application with Ctrl+C; `docker compose down` stops the local database and preserves its named volume.
 
-The bootstrap contains PostgreSQL/Flyway schema, database integration tests and a deny-by-default installation/repository authorization gate. The optional GitHub App client signs short-lived JWTs from a mounted key and requests single-repository, operation-scoped read tokens. See [GitHub App setup](docs/github/app-setup.md) for permission rationale, registration, allowlisting and credential rotation. GitHub credentials are unnecessary for the default-disabled configuration. An operator-approved [development App installation and live verification record](docs/github/issue-11-registration-evidence.md) is available. The opt-in [webhook receiver](docs/github/webhook-ingress.md) verifies raw-body signatures and commits authorized, deduplicated inbox metadata before acknowledgement. No event worker, user OAuth flow or review automation is supplied. Package dependency boundaries are not enforced automatically.
+The bootstrap contains PostgreSQL/Flyway schema, database integration tests and a deny-by-default installation/repository authorization gate. The optional GitHub App client signs short-lived JWTs from a mounted key and requests single-repository, operation-scoped read tokens. See [GitHub App setup](docs/github/app-setup.md) for permission rationale, registration, allowlisting and credential rotation. GitHub credentials are unnecessary for the default-disabled configuration. An operator-approved [development App installation and live verification record](docs/github/issue-11-registration-evidence.md) is available. The opt-in [webhook receiver](docs/github/webhook-ingress.md) verifies raw-body signatures and commits authorized, deduplicated inbox metadata before acknowledgement. The [durable dispatcher](docs/development/durable-dispatch.md) supplies transactional command deduplication, fenced leases, bounded retries, reconciliation gates and dead-letter visibility. It stays disabled until approved `EventPlanner` and `CommandGateway` adapters are supplied; live provider adapters, user OAuth and review automation remain planned. Package dependency boundaries are not enforced automatically.
 
 ## Documentation
 
 - [Roadmap](docs/ROADMAP.md)
 - [Architecture](docs/architecture/overview.md)
 - [Local database setup and rollback](docs/development/database.md)
+- [Durable dispatch, adapter contracts and recovery](docs/development/durable-dispatch.md)
 - [GitHub App registration, authorization and rotation](docs/github/app-setup.md)
 - [Signed webhook ingress, replay handling and rotation](docs/github/webhook-ingress.md)
 - [Review lifecycle](docs/architecture/review-lifecycle.md)

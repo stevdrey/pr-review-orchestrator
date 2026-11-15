@@ -1,6 +1,8 @@
 package io.github.stevdrey.prrevieworchestrator.application;
 
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationUnavailable;
 import io.github.stevdrey.prrevieworchestrator.ports.InstallationAuthorization;
 import java.util.Set;
 
@@ -21,7 +23,8 @@ public final class RepositoryAuthorization {
             }
         } catch (RuntimeException ignored) {
             // Do not propagate SQL/driver diagnostics or fail open when the authority is unavailable.
+            throw new AuthorizationUnavailable();
         }
-        throw new SecurityException("Repository authorization denied");
+        throw new AuthorizationDenied();
     }
 }

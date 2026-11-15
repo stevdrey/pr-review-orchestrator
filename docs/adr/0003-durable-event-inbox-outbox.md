@@ -1,6 +1,6 @@
 # ADR 0003: Durable inbox/outbox and bounded idempotent dispatch
 
-**Status:** Accepted (schema and durable metadata ingress implemented; workers and outbox dispatch pending)
+**Status:** Accepted (schema, durable metadata ingress and opt-in dispatch infrastructure implemented; live planning/side-effect adapters pending)
 **Date:** 2026-11-13
 
 ## Context
@@ -22,3 +22,5 @@ Direct webhook→GitHub call: event loss and duplicate actions. In-memory queue:
 ## Verification
 
 Crash-after-write, duplicate delivery, concurrent workers, lost API response and out-of-order commit tests.
+
+Issue #13 implements these paths using PostgreSQL integration fixtures and a strongly idempotent synthetic remote adapter. See [dispatch contracts and operational limits](../development/durable-dispatch.md). Default-disabled ticks require approved planner/gateway beans; no live GitHub write or review-iteration/spending policy is implied. Gateways must preserve ambiguous remote outcomes and enforce fresh SHA, authorization, approval and spending gates at the actual effect boundary.

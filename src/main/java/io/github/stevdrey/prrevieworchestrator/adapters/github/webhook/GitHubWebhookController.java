@@ -1,6 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.github.webhook;
 
 import io.github.stevdrey.prrevieworchestrator.application.AcceptDelivery;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationUnavailable;
 import io.github.stevdrey.prrevieworchestrator.ports.DeliveryInbox;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
@@ -83,6 +84,9 @@ public class GitHubWebhookController {
             return ResponseEntity.noContent().build();
         } catch (DeliveryInbox.Conflict ignored) {
             return error(409, "DELIVERY_CONFLICT");
+        } catch (AuthorizationUnavailable ignored) {
+            // A membership-authority outage is transient, not a denial; keep it redeliverable.
+            return error(503, "INGRESS_UNAVAILABLE");
         } catch (SecurityException ignored) {
             return error(403, "REPOSITORY_DENIED");
         } catch (IllegalArgumentException | IOException ignored) {
