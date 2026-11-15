@@ -15,12 +15,13 @@ public class JdbcInstallationAuthorization implements InstallationAuthorization 
 
     @Override
     public boolean isActiveAndEnabled(RepositoryScope scope) {
-        return Boolean.TRUE.equals(jdbc.queryForObject("""
-                SELECT EXISTS (
-                    SELECT 1 FROM installations i JOIN installation_repositories r
-                    ON r.installation_id = i.installation_id
-                    WHERE i.installation_id = ? AND r.repository_id = ?
-                    AND i.status = 'ACTIVE' AND r.enabled = true)
-                """, Boolean.class, scope.installationId(), scope.repositoryId()));
+        // FOR SHARE makes a concurrent revocation wait for an enclosing transaction (e.g. inbox acceptance).
+        return !jdbc.queryForList("""
+                SELECT 1 FROM installations i JOIN installation_repositories r
+                ON r.installation_id = i.installation_id
+                WHERE i.installation_id = ? AND r.repository_id = ?
+                AND i.status = 'ACTIVE' AND r.enabled = true
+                FOR SHARE OF i, r
+                """, Integer.class, scope.installationId(), scope.repositoryId()).isEmpty();
     }
 }

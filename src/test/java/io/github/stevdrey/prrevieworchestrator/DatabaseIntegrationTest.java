@@ -128,13 +128,14 @@ class DatabaseIntegrationTest {
     }
 
     @Test
-    void migrationRecordsOnlyV1AndSecondStartupIsNoOp() throws SQLException {
-        // Spring Boot migrated this fresh container before creating the context. A single SQL history row
-        // (no BASELINE/SCHEMA row) shows Flyway applied V1 to an empty schema rather than adopting one.
+    void migrationRecordsV1AndV2AndSecondStartupIsNoOp() throws SQLException {
+        // Spring Boot migrated this fresh container before creating the context. Two SQL history rows
+        // (no BASELINE/SCHEMA row) show Flyway applied each migration rather than adopting a schema.
         String history = "SELECT count(*) FROM flyway_schema_history WHERE version = '1' AND type = 'SQL' AND success";
-        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(2, count("SELECT count(*) FROM flyway_schema_history"));
         assertEquals(1, count(history));
-        int checksum = count("SELECT checksum FROM flyway_schema_history");
+        int checksum = count("SELECT checksum FROM flyway_schema_history WHERE version = '1'");
+        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE version = '2' AND type = 'SQL' AND success"));
         assertTrue(flyway.validateWithResult().validationSuccessful);
         assertTrue(flyway.getConfiguration().isCleanDisabled());
         assertThrows(FlywayException.class, flyway::clean);
@@ -148,9 +149,33 @@ class DatabaseIntegrationTest {
                         "--spring.datasource.password=" + POSTGRES.getPassword())) {
             assertTrue(restarted.isRunning());
         }
-        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(2, count("SELECT count(*) FROM flyway_schema_history"));
         assertEquals(1, count(history));
-        assertEquals(checksum, count("SELECT checksum FROM flyway_schema_history"));
+        assertEquals(checksum, count("SELECT checksum FROM flyway_schema_history WHERE version = '1'"));
+    }
+
+    @Test
+    void v1DatabaseUpgradesWithoutRewritingLegacyInboxEvidence() throws SQLException {
+        String schema = "upgrade_fixture";
+        try {
+            var v1 = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema)
+                    .target("1").load();
+            v1.migrate();
+            new JdbcTemplate(dataSource).update("""
+                    INSERT INTO upgrade_fixture.inbox_events
+                        (id, delivery_id, event_type, installation_id, repository_id, payload_sha256, correlation_id, verified_at)
+                    VALUES (?, ?, 'pull_request', 101, 1001, ?, ?, now())
+                    """, UUID.randomUUID(), UUID.randomUUID().toString(), "c".repeat(64), UUID.randomUUID());
+            var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
+            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertTrue(latest.validateWithResult().validationSuccessful);
+            assertEquals(1, new JdbcTemplate(dataSource).queryForObject("""
+                    SELECT count(*) FROM upgrade_fixture.inbox_events
+                    WHERE payload_sha256 = ? AND event_action IS NULL AND pr_number IS NULL
+                    """, Integer.class, "c".repeat(64)));
+        } finally {
+            new JdbcTemplate(dataSource).execute("DROP SCHEMA IF EXISTS upgrade_fixture CASCADE");
+        }
     }
 
     @Test

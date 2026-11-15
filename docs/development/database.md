@@ -1,6 +1,6 @@
 # Local PostgreSQL and migrations
 
-Implements the database foundation for [issue #10](https://github.com/stevdrey/pr-review-orchestrator/issues/10), following ADRs [0001](../adr/0001-independent-modular-monolith.md), [0003](../adr/0003-durable-event-inbox-outbox.md) and [0005](../adr/0005-finding-state-and-head-sha.md). This is schema and startup infrastructure; webhook validation, repositories, dispatch, budget gates and review state transitions are separate increments.
+Implements the database foundation for [issue #10](https://github.com/stevdrey/pr-review-orchestrator/issues/10), following ADRs [0001](../adr/0001-independent-modular-monolith.md), [0003](../adr/0003-durable-event-inbox-outbox.md) and [0005](../adr/0005-finding-state-and-head-sha.md). This document covers schema and startup infrastructure. Issue #12 adds [signed webhook metadata acceptance](../github/webhook-ingress.md); dispatch, budget gates and review state transitions remain separate increments.
 
 ## Start locally
 
@@ -34,7 +34,7 @@ Compose and tests pin PostgreSQL 17.11 by image digest. `compose.yaml` is the si
 
 ## Schema and guarantees
 
-Flyway runs `src/main/resources/db/migration/V1__orchestration_foundation.sql` on application startup. An empty database receives seven tables plus `flyway_schema_history`:
+Flyway applies V1 (`orchestration_foundation`) and V2 (`webhook_routing_metadata`) on application startup. V2 adds optional event action/PR number columns and a partial unique scoped-payload index for new ingress rows. An empty database receives seven tables plus `flyway_schema_history`:
 
 | Table | Scope and purpose |
 | --- | --- |
@@ -46,13 +46,13 @@ Flyway runs `src/main/resources/db/migration/V1__orchestration_foundation.sql` o
 | `outbox_commands` | Unique command key, cycle, expected SHA, provider, bounded retry and lease metadata |
 | `audit_entries` | Scoped actor/action/outcome, correlation and evidence reference |
 
-UUID record/correlation IDs and deterministic command keys are supplied by future application code. Timestamps use `timestamptz`; a `BEFORE UPDATE` trigger maintains `updated_at` on installations, review cycles and findings. SHA fields accept full lowercase 40- or 64-character hex commit IDs. Composite references bind findings and commands to a cycle's installation, repository and SHA. Audit records may be installation/repository-level, but cycle-specific records must include a matching repository and SHA. Inbox events have no foreign keys: a signature-verified delivery is durably recorded even when its installation or repository membership is not stored yet (for example `installation.created`, or a `pull_request` arriving before membership sync). Installation-level events may omit repository/SHA. Inbox rows are therefore not authorized input; workers must recheck installation/repository authorization before processing. Referencing foreign-key columns are indexed. No cascading deletes remove evidence implicitly.
+Ingress supplies server-generated UUID event/correlation IDs. Future dispatch code must supply deterministic command keys. Timestamps use `timestamptz`; a `BEFORE UPDATE` trigger maintains `updated_at` on installations, review cycles and findings. SHA fields accept full lowercase 40- or 64-character hex commit IDs. Composite references bind findings and commands to a cycle's installation, repository and SHA. Audit records may be installation/repository-level, but cycle-specific records must include a matching repository and SHA. Inbox events have no foreign keys: a signature-verified delivery is durably recorded even when its installation or repository membership is not stored yet (for example `installation.created`, or a `pull_request` arriving before membership sync). Installation-level events may omit repository/SHA. The schema permits these unknown/lifecycle observations for future use, but the current issue #12 HTTP ingress accepts only already-authorized repository pairs and rejects installation lifecycle events. Inbox rows are not durable authority; workers must recheck installation/repository authorization before processing. Referencing foreign-key columns are indexed. No cascading deletes remove evidence implicitly.
 
-A repeated Flyway migrate validates checksums and applies zero migrations once V1 is recorded; the DDL is intentionally not wrapped in `IF NOT EXISTS`, which could hide drift. Keep applied migrations immutable and add `V2__...sql`, etc. Baseline-on-migrate is off: an unexpected existing nonempty schema is not silently adopted. Flyway clean is disabled. Failed PostgreSQL transactional migrations roll back; investigate and correct the cause before retrying, rather than deleting history or disabling validation.
+A repeated Flyway migrate validates checksums and applies zero migrations once all current migrations are recorded; the DDL is intentionally not wrapped in `IF NOT EXISTS`, which could hide drift. Keep applied migrations immutable and add a new version after V2. Baseline-on-migrate is off: an unexpected existing nonempty schema is not silently adopted. Flyway clean is disabled. Failed PostgreSQL transactional migrations roll back; investigate and correct the cause before retrying, rather than deleting history or disabling validation.
 
 Delivery keys deduplicate transport retries; command keys are a separate side-effect identity. Several findings can share one source comment/review and have independent dispositions; `(review_cycle_id, source_provider, source_kind, source_id, source_ordinal)` is unique, so re-ingesting the same source finding is rejected instead of duplicated. A resolved thread leaves a finding open. `VERIFIED_FIXED` requires an evidence commit different from the reviewed SHA, verification time, actor and reason. Evidence fields must be cleared when a finding leaves `VERIFIED_FIXED`, and an `OPEN` finding carries no disposition; these fields record evidence but cannot establish its correctness. A general issue comment/review cannot acquire a thread-resolution flag. Application policy must still validate dispositions, freeze policy/budget context, authorize every action and compare the expected SHA with current remote state.
 
-The retry ceiling defaults to five storage attempts and is not a review-iteration or spending policy. `PROCESSING` rows must carry `locked_by` and `locked_until` (indexed for expired-lease recovery), and terminal statuses require `processed_at`/`completed_at`. There is no dispatcher to claim rows, increment attempts, recover leases or perform side effects yet. Likewise, these foreign keys are integrity constraints, not row-level tenant security or an authorization check. Full source, webhook payloads, tokens and review bodies are not stored here; reference storage and retention must be designed before ingestion.
+The retry ceiling defaults to five storage attempts and is not a review-iteration or spending policy. `PROCESSING` rows must carry `locked_by` and `locked_until` (indexed for expired-lease recovery), and terminal statuses require `processed_at`/`completed_at`. There is no dispatcher to claim rows, increment attempts, recover leases or perform side effects yet. Likewise, these foreign keys are integrity constraints, not row-level tenant security or an authorization check. Full source, webhook payloads, tokens and review bodies are not stored here; the current ingress stores routing metadata and hashes only. Reference storage and production retention remain to be designed.
 
 ## Verify
 
@@ -91,7 +91,7 @@ docker compose down --volumes
 docker compose up -d --wait
 ```
 
-The next application start reapplies V1. Never use this reset procedure against a shared or production database. Production backup/recovery, secret provisioning, TLS, role separation and data-retention automation remain out of scope.
+The next application start reapplies all current migrations. Never use this reset procedure against a shared or production database. Production backup/recovery, secret provisioning, TLS, role separation and data-retention automation remain out of scope.
 
 ## Issue #10 implementation evidence
 
