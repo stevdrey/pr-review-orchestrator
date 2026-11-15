@@ -3,11 +3,11 @@ package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
-import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -15,6 +15,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /** PostgreSQL clocks, SKIP LOCKED claims and per-claim fencing. No JVM clock orders work. */
 public final class JdbcWorkQueue implements WorkQueue {
+    /** Every queue transaction, including any gateway call inside executeCommand, finishes within this. */
+    private static final Duration DEADLINE = Duration.ofSeconds(10);
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final Limits limits;
@@ -25,18 +27,14 @@ public final class JdbcWorkQueue implements WorkQueue {
         this.limits = limits;
         transactions = new TransactionTemplate(manager);
         transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-        transactions.setTimeout(10);
+        transactions.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
     }
 
     private <T> T transaction(Supplier<T> operation) {
         return transactions.execute(status -> {
             try {
-                jdbc.execute("SET LOCAL transaction_timeout = '10s'");
-                jdbc.execute("SET LOCAL statement_timeout = '9s'");
-                jdbc.execute((ConnectionCallback<Void>) connection -> {
-                    connection.setNetworkTimeout(Runnable::run, 10_000);
-                    return null;
-                });
+                PostgresDeadlines.apply(jdbc, DEADLINE);
+                jdbc.execute("SET LOCAL statement_timeout = '" + DEADLINE.minusSeconds(1).toMillis() + "ms'");
                 return operation.get();
             } catch (RuntimeException failure) {
                 // Spring may log the callback exception during rollback (including rollback failure).
@@ -114,7 +112,7 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     @Override
     public boolean completeEvent(Event event, List<Intent> intents, Runnable authorize) {
-        if (intents.size() > 32) throw new Failure(ErrorCode.INVALID_EVENT, false);
+        if (intents.size() > MAX_INTENTS) throw new Failure(ErrorCode.INVALID_EVENT, false);
         return transaction(() -> {
             if (!lock(event.lease())) return false;
             authorize.run();

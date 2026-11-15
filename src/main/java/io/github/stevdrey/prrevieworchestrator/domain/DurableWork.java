@@ -77,7 +77,8 @@ public final class DurableWork {
         public static Failure sanitized(RuntimeException failure) {
             if (failure instanceof Failure known) return new Failure(known.code(), known.retryable());
             if (failure instanceof AuthorizationUnavailable) return new Failure(ErrorCode.AUTHORIZATION_UNAVAILABLE, true);
-            if (failure instanceof SecurityException) return new Failure(ErrorCode.AUTHORIZATION_DENIED, false);
+            if (failure instanceof AuthorizationDenied) return new Failure(ErrorCode.AUTHORIZATION_DENIED, false);
+            // Any other SecurityException (TLS, signing, adapter code) is not a membership denial.
             return new Failure(ErrorCode.INTERNAL_ERROR, true);
         }
     }

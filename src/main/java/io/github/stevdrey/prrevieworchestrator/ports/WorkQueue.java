@@ -7,6 +7,9 @@ import java.util.function.Supplier;
 
 /** All mutations are committed before returning. Stale/expired tokens cannot mutate or execute work. */
 public interface WorkQueue {
+    /** Upper bound on command intents one event may plan; larger plans are INVALID_EVENT. */
+    int MAX_INTENTS = 32;
+
     Optional<Event> claimEvent();
     Optional<Command> claimCommand();
     boolean completeEvent(Event event, List<Intent> intents, Runnable authorize);

@@ -155,7 +155,8 @@ class DurableDispatchIntegrationTest {
         gateway.loseResponse = true;
         dispatcher().processCommand();
         assertEquals(1, gateway.writes.get());
-        assertEquals(1, count("outbox_commands", "status = 'PENDING' AND last_error_code = 'REMOTE_UNAVAILABLE'"));
+        // The effect may have landed, so the retry is recorded as reconciliation-required.
+        assertEquals(1, count("outbox_commands", "status = 'PENDING' AND last_error_code = 'REMOTE_UNCERTAIN'"));
         ready("outbox_commands");
         queue = newQueue();
         dispatcher().processCommand();
@@ -228,7 +229,8 @@ class DurableDispatchIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"true, 1", "true, 2", "false, 1", "false, 2"})
+    // The outbox authorizes once inside its locked transaction; FOR SHARE locks make a second query redundant.
+    @CsvSource({"true, 1", "true, 2", "false, 1"})
     void authorizationOutageRetriesAndRecoversAfterRestart(boolean inbox, int failedCheck) {
         UUID eventId = event(FIRST, HEAD);
         if (!inbox) dispatcher().processEvent();
@@ -284,6 +286,8 @@ class DurableDispatchIntegrationTest {
         UUID id = event(null, null);
         dispatcher().processEvent();
         assertEquals("DEAD", status("inbox_events", id));
+        // A repository-less row is an unsupported route, not an authorization incident.
+        assertEquals(1, count("inbox_events", "id = '" + id + "' AND last_error_code = 'INVALID_EVENT'"));
         event(FIRST, null);
         dispatcher(event -> { throw new Failure(ErrorCode.INVALID_EVENT, false); }).processEvent();
         event(SECOND, HEAD);

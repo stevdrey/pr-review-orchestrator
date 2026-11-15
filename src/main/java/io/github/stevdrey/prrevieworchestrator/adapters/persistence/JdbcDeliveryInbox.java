@@ -3,14 +3,16 @@ package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 import io.github.stevdrey.prrevieworchestrator.domain.VerifiedDelivery;
 import io.github.stevdrey.prrevieworchestrator.ports.DeliveryInbox;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.util.UUID;
-import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionTemplate;
 
 @Repository
 public class JdbcDeliveryInbox implements DeliveryInbox {
+    // Leave time for the HTTP acknowledgement.
+    private static final Duration DEADLINE = Duration.ofSeconds(3);
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
 
@@ -18,29 +20,18 @@ public class JdbcDeliveryInbox implements DeliveryInbox {
         this.jdbc = jdbc;
         this.transactions = new TransactionTemplate(manager);
         // Leave time for the HTTP acknowledgement; no provider calls occur inside this transaction.
-        transactions.setTimeout(3);
+        transactions.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
     }
 
     @Override
     public void requireCapabilities() {
-        // PostgreSQL 17 introduced transaction_timeout; fail startup rather than every delivery.
-        String setting = jdbc.queryForObject("SELECT current_setting('transaction_timeout', true)", String.class);
-        if (setting == null) {
-            throw new IllegalStateException("PostgreSQL 17+ transaction_timeout is required for webhook ingress");
-        }
+        PostgresDeadlines.requireTransactionTimeout(jdbc, "webhook ingress");
     }
 
     @Override
     public Receipt accept(VerifiedDelivery event, Runnable precondition) {
         return transactions.execute(status -> {
-            // JDBC and PostgreSQL statement timeouts do not cover deferred COMMIT work.
-            // PostgreSQL 17's transaction timeout covers it and resets at transaction end.
-            jdbc.execute("SET LOCAL transaction_timeout = '3s'");
-            // Bound waiting for the commit response on this connection only; Hikari resets it on return.
-            jdbc.execute((ConnectionCallback<Void>) connection -> {
-                connection.setNetworkTimeout(Runnable::run, 3_000);
-                return null;
-            });
+            PostgresDeadlines.apply(jdbc, DEADLINE);
             precondition.run();
             int inserted = jdbc.update("""
                     INSERT INTO inbox_events (id, delivery_id, event_type, event_action, installation_id,

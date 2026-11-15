@@ -26,9 +26,11 @@ public final class DurableDispatcher {
         if (claimed.isEmpty()) return false;
         Event event = claimed.get();
         try {
+            // Installation-level/legacy rows name no repository: an unsupported route, not a denial.
+            if (event.scope() == null) throw new Failure(ErrorCode.INVALID_EVENT, false);
             authorization.requireAuthorized(event.scope());
+            // The queue enforces WorkQueue.MAX_INTENTS atomically with completion.
             var intents = java.util.List.copyOf(planner.plan(event));
-            if (intents.size() > 32) throw new Failure(ErrorCode.INVALID_EVENT, false);
             if (queue.completeEvent(event, intents, () -> authorization.requireAuthorized(event.scope()))) {
                 report(event.lease(), "PROCESSED");
             }
@@ -42,6 +44,7 @@ public final class DurableDispatcher {
         var claimed = queue.claimCommand();
         if (claimed.isEmpty()) return false;
         Command command = claimed.get();
+        var effectAttempted = new java.util.concurrent.atomic.AtomicBoolean();
         try {
             if (queue.executeCommand(command, () -> authorization.requireAuthorized(command.scope()), () -> {
                 if (!gateway.supports(command)) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
@@ -49,12 +52,19 @@ public final class DurableDispatcher {
                 if (!command.intent().expectedHeadSha().equals(state.currentHeadSha())) return Outcome.CANCELLED;
                 if (state.effect() == RemoteEffect.APPLIED) return Outcome.SUCCEEDED;
                 if (state.effect() == RemoteEffect.UNKNOWN) throw new Failure(ErrorCode.REMOTE_UNCERTAIN, true);
-                authorization.requireAuthorized(command.scope());
+                // No second authorization query: authorize.run() holds FOR SHARE locks on the
+                // installation/repository rows, so a revocation cannot commit before this transaction ends.
+                effectAttempted.set(true);
                 gateway.execute(command);
                 return Outcome.SUCCEEDED;
             })) report(command.lease(), "COMPLETED");
         } catch (RuntimeException failure) {
-            handle(command.lease(), failure);
+            Failure safe = Failure.sanitized(failure);
+            // Once execute has started, the effect may have landed even if the call or commit failed.
+            // Record that ambiguity so the next attempt reconciles, and so a final-attempt dead letter is
+            // marked REMOTE_UNCERTAIN (reconcile before any redrive) rather than a plain failure.
+            if (effectAttempted.get() && safe.retryable()) safe = new Failure(ErrorCode.REMOTE_UNCERTAIN, true);
+            handle(command.lease(), safe);
         }
         return true;
     }
