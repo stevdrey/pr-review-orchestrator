@@ -20,10 +20,12 @@ The initial cycle uses iteration 1. Review-loop iteration, policy/budget reserva
 
 | Evidence | Dispatcher behavior |
 | --- | --- |
-| Current SHA differs from expected SHA | `CANCELLED`; no write |
-| Effect already applied | `SUCCEEDED`; no repeated write |
-| Effect authoritatively absent | Reauthorize and call the approved gateway |
-| Unknown, ambiguous or not yet settled | Retry reconciliation; no write |
+| Effect already applied, including after the current head changes | `SUCCEEDED` for the original command/SHA; no repeated write |
+| Otherwise, current SHA differs from expected SHA | `CANCELLED`; no write |
+| Current SHA matches and effect is authoritatively absent | Call the approved gateway under the held authorization locks |
+| Current SHA matches and effect is unknown, ambiguous or not yet settled | Retry reconciliation; no write |
+
+Evaluate these rows in order: confirmed remote execution remains durable evidence even after a new PR head supersedes the command's expected SHA. `SUCCEEDED` records the effect for that original key/SHA; it does not establish a clean review or any other verdict for the new head.
 
 Gateway calls together must finish within the 10-second database transaction deadline, using strict provider request deadlines. An executing gateway must enforce remote idempotency, fresh SHA at the actual effect boundary, and all required action, approval and budget gates. The initial dispatcher SHA read cannot atomically fence a later GitHub head change. A gateway that cannot implement those guarantees must refuse execution. There is no generic GitHub write, OAuth, merge, AI prompt or billable provider implementation in this increment.
 
@@ -73,3 +75,5 @@ Live GitHub writes, actual process killing, network partitions against a remote 
 Local verification on 2026-11-14 (Java 27, disposable PostgreSQL 17.11): the initial focused integration run passed 27 tests; the final `./gradlew clean build` passed 80 tests with 0 failures, 0 errors and 0 skipped. Compose validation and `git diff --check` passed. The full build includes 15 new durable-dispatch integration tests and three new configuration/identity tests. These results are local; GitHub Actions evidence is recorded separately on the PR's published head.
 
 After the two PR #47 review fixes, the focused command covering dispatch, authorization, logging and database tests passed 41 tests. The subsequent `./gradlew clean build` passed 91 tests with 0 failures, 0 errors and 0 skipped; Compose validation and `git diff --check` also passed. The added V3-to-V4 upgrade fixture was included in that full build. Failure injection exercises actual PostgreSQL queue persistence and Spring transaction/rollback logging, without claiming a live infrastructure outage or remote provider run.
+
+The applied-effect reconciliation regression was reproduced on `1ba669dc3308951dc6ccc8749d9eb9759147314b`: both lost-response and deferred-commit-failure cases incorrectly ended as `CANCELLED` after the PR head advanced. Giving confirmed `APPLIED` evidence precedence fixed both cases. `./gradlew test --tests '*DurableDispatchIntegrationTest'` passed all 21 dispatch integration cases, and `./gradlew clean build` passed 92 tests with 0 failures, 0 errors and 0 skipped. Compose validation and diff checks passed. The tests verify the original command key/SHA and successful journal outcome, no repeated write and no review cycle for the newer SHA.

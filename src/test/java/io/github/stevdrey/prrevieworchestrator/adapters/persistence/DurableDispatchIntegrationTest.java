@@ -19,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.dao.TransientDataAccessResourceException;
@@ -162,6 +163,52 @@ class DurableDispatchIntegrationTest {
         dispatcher().processCommand();
         assertEquals(1, gateway.writes.get());
         assertEquals(1, count("outbox_commands", "status = 'SUCCEEDED' AND attempts = 2"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void appliedEffectRemainsSucceededWhenHeadAdvancesBeforeReconciliation(boolean loseResponse) {
+        event(FIRST, HEAD);
+        dispatcher().processEvent();
+        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        if (loseResponse) {
+            gateway.loseResponse = true;
+        } else {
+            // The remote write succeeds, but its terminal status/journal cannot commit locally.
+            jdbc.execute("""
+                    CREATE FUNCTION reject_command_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN IF NEW.outcome = 'SUCCEEDED' THEN RAISE EXCEPTION 'synthetic commit failure'; END IF;
+                    RETURN NEW; END; $$
+                    """);
+            jdbc.execute("""
+                    CREATE CONSTRAINT TRIGGER reject_command_completion AFTER INSERT ON queue_transitions
+                    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_command_completion()
+                    """);
+        }
+        try {
+            dispatcher().processCommand();
+        } finally {
+            if (!loseResponse) {
+                jdbc.execute("DROP TRIGGER reject_command_completion ON queue_transitions");
+                jdbc.execute("DROP FUNCTION reject_command_completion()");
+            }
+        }
+        assertEquals(1, gateway.writes.get());
+        assertEquals("PENDING", status("outbox_commands", command));
+        assertEquals(1, count("outbox_commands", "last_error_code = 'REMOTE_UNCERTAIN' AND attempts = 1"));
+
+        gateway.head = NEXT;
+        queue = newQueue();
+        ready("outbox_commands");
+        assertTrue(dispatcher().processCommand());
+
+        assertEquals("SUCCEEDED", status("outbox_commands", command));
+        assertEquals(1, gateway.writes.get(), "Reconciliation must preserve evidence without repeating the write");
+        assertEquals(1, count("outbox_commands", "attempts = 2 AND expected_head_sha = '" + HEAD + "'"));
+        assertEquals(INTENT.key(FIRST), jdbc.queryForObject("SELECT command_key FROM outbox_commands WHERE id = ?", String.class, command));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'SUCCEEDED'", Integer.class, command));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM queue_transitions WHERE work_id = ? AND outcome = 'CANCELLED'", Integer.class, command));
+        assertEquals(0, count("review_cycles", "head_sha = '" + NEXT + "'"));
     }
 
     @Test

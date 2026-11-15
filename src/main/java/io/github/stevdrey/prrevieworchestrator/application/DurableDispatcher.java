@@ -49,8 +49,9 @@ public final class DurableDispatcher {
             if (queue.executeCommand(command, () -> authorization.requireAuthorized(command.scope()), () -> {
                 if (!gateway.supports(command)) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
                 RemoteState state = gateway.reconcile(command);
-                if (!command.intent().expectedHeadSha().equals(state.currentHeadSha())) return Outcome.CANCELLED;
+                // A later PR head does not undo a confirmed effect for this command's original SHA/key.
                 if (state.effect() == RemoteEffect.APPLIED) return Outcome.SUCCEEDED;
+                if (!command.intent().expectedHeadSha().equals(state.currentHeadSha())) return Outcome.CANCELLED;
                 if (state.effect() == RemoteEffect.UNKNOWN) throw new Failure(ErrorCode.REMOTE_UNCERTAIN, true);
                 // No second authorization query: authorize.run() holds FOR SHARE locks on the
                 // installation/repository rows, so a revocation cannot commit before this transaction ends.
