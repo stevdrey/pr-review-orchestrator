@@ -6,7 +6,7 @@ This document describes planned endpoints and adapter contracts. The [GitHub App
 
 Events to investigate: `pull_request` (opened, ready_for_review, synchronize, reopened, closed), `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `workflow_run`. GitHub delivery semantics and payload availability depend on app event subscription and permissions; verify each combination via captured **sanitized** fixtures.
 
-Implemented ingress: `POST /webhooks/github`. Verify bounded raw HMAC-SHA256 bytes, delivery ID, installation, repository and explicitly supported event/action before queuing metadata. Return 202 after commit, 200 for a durable duplicate, or 204 for a signed ping that queues no work. See the [route and response contract](../github/webhook-ingress.md) for unsupported lifecycle events, replay fingerprints, secret rotation and metadata-only limitations. Detailed payloads are not retained; a future worker must fetch authoritative GitHub state.
+Implemented ingress: `POST /webhooks/github`. Verify bounded raw HMAC-SHA256 bytes, delivery ID, installation, repository and explicitly supported event/action before queuing metadata. Return 202 after commit, 200 for a durable duplicate, or 204 for a signed ping that queues no work. See the [route and response contract](../github/webhook-ingress.md) for unsupported lifecycle events, replay fingerprints, secret rotation and metadata-only limitations. Detailed payloads are not retained; an approved dispatch planner must fetch authoritative GitHub state.
 
 Outbound GitHub: limited to app-authorized operations; use user-to-server authorization where necessary for account attribution and verify Codex subscription ownership in an integration test. GitHub comment author identity and Codex billable identity may differ.
 
@@ -29,3 +29,7 @@ Notify PR author by email **only when an address and permission are legitimately
 ## Optional OpenAI / Anthropic
 
 Record model, account/organization, usage and pricing effective date. Account-specific ChatGPT credits, model availability or billing should never be hardcoded. AI classification of comments is advisory; hard policy remains deterministic.
+
+## Durable worker adapter contracts
+
+Issue #13 supplies provider-neutral `EventPlanner`, `CommandGateway` and `WorkQueue` ports. Approved planners return bounded metadata-only intents; command gateways explicitly support registered actions and reconcile authoritative PR head/remote command-key evidence before writes. Unknown outcomes remain reconciliation-only. No live command adapters are supplied; default-disabled activation fails without approved beans. See [transaction, deadline, policy and idempotency requirements](../development/durable-dispatch.md).
