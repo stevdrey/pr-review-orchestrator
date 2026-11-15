@@ -129,15 +129,16 @@ class DatabaseIntegrationTest {
 
     @Test
     void migrationRecordsAllVersionsAndSecondStartupIsNoOp() throws SQLException {
-        // Spring Boot migrated this fresh container before creating the context. Four SQL history rows
+        // Spring Boot migrated this fresh container before creating the context. Five SQL history rows
         // (no BASELINE/SCHEMA row) show Flyway applied each migration rather than adopting a schema.
         String history = "SELECT count(*) FROM flyway_schema_history WHERE version = '1' AND type = 'SQL' AND success";
-        assertEquals(4, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(5, count("SELECT count(*) FROM flyway_schema_history"));
         assertEquals(1, count(history));
         int checksum = count("SELECT checksum FROM flyway_schema_history WHERE version = '1'");
         assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE version = '2' AND type = 'SQL' AND success"));
         assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE version = '3' AND type = 'SQL' AND success"));
         assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE version = '4' AND type = 'SQL' AND success"));
+        assertEquals(1, count("SELECT count(*) FROM flyway_schema_history WHERE version = '5' AND type = 'SQL' AND success"));
         assertTrue(flyway.validateWithResult().validationSuccessful);
         assertTrue(flyway.getConfiguration().isCleanDisabled());
         assertThrows(FlywayException.class, flyway::clean);
@@ -151,7 +152,7 @@ class DatabaseIntegrationTest {
                         "--spring.datasource.password=" + POSTGRES.getPassword())) {
             assertTrue(restarted.isRunning());
         }
-        assertEquals(4, count("SELECT count(*) FROM flyway_schema_history"));
+        assertEquals(5, count("SELECT count(*) FROM flyway_schema_history"));
         assertEquals(1, count(history));
         assertEquals(checksum, count("SELECT checksum FROM flyway_schema_history WHERE version = '1'"));
     }
@@ -169,7 +170,7 @@ class DatabaseIntegrationTest {
                     VALUES (?, ?, 'pull_request', 101, 1001, ?, ?, now())
                     """, UUID.randomUUID(), UUID.randomUUID().toString(), "c".repeat(64), UUID.randomUUID());
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(3, latest.migrate().migrationsExecuted);
+            assertEquals(4, latest.migrate().migrationsExecuted);
             assertTrue(latest.validateWithResult().validationSuccessful);
             assertEquals(1, new JdbcTemplate(dataSource).queryForObject("""
                     SELECT count(*) FROM upgrade_fixture.inbox_events
@@ -194,7 +195,7 @@ class DatabaseIntegrationTest {
                     VALUES ('INBOX', ?, ?, 1, 'RETRY', 'INTERNAL_ERROR')
                     """, work, correlation);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             assertTrue(latest.validateWithResult().validationSuccessful);
             assertEquals(1, jdbc.queryForObject("""
                     SELECT count(*) FROM dispatch_upgrade_fixture.queue_transitions

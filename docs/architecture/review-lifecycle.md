@@ -1,6 +1,6 @@
 # Review lifecycle and stop conditions
 
-**Specification, not deployed behavior.** Govern all transitions with a deterministic policy evaluated against current repository state.
+**Internal state machine implemented; live orchestration remains planned.** Issue #15 supplies persistent guarded transitions and clean evidence for exact head SHAs. See the [action/guard table, caller trust contract and verification](../development/review-state-machine.md). The diagram below is the broader target workflow; separate budget states, provider dispatch and automatic notifications are not enabled.
 
 ```mermaid
 stateDiagram-v2
