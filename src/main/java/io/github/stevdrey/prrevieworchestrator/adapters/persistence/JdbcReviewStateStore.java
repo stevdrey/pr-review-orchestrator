@@ -23,28 +23,40 @@ public class JdbcReviewStateStore implements ReviewStateStore {
 
     public JdbcReviewStateStore(JdbcTemplate jdbc, PlatformTransactionManager manager) {
         this.jdbc = jdbc;
+        // Every operation sets transaction_timeout; fail startup rather than every transaction.
+        PostgresDeadlines.requireTransactionTimeout(jdbc, "review state");
         transactions = new TransactionTemplate(manager);
         transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         transactions.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
     }
 
     private <T> T transaction(Runnable authorize, Supplier<T> operation) {
-        return transactions.execute(status -> {
-            try {
-                PostgresDeadlines.apply(jdbc, DEADLINE);
-                authorize.run();
-                return operation.get();
-            } catch (ReviewConflict failure) {
-                throw new ReviewConflict(failure.code());
-            } catch (AuthorizationDenied failure) {
-                throw new AuthorizationDenied();
-            } catch (AuthorizationUnavailable failure) {
-                throw new AuthorizationUnavailable();
-            } catch (RuntimeException failure) {
-                // Sanitize before Spring rollback diagnostics, just as for durable dispatch.
-                throw new IllegalStateException("REVIEW_STATE_UNAVAILABLE");
-            }
-        });
+        try {
+            return transactions.execute(status -> {
+                try {
+                    PostgresDeadlines.apply(jdbc, DEADLINE);
+                    authorize.run();
+                    return operation.get();
+                } catch (RuntimeException failure) {
+                    // Sanitize before Spring rollback diagnostics, just as for durable dispatch.
+                    throw sanitized(failure);
+                }
+            });
+        } catch (RuntimeException failure) {
+            // COMMIT-time failures (deferred constraints, timeouts, connection loss) surface here.
+            throw sanitized(failure);
+        }
+    }
+
+    /** Copy only stable metadata, never causes, SQL text or suppressed exceptions. */
+    private static RuntimeException sanitized(RuntimeException failure) {
+        if (failure instanceof ReviewConflict conflict) return new ReviewConflict(conflict.code());
+        if (failure instanceof AuthorizationDenied) return new AuthorizationDenied();
+        if (failure instanceof AuthorizationUnavailable) return new AuthorizationUnavailable();
+        if (failure instanceof ReviewStateUnavailable known) return new ReviewStateUnavailable(known.retryable());
+        // Domain validation inside a transaction only fails for a corrupt persisted snapshot.
+        if (failure instanceof IllegalArgumentException) return new ReviewStateUnavailable(false);
+        return new ReviewStateUnavailable(true);
     }
 
     @Override
@@ -80,11 +92,17 @@ public class JdbcReviewStateStore implements ReviewStateStore {
         java.util.Objects.requireNonNull(command);
         return transaction(authorize, () -> {
             PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
-            boolean duplicate = !jdbc.queryForList("""
-                    SELECT 1 FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
+            String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
+                    ? command.newHeadSha() : command.expectedHeadSha();
+            var replays = jdbc.query("""
+                    SELECT expected_version = ? AND expected_head_sha = ? AND action = ? AND resulting_head_sha = ?
+                    FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
                     AND pr_number = ? AND transition_id = ?
-                    """, Integer.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), command.id()).isEmpty();
-            if (duplicate) throw new ReviewConflict(DUPLICATE_TRANSITION);
+                    """, (rs, row) -> rs.getBoolean(1), command.expectedVersion(), command.expectedHeadSha(),
+                    command.action().name(), resultingHead, pr.scope().installationId(), pr.scope().repositoryId(),
+                    pr.number(), command.id());
+            // A UUID reused for a different command must not be mistaken for an already-committed retry.
+            if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
             PullRequestReview next = current.transition(command);
             jdbc.update("""
                     UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,

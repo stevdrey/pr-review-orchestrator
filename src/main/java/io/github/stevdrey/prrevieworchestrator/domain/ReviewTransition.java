@@ -32,8 +32,6 @@ public record ReviewTransition(UUID id, long expectedVersion, String expectedHea
     }
 
     public static void requireSha(String sha) {
-        if (sha == null || !sha.matches("[0-9a-f]{40}|[0-9a-f]{64}")) {
-            throw new IllegalArgumentException("Invalid head SHA");
-        }
+        CommitSha.require(sha);
     }
 }

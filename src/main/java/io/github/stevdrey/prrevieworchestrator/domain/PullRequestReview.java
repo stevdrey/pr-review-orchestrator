@@ -67,14 +67,14 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
             }
             case BASELINE_CLEAN -> {
                 requireState(State.REVIEWING);
-                guard(!gates.blockingFindings());
+                guard(gates.eligible() && !gates.blockingFindings());
                 next = State.DEEP_REVIEW;
                 baseline = sha;
             }
             case DEEP_CLEAN -> {
                 requireState(State.DEEP_REVIEW);
                 if (deep != null) throw new ReviewConflict(ILLEGAL_TRANSITION);
-                guard(!gates.blockingFindings());
+                guard(gates.eligible() && !gates.blockingFindings());
                 deep = sha;
             }
             case MARK_READY_FOR_HUMAN -> {
@@ -89,7 +89,8 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
             }
             case RESUME -> {
                 requireState(State.PAUSED);
-                guard(gates.eligible() && (resume != State.READY_FOR_HUMAN || ready(gates)));
+                // NEW, ACTION_REQUIRED and WAITING_FOR_FIX permit no review work, so they need no eligibility.
+                guard(!reviewActive(resume) || (gates.eligible() && (resume != State.READY_FOR_HUMAN || ready(gates))));
                 next = resume;
                 resume = null;
             }
@@ -98,8 +99,10 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
                 sha = command.newHeadSha();
                 baseline = null;
                 deep = null;
-                if (state == State.PAUSED) resume = State.WAITING_FOR_REVIEW;
-                else next = State.WAITING_FOR_REVIEW;
+                // NEW stays NEW: only the eligibility-gated MARK_READY enters WAITING_FOR_REVIEW.
+                if (state == State.PAUSED) {
+                    if (resume != State.NEW) resume = State.WAITING_FOR_REVIEW;
+                } else if (state != State.NEW) next = State.WAITING_FOR_REVIEW;
             }
         }
         return new PullRequestReview(pr, sha, Math.incrementExact(version), next, resume, baseline, deep);
@@ -108,6 +111,11 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
     private void requireState(State... allowed) {
         for (State candidate : allowed) if (state == candidate) return;
         throw new ReviewConflict(ILLEGAL_TRANSITION);
+    }
+
+    private static boolean reviewActive(State state) {
+        return state == State.WAITING_FOR_REVIEW || state == State.REVIEWING
+                || state == State.DEEP_REVIEW || state == State.READY_FOR_HUMAN;
     }
 
     private static boolean ready(Gates gates) {

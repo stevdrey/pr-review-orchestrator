@@ -8,7 +8,7 @@ Implements [issue #15](https://github.com/stevdrey/pr-review-orchestrator/issues
 
 Flyway V5 adds `pr_review_states` and `pr_review_transitions`. Existing provider/stage/iteration `review_cycles`, findings, commands and their evidence are preserved. There is intentionally no backfill from old cycles: they cannot establish the authoritative current head. New callers initialize an aggregate only after fetching that head. Provider/stage cycles remain separate records and are not automatically updated by this use case.
 
-`ReviewLifecycle` calls the `ReviewStateStore` port with paired deployment/live repository authorization on every operation, including reads and duplicate attempts. `JdbcReviewStateStore` checks authorization inside a bounded, independent transaction; JDBC membership share locks prevent revocation from completing during that transaction. Mutations lock one PR row, check the transition key, expected version and expected SHA, apply the pure domain transition and atomically commit state plus a metadata-only journal entry. The transaction/network deadline is three seconds and requires PostgreSQL 17+. Callers must not hold outer transaction locks on these rows while calling the independent transaction.
+`ReviewLifecycle` calls the `ReviewStateStore` port with paired deployment/live repository authorization on every operation, including reads and duplicate attempts. `JdbcReviewStateStore` checks authorization inside a bounded, independent transaction; JDBC membership share locks prevent revocation from completing during that transaction. Mutations lock one PR row, check the transition key, expected version and expected SHA, apply the pure domain transition and atomically commit state plus a metadata-only journal entry. The transaction/network deadline is three seconds and requires PostgreSQL 17+; the store checks `transaction_timeout` support at startup. Callers must not hold outer transaction locks on these rows while calling the independent transaction.
 
 ## Transitions and guards
 
@@ -20,12 +20,12 @@ Every command carries a caller-stable UUID, expected version, expected head SHA,
 | `START_REVIEW` | `WAITING_FOR_REVIEW` | `REVIEWING`; eligible and review policy permits |
 | `BLOCKING_FINDINGS` | `REVIEWING`, `DEEP_REVIEW`, `READY_FOR_HUMAN` | `ACTION_REQUIRED`; blocking findings observed; clear both clean SHAs |
 | `AWAIT_FIX` | `ACTION_REQUIRED` | `WAITING_FOR_FIX` |
-| `BASELINE_CLEAN` | `REVIEWING` | `DEEP_REVIEW`; no blocking findings; record baseline clean SHA |
-| `DEEP_CLEAN` | `DEEP_REVIEW` | Keep state, record deep clean SHA once; no blocking findings |
+| `BASELINE_CLEAN` | `REVIEWING` | `DEEP_REVIEW`; eligible, no blocking findings; record baseline clean SHA |
+| `DEEP_CLEAN` | `DEEP_REVIEW` | Keep state, record deep clean SHA once; eligible, no blocking findings |
 | `MARK_READY_FOR_HUMAN` | `DEEP_REVIEW` | `READY_FOR_HUMAN`; both reviews clean for current SHA, eligible, no blockers, CI explicitly `PASSED` |
 | `PAUSE` | Any except `PAUSED` | Save resume state and clean evidence; enter `PAUSED` |
-| `RESUME` | `PAUSED` | Restore saved state; require eligibility; restoring `READY_FOR_HUMAN` also rechecks CI and blockers |
-| `UPDATE_HEAD` | Any | Require different SHA; clear both clean SHAs; enter `WAITING_FOR_REVIEW`, or stay paused with that resume state |
+| `RESUME` | `PAUSED` | Restore saved state; restoring `WAITING_FOR_REVIEW`, `REVIEWING`, `DEEP_REVIEW` or `READY_FOR_HUMAN` requires eligibility, and `READY_FOR_HUMAN` also rechecks CI and blockers; `NEW`, `ACTION_REQUIRED` and `WAITING_FOR_FIX` permit no review work and resume ungated |
+| `UPDATE_HEAD` | Any | Require different SHA; clear both clean SHAs; `NEW` stays `NEW` (only `MARK_READY` is the gated entry); other states enter `WAITING_FOR_REVIEW`, or stay paused with that resume state (a `NEW` resume target stays `NEW`) |
 
 `DEEP_REVIEW` identifies the required review stage; entering it does not dispatch a provider call. Clean deep evidence can be stored while CI is pending; readiness is a separate guarded action. This increment conservatively requires both clean stages. Optional-stage policy, separate budget/failure states and automatic no-progress stops remain future integrations; operators/callers can explicitly pause the current aggregate.
 
@@ -33,7 +33,7 @@ After every head change, including force-push and a return to a previously revie
 
 ## Rejection and concurrency
 
-Authorization failure takes precedence over state visibility. For authorized mutations, rejection order is missing aggregate, duplicate transition UUID, stale version, stale expected SHA, illegal action/state pair, then failed guards. Stable `ReviewConflict.Code` values are `NOT_FOUND`, `DUPLICATE_TRANSITION`, `STALE_VERSION`, `STALE_HEAD`, `ILLEGAL_TRANSITION`, `GUARD_REJECTED`; creation uses `ALREADY_EXISTS`. Rejected commands change neither aggregate nor journal.
+Authorization failure takes precedence over state visibility. For authorized mutations, rejection order is missing aggregate, previously used transition UUID, stale version, stale expected SHA, illegal action/state pair, then failed guards. Stable `ReviewConflict.Code` values are `NOT_FOUND`, `DUPLICATE_TRANSITION`, `TRANSITION_ID_REUSED`, `STALE_VERSION`, `STALE_HEAD`, `ILLEGAL_TRANSITION`, `GUARD_REJECTED`; creation uses `ALREADY_EXISTS`. Rejected commands change neither aggregate nor journal. A previously used UUID is `DUPLICATE_TRANSITION` only when the journaled expected version, expected SHA, action and resulting SHA match the retried command; a UUID reused for any other command is `TRANSITION_ID_REUSED` and must not be treated as committed. Other persistence failures, including deferred COMMIT failures, surface as `ReviewStateUnavailable` with a stable message, no cause and a `retryable()` flag (false for an invalid persisted snapshot).
 
 The transition UUID is scoped to installation/repository/PR and must remain unchanged on retry. Replays remain `DUPLICATE_TRANSITION` after later transitions or a restart. A fresh UUID with an old version is `STALE_VERSION`; a fresh version with an old SHA is `STALE_HEAD`. A semantically repeated action with a fresh UUID/version is rejected if the graph does not permit it (for example repeated `BASELINE_CLEAN` or `DEEP_CLEAN`). Concurrent distinct commands against one version have exactly one successful local commit. After an ambiguous database response, read state and reuse the original UUID; never invent a new key to force advancement.
 
@@ -57,10 +57,10 @@ The focused tests cover the entire action/state graph, full fix/review cycle, ev
 
 V5 is additive and creates empty tables; it does not enable background work or infer existing PR readiness. Before rollout, back up the database and validate migrations using the [database runbook](database.md). Stop callers before rollback. There is no down migration; preserve journals and use a reviewed forward correction or verified backup restore instead of dropping evidence. Live GitHub/provider integration, production deployment and end-to-end review/repair/notification behavior remain unverified.
 
-Local implementation verification on 2026-11-15 (America/Costa_Rica), Java 27 and disposable PostgreSQL 17.11:
+Local implementation verification on 2026-11-16 (after PR #48 review fixes) (America/Costa_Rica), Java 27 and disposable PostgreSQL 17.11:
 
-- Focused command above: passed, 39 tests, no failures or skips.
-- `./gradlew clean build`: passed, 134 tests, no failures, errors or skips. Existing Flyway-history assertions now include V5.
+- Focused command above: passed, 42 tests, no failures or skips.
+- `./gradlew clean build`: passed, 137 tests, no failures, errors or skips. Existing Flyway-history assertions now include V5.
 - `git diff --check` and relative documentation links: passed.
 
 GitHub Actions must be checked independently against the PR's exact head SHA. These results do not establish live provider behavior or production rollout readiness.

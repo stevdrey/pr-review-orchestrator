@@ -93,7 +93,30 @@ class PullRequestReviewTest {
         if (source == PAUSED) {
             assertEquals(PAUSED, state.state());
             assertEquals(WAITING_FOR_REVIEW, step(state, RESUME).state());
-        } else assertEquals(WAITING_FOR_REVIEW, state.state());
+        } else assertEquals(source == NEW ? NEW : WAITING_FOR_REVIEW, state.state());
+    }
+
+    @Test
+    void headChangeNeverBypassesMarkReadyEligibility() {
+        var draft = new Gates(true, true, false, true, false, Ci.PASSED);
+        var fresh = PullRequestReview.initial(PR, HEAD);
+        assertEquals(NEW, fresh.transition(command(fresh, UPDATE_HEAD, draft)).state());
+        var paused = step(fresh, PAUSE);
+        var moved = paused.transition(command(paused, UPDATE_HEAD, draft));
+        assertEquals(PAUSED, moved.state());
+        assertEquals(NEW, moved.resumeState());
+    }
+
+    @Test
+    void resumeToStatesWithoutReviewWorkDoesNotRequireEligibility() {
+        var draft = new Gates(true, true, false, true, false, Ci.PASSED);
+        var held = new Gates(true, false, true, true, false, Ci.PASSED);
+        for (State source : List.of(NEW, ACTION_REQUIRED, WAITING_FOR_FIX)) {
+            for (Gates gates : List.of(draft, held)) {
+                var paused = step(at(source), PAUSE);
+                assertEquals(source, paused.transition(command(paused, RESUME, gates)).state());
+            }
+        }
     }
 
     @Test
@@ -129,6 +152,8 @@ class PullRequestReviewTest {
             rejected(at(NEW), MARK_READY, gates);
             rejected(at(WAITING_FOR_REVIEW), START_REVIEW, gates);
             rejected(at(PAUSED), RESUME, gates);
+            rejected(at(REVIEWING), BASELINE_CLEAN, gates);
+            rejected(at(DEEP_REVIEW), DEEP_CLEAN, gates);
             rejected(step(at(DEEP_REVIEW), DEEP_CLEAN), MARK_READY_FOR_HUMAN, gates);
         }
         rejected(at(WAITING_FOR_REVIEW), START_REVIEW, new Gates(true, false, false, false, false, Ci.PASSED));

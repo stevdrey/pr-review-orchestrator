@@ -118,6 +118,23 @@ class ReviewStateIntegrationTest {
     }
 
     @Test
+    void reusedTransitionIdForDifferentCommandIsNotReportedAsCommitted() {
+        var ready = step(lifecycle.create(FIRST, HEAD), MARK_READY);
+        var pause = command(ready, PAUSE);
+        var paused = lifecycle.apply(FIRST, pause);
+        var blocking = new Gates(true, false, false, true, true, Ci.PASSED);
+        assertCode(TRANSITION_ID_REUSED, () -> lifecycle.apply(FIRST,
+                new ReviewTransition(pause.id(), paused.version(), HEAD, BLOCKING_FINDINGS, null, blocking)));
+        assertCode(TRANSITION_ID_REUSED, () -> lifecycle.apply(FIRST,
+                new ReviewTransition(pause.id(), paused.version(), HEAD, PAUSE, null, CLEAR)));
+        assertCode(TRANSITION_ID_REUSED, () -> lifecycle.apply(FIRST,
+                new ReviewTransition(pause.id(), pause.expectedVersion(), HEAD, UPDATE_HEAD, NEXT, CLEAR)));
+        assertCode(DUPLICATE_TRANSITION, () -> lifecycle.apply(FIRST, pause));
+        assertEquals(2, journalCount());
+        assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
+    }
+
+    @Test
     void simultaneousIdenticalTransitionsHaveOneCommitAndDeterministicDuplicateRejections() throws Exception {
         var initial = lifecycle.create(FIRST, HEAD);
         var request = command(initial, MARK_READY);
@@ -205,7 +222,11 @@ class ReviewStateIntegrationTest {
                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_review_commit()
                 """);
         try {
-            assertThrows(RuntimeException.class, () -> lifecycle.apply(FIRST, request));
+            var failure = assertThrows(ReviewStateUnavailable.class, () -> lifecycle.apply(FIRST, request));
+            assertEquals("REVIEW_STATE_UNAVAILABLE", failure.getMessage());
+            assertTrue(failure.retryable());
+            assertNull(failure.getCause());
+            assertEquals(0, failure.getSuppressed().length);
             assertEquals(initial, newLifecycle().find(FIRST).orElseThrow());
             assertEquals(0, journalCount());
         } finally {
