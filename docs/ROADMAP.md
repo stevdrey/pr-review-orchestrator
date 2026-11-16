@@ -2,6 +2,8 @@
 
 **Status:** Initial implementation. The Java service bootstrap, PostgreSQL/Flyway schema and opt-in GitHub App authentication/installation authorization are present, with a local Compose database and integration tests. [App registration and rotation](github/app-setup.md) have an operator runbook; [live development registration and scoped-token verification](github/issue-11-registration-evidence.md) are recorded separately from local tests, with remote invalidation limitations. Issue #12 adds opt-in signed webhook ingress with authorized, deduplicated metadata acceptance; [configuration, routes and limits](github/webhook-ingress.md) are documented. Issue #13 adds [durable dispatch infrastructure](development/durable-dispatch.md): transactional command deduplication, fenced leases, bounded retries, SHA/remote-outcome reconciliation gates and dead-letter/correlation visibility. Ticks remain disabled until approved event-planning and command adapters exist; live review orchestration remains planned. Issue trackers are the source of truth for implementation.
 
+Issue #15 implements the [internal persistent PR review state machine](development/review-state-machine.md): explicit guards, per-PR optimistic versions, transactional transition deduplication, pause/resume and clean-evidence invalidation on every head change. It does not enable live planning, provider reviews, finding normalization, budget accounting or notifications.
+
 ## Milestones
 
 | Phase | Priority | Outcome | Exit condition |

@@ -20,7 +20,7 @@ public final class DurableWork {
             Integer prNumber, String observedHeadSha) {}
     public record Intent(int prNumber, String expectedHeadSha, String stage, String provider, String type) {
         public Intent {
-            if (prNumber <= 0 || expectedHeadSha == null || !expectedHeadSha.matches("[0-9a-f]{40}|[0-9a-f]{64}")) {
+            if (prNumber <= 0 || !CommitSha.isValid(expectedHeadSha)) {
                 throw new IllegalArgumentException("Invalid command identity");
             }
             for (String value : new String[] {stage, provider, type}) {
@@ -38,7 +38,7 @@ public final class DurableWork {
     public record Command(Lease lease, RepositoryScope scope, Intent intent, String key) {}
     public record RemoteState(String currentHeadSha, RemoteEffect effect) {
         public RemoteState {
-            if (currentHeadSha == null || !currentHeadSha.matches("[0-9a-f]{40}|[0-9a-f]{64}") || effect == null) {
+            if (!CommitSha.isValid(currentHeadSha) || effect == null) {
                 throw new IllegalArgumentException("Invalid remote state");
             }
         }

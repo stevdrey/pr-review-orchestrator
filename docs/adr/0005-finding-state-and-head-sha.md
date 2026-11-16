@@ -1,6 +1,6 @@
 # ADR 0005: Durable findings and per-head-SHA review evidence
 
-**Status:** Accepted (implementation pending)  
+**Status:** Accepted (persistent PR state and SHA-bound clean evidence implemented; finding normalization and live provider correlation pending)
 **Date:** 2026-11-13
 
 ## Context
@@ -22,3 +22,5 @@ Treat all comments as threads: misses general feedback. Accept resolved checkbox
 ## Verification
 
 General-only feedback; deleted/edited comment; no-finding review; thread resolved before code changed; force-push invalidating a previously clean result.
+
+Issue #15 implements the [persistent local review state contract](../development/review-state-machine.md), including guarded transitions, version/key rejection, pause/resume and invalidation of both clean stage SHAs after every head change. Existing cycle/finding schema and provenance are preserved. This does not itself prove or ingest live provider results or finding dispositions.

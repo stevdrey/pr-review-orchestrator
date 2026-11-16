@@ -1,5 +1,6 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.github.webhook;
 
+import io.github.stevdrey.prrevieworchestrator.domain.CommitSha;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.domain.VerifiedDelivery;
 import java.security.MessageDigest;
@@ -9,7 +10,6 @@ import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.regex.Pattern;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
@@ -17,7 +17,6 @@ import tools.jackson.databind.json.JsonMapper;
 
 /** Explicit metadata routes, without interpretation of comment text, conclusions or review verdicts. */
 final class GitHubWebhookPayload {
-    private static final Pattern SHA = Pattern.compile("[0-9a-f]{40}|[0-9a-f]{64}");
     private static final JsonMapper JSON = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
@@ -97,7 +96,7 @@ final class GitHubWebhookPayload {
     }
 
     private static String sha(JsonNode node) {
-        require(node.isString() && SHA.matcher(node.asText()).matches());
+        require(node.isString() && CommitSha.isValid(node.asText()));
         return node.asText();
     }
 

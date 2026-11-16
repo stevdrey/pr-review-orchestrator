@@ -2,7 +2,7 @@
 
 > Event-driven, provider-neutral pull request review orchestration.
 
-**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; durable dispatch infrastructure now exists behind an opt-in switch requiring approved planning/command adapters. Live review orchestration remains planned.
+**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; durable dispatch infrastructure now exists behind an opt-in switch requiring approved planning/command adapters. An internal persistent PR review state machine enforces versioned transitions and SHA-bound clean evidence. Live review orchestration remains planned.
 
 PR Review Orchestrator is an independent open-source project to coordinate GitHub pull request reviews, CI events, remediation feedback and AI agents. The first target repositories are [Dokene](https://github.com/stevdrey/dokene) and [Monada Neuron](https://github.com/stevdrey/monada-neuron), but the architecture is repository-agnostic.
 
@@ -62,6 +62,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [GitHub App registration, authorization and rotation](docs/github/app-setup.md)
 - [Signed webhook ingress, replay handling and rotation](docs/github/webhook-ingress.md)
 - [Review lifecycle](docs/architecture/review-lifecycle.md)
+- [Persistent PR review state, guards and verification](docs/development/review-state-machine.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Codex attribution spike and test protocol](docs/spikes/issue-14-codex-attribution.md)
