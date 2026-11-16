@@ -1,6 +1,6 @@
 # Domain model
 
-Issue #15 implements `PullRequestId`, immutable `PullRequestReview`, `ReviewTransition`, the `ReviewLifecycle` use case and `ReviewStateStore` port with PostgreSQL persistence. The aggregate owns the current observed head, version, explicit lifecycle state, resume target and baseline/deep clean SHAs. It is separate from the provider/stage/iteration `review_cycles` ledger. See the [implemented transition contract](../development/review-state-machine.md). Other concepts below remain architecture targets or schema foundations.
+Issue #15 implements `PullRequestId`, immutable `PullRequestReview`, `ReviewTransition`, the `ReviewLifecycle` use case and `ReviewStateStore` port with PostgreSQL persistence. The aggregate owns the current observed head, version, explicit lifecycle state, resume target and baseline/deep clean SHAs. It is separate from the provider/stage/iteration `review_cycles` ledger. See the [implemented transition contract](../development/review-state-machine.md). Issue #16 adds provider-neutral `ReviewEvidence` snapshots and an authorized `IngestReviewEvidence` use case, with immutable source metadata and stable inline candidate identities linked to per-round finding occurrences. See the [ingestion and SHA contract](../development/review-evidence.md). Other concepts below remain architecture targets or schema foundations.
 
 | Concept | Core fields | Invariants |
 | --- | --- | --- |
