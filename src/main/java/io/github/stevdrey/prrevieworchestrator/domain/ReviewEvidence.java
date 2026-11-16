@@ -18,7 +18,9 @@ public final class ReviewEvidence {
             text(id); Objects.requireNonNull(kind);
             Objects.requireNonNull(severity);
             if (kind != Kind.REVIEW_THREAD) {
-                Objects.requireNonNull(updatedAt); CommitSha.require(reviewedSha);
+                // A null commit (e.g. after a force-push) is recorded as unknown and staleFor() treats it as stale.
+                Objects.requireNonNull(updatedAt);
+                if (reviewedSha != null) CommitSha.require(reviewedSha);
                 if (bodySha256 == null || !bodySha256.matches("[0-9a-f]{64}")) invalid();
             }
             if (originalSha != null) CommitSha.require(originalSha);
@@ -30,7 +32,7 @@ public final class ReviewEvidence {
                 if (threadId != null || replyToId != null || resolved != null || outdated != null
                         || reviewState == null || !id.equals(reviewId) || severity != Severity.UNKNOWN) invalid();
             } else if (kind == Kind.REVIEW_COMMENT) {
-                if (threadId == null || reviewId == null || resolved == null || outdated == null) invalid();
+                if (threadId == null || resolved == null || outdated == null) invalid();
             } else if (!id.equals(threadId) || reviewId != null || reviewedSha != null || originalSha != null
                     || updatedAt != null || bodySha256 != null || replyToId != null || author != null
                     || resolved == null || outdated == null || severity != Severity.UNKNOWN) invalid();
@@ -57,7 +59,15 @@ public final class ReviewEvidence {
         public Conflict() { super("Review evidence conflict"); }
     }
     public static final class Unavailable extends RuntimeException {
-        public Unavailable() { super("Review evidence unavailable"); }
+        private final boolean retryable;
+
+        /** @param retryable false when the snapshot or its data deterministically fails; retrying cannot help */
+        public Unavailable(boolean retryable) {
+            super("Review evidence unavailable");
+            this.retryable = retryable;
+        }
+
+        public boolean retryable() { return retryable; }
     }
     private static void text(String value) {
         if (value == null || value.isBlank() || value.length() > 1024) invalid();

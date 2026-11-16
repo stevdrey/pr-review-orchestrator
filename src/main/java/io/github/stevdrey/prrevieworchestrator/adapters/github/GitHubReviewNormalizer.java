@@ -3,8 +3,6 @@ package io.github.stevdrey.prrevieworchestrator.adapters.github;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.*;
 import tools.jackson.core.StreamReadFeature;
@@ -26,8 +24,8 @@ public final class GitHubReviewNormalizer {
     /** Severity classifications are explicit caller input; review prose cannot change dispositions. */
     public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
             Instant capturedAt, byte[] response, Map<String, Severity> severities) {
-        require(response.length <= 2 * 1024 * 1024);
         try {
+            require(response.length <= 2 * 1024 * 1024);
             JsonNode root = JSON.readTree(response);
             require(root != null && root.isObject() && !root.has("errors"));
             JsonNode repository = root.path("data").path("repository");
@@ -42,7 +40,7 @@ public final class GitHubReviewNormalizer {
             for (JsonNode review : nodes(pull.path("reviews"))) {
                 String id = string(review, "id");
                 sources.add(new Source(id, Kind.REVIEW, id, null, null, author(review),
-                        string(review.path("commit"), "oid"), null, hash(body(review)),
+                        optionalString(review.path("commit"), "oid"), null, hash(body(review)),
                         Instant.parse(string(review, "updatedAt")), string(review, "state"),
                         null, null, null, null, null, Severity.UNKNOWN));
             }
@@ -56,10 +54,10 @@ public final class GitHubReviewNormalizer {
                 for (JsonNode comment : nodes(thread.path("comments"))) {
                     String id = string(comment, "id");
                     sources.add(new Source(id, Kind.REVIEW_COMMENT,
-                            string(comment.path("pullRequestReview"), "id"), threadId,
+                            optionalString(comment.path("pullRequestReview"), "id"), threadId,
                             optionalString(comment.path("replyTo"), "id"), author(comment),
-                            string(comment.path("commit"), "oid"),
-                            string(comment.path("originalCommit"), "oid"), hash(body(comment)),
+                            optionalString(comment.path("commit"), "oid"),
+                            optionalString(comment.path("originalCommit"), "oid"), hash(body(comment)),
                             Instant.parse(string(comment, "updatedAt")), null, resolved, outdated,
                             string(comment, "path"), position(comment, "line"), position(comment, "originalLine"),
                             severities.getOrDefault(id, Severity.UNKNOWN)));
@@ -102,10 +100,5 @@ public final class GitHubReviewNormalizer {
     private void require(boolean value) {
         if (!value) throw new IllegalArgumentException("Invalid GitHub evidence");
     }
-    private String hash(String value) {
-        try {
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException failure) { throw new IllegalStateException("Digest unavailable"); }
-    }
+    private String hash(String value) { return Sha256.hex(value.getBytes(StandardCharsets.UTF_8)); }
 }

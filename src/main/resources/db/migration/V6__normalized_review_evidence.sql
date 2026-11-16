@@ -41,8 +41,9 @@ CREATE TABLE review_evidence_sources (
     CHECK ((source_kind <> 'REVIEW') = (thread_id IS NOT NULL)),
     CHECK ((source_kind <> 'REVIEW') = (thread_resolved IS NOT NULL)),
     CHECK ((source_kind <> 'REVIEW') = (thread_outdated IS NOT NULL)),
-    CHECK (source_kind = 'REVIEW_THREAD' OR
-        (reviewed_sha IS NOT NULL AND review_id IS NOT NULL AND body_sha256 IS NOT NULL AND source_updated_at IS NOT NULL))
+    -- reviewed_sha/review_id may be NULL when GitHub no longer resolves the commit/review; such sources are stale.
+    CHECK (source_kind = 'REVIEW_THREAD' OR (body_sha256 IS NOT NULL AND source_updated_at IS NOT NULL)),
+    CHECK (source_kind <> 'REVIEW' OR review_id IS NOT NULL)
 );
 
 -- Stable identity is scoped by installation/repository/PR/provider/source; never by mutable text/line.

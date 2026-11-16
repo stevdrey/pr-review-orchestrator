@@ -60,7 +60,9 @@ class GitHubReviewNormalizerTest {
                 fixture.replace("\"databaseId\": 1001", "\"databaseId\": 2002"),
                 fixture.replace("\"number\": 7", "\"number\": 8"),
                 fixture.replace("\"headRefOid\": \"" + HEAD, "\"headRefOid\": \"b" + HEAD.substring(1)),
-                fixture.replace("\"commit\": { \"oid\": \"" + HEAD + "\" }", "\"commit\": null"),
+                fixture.replaceFirst("\"commit\": \\{ \"oid\": \"" + HEAD + "\" \\},", ""),
+                fixture.replace("\"originalCommit\": { \"oid\": \"" + "c".repeat(40) + "\" }",
+                        "\"originalCommit\": { \"oid\": \"not-a-sha\" }"),
                 fixture.replace("\"line\": 12", "\"line\": -1"),
                 fixture.replace("\"id\": \"C2\"", "\"id\": \"C1\""),
                 fixture.replace("\"replyTo\": null,", ""),
@@ -72,6 +74,29 @@ class GitHubReviewNormalizerTest {
             assertEquals("Incomplete or invalid GitHub review snapshot", failure.getMessage());
             assertNull(failure.getCause());
         }
+        for (byte[] invalid : new byte[][] {new byte[2 * 1024 * 1024 + 1], null}) {
+            var failure = assertThrows(IllegalArgumentException.class, () -> normalizer.normalize(UUID.randomUUID(),
+                    UUID.randomUUID(), PR, HEAD, Instant.parse("2026-11-16T11:00:00Z"), invalid, Map.of()));
+            assertEquals("Incomplete or invalid GitHub review snapshot", failure.getMessage());
+            assertNull(failure.getCause());
+        }
+    }
+
+    @Test
+    void unresolvableCommitsAndReviewsAreRecordedAsUnknownAndStaleRatherThanRejectingThePr() throws Exception {
+        var snapshot = normalize(fixture()
+                .replace("\"commit\": { \"oid\": \"" + HEAD + "\" }", "\"commit\": null")
+                .replace("\"originalCommit\": { \"oid\": \"" + "c".repeat(40) + "\" }", "\"originalCommit\": null")
+                .replace("\"pullRequestReview\": { \"id\": \"R1\" }, \"replyTo\": null",
+                        "\"pullRequestReview\": null, \"replyTo\": null"), Map.of());
+        var root = source(snapshot, "C1");
+        assertNull(root.reviewedSha());
+        assertNull(root.originalSha());
+        assertNull(root.reviewId());
+        assertTrue(root.candidate());
+        assertTrue(root.staleFor(HEAD));
+        assertNull(source(snapshot, "R1").reviewedSha());
+        assertTrue(source(snapshot, "R1").staleFor(HEAD));
     }
 
     private Snapshot normalize(String json, Map<String, Severity> severity) {

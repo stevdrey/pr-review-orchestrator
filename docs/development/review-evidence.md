@@ -41,7 +41,7 @@ repository(owner: $owner, name: $name) {
 }
 ```
 
-The checked fixture is synthetic, shaped after these fields, and does not demonstrate a live GitHub query. Unavailable/deleted commits or missing source metadata fail closed rather than substituting the PR head. Deleted authors may have a null login. Threads themselves have no reviewed SHA or body; those fields remain null, including for empty threads.
+The checked fixture is synthetic, shaped after these fields, and does not demonstrate a live GitHub query. A `null` `commit`, `originalCommit` or `pullRequestReview` (for example after a force-push) is recorded as an unknown SHA/review on that source only; `Source.staleFor` treats it as stale and the PR head is never substituted. Missing fields still reject the whole snapshot. Deleted authors may have a null login. Threads themselves have no reviewed SHA or body; those fields remain null, including for empty threads.
 
 ## Identity, provenance and freshness
 
@@ -55,7 +55,7 @@ Per-cycle locks serialize writes. Older captured snapshots remain in history and
 
 ## Resolution, edits and absence
 
-`thread_resolved` and `thread_outdated` are independent source observations. A fresh root-comment observation leaves or conservatively resets its occurrence to `OPEN`, clears disposition/fix evidence, and updates resolution/severity. Only a separate future verification/disposition workflow may assert `VERIFIED_FIXED`. Identical persistence retries leave dispositions untouched. Resolving a thread, approving/dismissing a review, changing a body, deleting a comment, or receiving a reply does not prove a fix.
+`thread_resolved` and `thread_outdated` are independent source observations. A newer root-comment observation updates resolution/severity and links the occurrence to the new snapshot. Only when the comment revision changed (body hash or `updatedAt` differs from the linked source) does it conservatively reset the occurrence to `OPEN` and clear disposition/fix evidence; an unchanged re-read keeps the existing disposition. Legacy occurrences without a linked snapshot are reset on first observation. Only a separate future verification/disposition workflow may assert `VERIFIED_FIXED`. Identical persistence retries leave dispositions untouched. Resolving a thread, approving/dismissing a review, changing a body, deleting a comment, or receiving a reply does not prove a fix.
 
 Absence from a later snapshot does not imply deletion, dismissal or a clean review. The old source revisions and candidate remain. Empty threads still retain their observed resolution/outdated state separately; they do not rewrite the missing root's historical occurrence. There is no authoritative deletion/tombstone API in this increment, and metadata-only history cannot recover text removed on GitHub. Production retention, deletion and encrypted storage policy must be established before rollout.
 

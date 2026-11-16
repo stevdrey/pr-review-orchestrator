@@ -103,6 +103,33 @@ class ReviewEvidenceIntegrationTest {
     }
 
     @Test
+    void unchangedReReadKeepsDispositionAndNullCommitIsStoredAsStale() {
+        ingestion.ingest(snapshot(UUID.randomUUID(), firstCycle, HEAD, TIME, json));
+        jdbc.update("""
+                UPDATE findings SET status = 'DISMISSED', disposition_actor = 'fixture-human',
+                    disposition_reason = 'Fixture dismissal'
+                """);
+        // Only thread resolution and an unrelated reply's commit change; the root comment revision is unchanged.
+        var reread = snapshot(UUID.randomUUID(), firstCycle, HEAD, TIME.plusSeconds(1), json
+                .replace("\"isResolved\": false", "\"isResolved\": true")
+                .replace("\"originalCommit\": { \"oid\": \"" + HEAD + "\" }", "\"originalCommit\": null")
+                .replace("\"pullRequestReview\": { \"id\": \"R1\" }, \"replyTo\": { \"id\": \"C1\" }",
+                        "\"pullRequestReview\": null, \"replyTo\": { \"id\": \"C1\" }")
+                .replace("\"commit\": { \"oid\": \"" + HEAD + "\" },\n        \"originalCommit\": null",
+                        "\"commit\": null,\n        \"originalCommit\": null"));
+        assertTrue(ingestion.ingest(reread));
+        var finding = jdbc.queryForMap("SELECT * FROM findings");
+        assertEquals("DISMISSED", finding.get("status"));
+        assertEquals("fixture-human", finding.get("disposition_actor"));
+        assertEquals(true, finding.get("thread_resolved"));
+        assertEquals(reread.id(), finding.get("evidence_snapshot_id"));
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM review_evidence_sources WHERE snapshot_id = ? AND source_id = 'C2'
+                    AND reviewed_sha IS NULL AND original_sha IS NULL AND review_id IS NULL
+                """, Integer.class, reread.id()));
+    }
+
+    @Test
     void sameFindingAcrossRoundsKeepsStableIdentityAndStaleSourceCommit() {
         ingestion.ingest(snapshot(UUID.randomUUID(), firstCycle, HEAD, TIME, json));
         String newHead = json.replace("\"headRefOid\": \"" + HEAD, "\"headRefOid\": \"" + NEXT)
@@ -177,6 +204,7 @@ class ReviewEvidenceIntegrationTest {
                     snapshot(UUID.randomUUID(), firstCycle, HEAD, TIME, json)));
             assertNull(failure.getCause());
             assertEquals("Review evidence unavailable", failure.getMessage());
+            assertTrue(failure.retryable());
             for (String table : List.of("review_evidence_snapshots", "review_evidence_sources", "finding_identities", "findings")) {
                 assertEquals(0, count(table), table);
             }
