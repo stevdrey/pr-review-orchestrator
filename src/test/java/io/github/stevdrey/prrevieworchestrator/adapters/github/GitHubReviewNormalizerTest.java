@@ -78,10 +78,10 @@ class GitHubReviewNormalizerTest {
         return normalizer.normalize(UUID.randomUUID(), UUID.randomUUID(), PR, HEAD,
                 Instant.parse("2026-11-16T11:00:00Z"), json.getBytes(StandardCharsets.UTF_8), severity);
     }
-    private static Source source(Snapshot s, String id) {
+    private Source source(Snapshot s, String id) {
         return s.sources().stream().filter(source -> source.id().equals(id)).findFirst().orElseThrow();
     }
-    static String fixture() throws Exception {
+    String fixture() throws Exception {
         try (var stream = GitHubReviewNormalizerTest.class.getResourceAsStream("/github/review-snapshot.json")) {
             return new String(Objects.requireNonNull(stream).readAllBytes(), StandardCharsets.UTF_8);
         }

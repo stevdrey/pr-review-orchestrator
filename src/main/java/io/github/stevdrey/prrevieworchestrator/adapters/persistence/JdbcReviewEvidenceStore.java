@@ -113,7 +113,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 Timestamp.from(snapshot.capturedAt()));
     }
 
-    private static RuntimeException sanitized(RuntimeException failure) {
+    private RuntimeException sanitized(RuntimeException failure) {
         if (failure instanceof AuthorizationDenied) return new AuthorizationDenied();
         if (failure instanceof AuthorizationUnavailable) return new AuthorizationUnavailable();
         if (failure instanceof Conflict) return new Conflict();
@@ -121,7 +121,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
     }
 
     /** Length-prefixed fields avoid delimiter collisions in untrusted paths, logins and provider IDs. */
-    private static String fingerprint(Snapshot snapshot) {
+    private String fingerprint(Snapshot snapshot) {
         try {
             var bytes = new ByteArrayOutputStream();
             var out = new DataOutputStream(bytes);
@@ -137,7 +137,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         } catch (IOException | java.security.NoSuchAlgorithmException ignored) { throw new Unavailable(); }
     }
 
-    private static void fields(DataOutputStream out, Object... values) throws IOException {
+    private void fields(DataOutputStream out, Object... values) throws IOException {
         for (Object value : values) {
             if (value == null) { out.writeInt(-1); continue; }
             byte[] encoded = value.toString().getBytes(StandardCharsets.UTF_8);

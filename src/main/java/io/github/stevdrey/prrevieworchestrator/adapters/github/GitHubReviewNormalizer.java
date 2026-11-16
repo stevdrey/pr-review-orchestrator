@@ -72,37 +72,37 @@ public final class GitHubReviewNormalizer {
         }
     }
 
-    private static Iterable<JsonNode> nodes(JsonNode connection) {
+    private Iterable<JsonNode> nodes(JsonNode connection) {
         require(connection.path("nodes").isArray() && connection.path("pageInfo").path("hasNextPage").isBoolean()
                 && !connection.path("pageInfo").path("hasNextPage").booleanValue());
         return connection.path("nodes");
     }
-    private static String author(JsonNode node) { return optionalString(node.path("author"), "login"); }
-    private static String body(JsonNode node) {
+    private String author(JsonNode node) { return optionalString(node.path("author"), "login"); }
+    private String body(JsonNode node) {
         require(node.path("body").isString()); return node.path("body").asString();
     }
-    private static String optionalString(JsonNode node, String field) {
+    private String optionalString(JsonNode node, String field) {
         require(!node.isMissingNode());
         if (node.isNull()) return null;
         return string(node, field);
     }
-    private static String string(JsonNode node, String field) {
+    private String string(JsonNode node, String field) {
         require(node.path(field).isString() && !node.path(field).asString().isBlank());
         return node.path(field).asString();
     }
-    private static boolean bool(JsonNode node, String field) {
+    private boolean bool(JsonNode node, String field) {
         require(node.path(field).isBoolean()); return node.path(field).booleanValue();
     }
-    private static Integer position(JsonNode node, String field) {
+    private Integer position(JsonNode node, String field) {
         require(node.has(field));
         if (node.path(field).isNull()) return null;
         require(node.path(field).isIntegralNumber() && node.path(field).canConvertToInt());
         return node.path(field).intValue();
     }
-    private static void require(boolean value) {
+    private void require(boolean value) {
         if (!value) throw new IllegalArgumentException("Invalid GitHub evidence");
     }
-    private static String hash(String value) {
+    private String hash(String value) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(value.getBytes(StandardCharsets.UTF_8)));
