@@ -185,6 +185,54 @@ increment cannot validate it. Before another experiment, require its own approve
 PR/event, snapshots, code/security settings, bound and cleanup plan. Do not enable
 repository-wide automatic review to fill this evidence gap.
 
+### Second authorized experiment: first review on PR #51
+
+The owner separately authorized exactly one `@codex review` request on the new
+[investigation PR #51](https://github.com/stevdrey/pr-review-orchestrator/pull/51)
+to investigate whether a first review of a different PR changes the counter.
+This is a separate observation window, not a retry of the PR #406 request.
+
+- Preflight: repository ID `1457036208`, PR #51 open and **draft**, author
+  `stevdrey`, base `507423c349ebbbaad0900509809a9eef3570c16b`, head
+  `5cb41c2b52fbc62fe9cb7411e1b82532202f12af`. GitHub returned no existing
+  conversation comments or reviews. The diff contains this investigation's six
+  documentation files. The PR was left in draft; no shared setting changed.
+- Baseline reference: last owner-reported panel reading was **47 PRs reviewed**
+  and **12 issues found**, received by 03:36:44 UTC. No fresh snapshot immediately
+  before this second request was supplied. Delayed reporting of PR #406 or other
+  activity could therefore affect the comparison. Repository, PR authorship and
+  draft state also differ from the first experiment.
+- Experiment key:
+  `issue42/1457036208/51/5cb41c2b52fbc62fe9cb7411e1b82532202f12af/manual-code/1`.
+- `github.add_comment_to_issue` posted exactly one
+  [request](https://github.com/stevdrey/pr-review-orchestrator/pull/51#issuecomment-6937488661)
+  at **2026-11-17 03:40:53 UTC** (2026-11-16 21:40:53 America/Costa_Rica),
+  actor `stevdrey`, body exactly `@codex review`. Credential type is not exposed.
+  The subsequent read was interrupted; a fresh read verified the existing comment
+  without resubmitting it.
+- [Provider summary](https://github.com/stevdrey/pr-review-orchestrator/pull/51#issuecomment-6937494471)
+  reported a manual code review running from **03:41:06.138558 UTC** on the full
+  expected head. It reported completion at **03:42:15.627909 UTC**
+  (2026-11-16 21:42:15 America/Costa_Rica), with no findings. The
+  [separate receipt](https://github.com/stevdrey/pr-review-orchestrator/pull/51#issuecomment-6937519196)
+  was created at 03:42:14 UTC and identifies short SHA `5cb41c2b52`.
+  Security-review state was null. Completion does not establish billed identity,
+  units or charge mechanism.
+- First post-completion counter reading: the owner again reported **47 PRs
+  reviewed / 12 issues found**, received by **2026-11-17 03:44:25 UTC**
+  (2026-11-16 21:44:25 America/Costa_Rica). Exact capture time, selected filters
+  and provider update time were not independently available. Visible difference
+  from the last baseline is zero for both metrics. The owner suggested a larger
+  refresh window; this remains plausible but unverified. The reading is
+  provisional, not evidence of zero consumption or rejection of this first review.
+- Any later observation must record capture/update times, the same reporting
+  scope, and intervening activity. No further review request will be sent to force
+  movement. The existing 48-hour local reporting cutoff is not a provider SLA;
+  even expiry without a visible increment leaves attribution inconclusive.
+- No temporary credentials, test PR or setting change requires rollback. Hold
+  evidence pushes while this review and comparison are in progress so the
+  reviewed head stays stable. This does not enable any service request adapter.
+
 ## Production decision and escalation
 
 Under [ADR 0002](../adr/0002-github-app-webhook-trust.md) and
@@ -221,7 +269,8 @@ confirmation becomes available, separately for each trigger and account context.
   retained only source capabilities and limitations, not private account data.
 - Initial read-only `git ls-remote origin refs/heads/main` failed sandbox DNS;
   the network-authorized retry succeeded.
-- Exactly one review request was posted as recorded above. No provider Support
+- Exactly two separately authorized review requests were posted, one per
+  experiment, as recorded above. No provider Support
   messages, credential creation or shared settings changes were performed.
   No tokens or private usage exports were saved.
 - Earlier issue #14 cleanup is recorded in its report; it was not repeated or
@@ -234,14 +283,14 @@ confirmation becomes available, separately for each trigger and account context.
   documents; passed. These checks do not validate external billing attribution.
 
 Acceptance remains partial: individual accounting and written confirmation are
-missing; the two cases and safe fallback are documented. Both post-completion
-counter readings showed no increase, but reporting freshness is unknown. Manual
-trigger/completion evidence is confirmed for this
-connector-mediated test; per-review accounting remains unknown.
+missing; the two historical cases, two new connector manual experiments and safe
+fallback are documented. All owner-reported post-completion counter readings
+showed no increase, but reporting freshness is unknown. Manual trigger/completion
+evidence is confirmed for both new tests; per-review accounting remains unknown.
 
 | Issue #42 criterion | Current evidence / remaining requirement |
 | --- | --- |
 | Authoritative accounting source or written confirmation | Not achieved: no per-review account/workspace, correlation or mechanism established; provider request prepared, not submitted |
-| Separate manual and automatic assessments | Historical cases and the new connector manual test documented; units and billing identity remain unknown for each. Two manual counter observations unchanged; comparison inconclusive |
+| Separate manual and automatic assessments | Historical cases and two new connector manual tests documented; units and billing identity remain unknown for each. Reported counters unchanged after both experiments; comparisons inconclusive |
 | Safe production decision and fallback | Documented: both service request paths stay disabled, missing usage cannot bypass budget gates, owner handoff or separately approved metered provider |
-| Commands, dates, sanitized evidence and cleanup | Recorded above; one new request, SHA-bound completion, two owner-reported counter readings, no new credentials or settings to undo. Provider reporting freshness remains unavailable |
+| Commands, dates, sanitized evidence and cleanup | Recorded above; two separately authorized requests with SHA-bound completion, two owner-reported counter readings for the first experiment and one for the second, no new credentials or settings to undo. Provider reporting freshness remains unavailable |

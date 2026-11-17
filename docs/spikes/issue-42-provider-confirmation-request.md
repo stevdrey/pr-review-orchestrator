@@ -36,6 +36,15 @@ Please assess these cases separately:
   including a second check reported by 2026-11-17 03:36:44 UTC. Exact capture
   times and provider update time are unavailable, so these readings may precede
   reporting settlement. The counter experiment is inconclusive.
+- Separately authorized first review on a new PR: [request on PR #51](https://github.com/stevdrey/pr-review-orchestrator/pull/51#issuecomment-6937488661)
+  at 2026-11-17 03:40:53 UTC, head
+  `5cb41c2b52fbc62fe9cb7411e1b82532202f12af`; [completion receipt](https://github.com/stevdrey/pr-review-orchestrator/pull/51#issuecomment-6937519196)
+  at 03:42:14 UTC, with summary completion at 03:42:15 UTC. This PR is authored
+  by `stevdrey` and remains a draft. The connector's token type is unknown.
+  The owner reported unchanged counters (47 PRs reviewed, 12 issues found) by
+  03:44:25 UTC, without a visible provider update time. Could you clarify whether `PRs
+  reviewed` counts unique PRs or individual review runs, including repeat reviews
+  and manually reviewed drafts, and its expected reporting delay?
 
 For each case, could you confirm:
 
