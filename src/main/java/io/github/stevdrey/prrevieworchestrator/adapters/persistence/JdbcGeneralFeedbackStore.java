@@ -38,11 +38,15 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     /** Called while holding the PR transaction lock. Missing/ambiguous feedback always blocks. */
     static boolean blocking(JdbcTemplate jdbc, PullRequestId pr, String head) {
+        return pending(jdbc, pr, head) != ReviewOutcome.PendingFindings.CLEAR;
+    }
+
+    static ReviewOutcome.PendingFindings pending(JdbcTemplate jdbc, PullRequestId pr, String head) {
         // The last head change is constant per PR: compute it once, not per finding row.
-        return Boolean.TRUE.equals(jdbc.queryForObject("""
+        return ReviewOutcome.PendingFindings.valueOf(jdbc.queryForObject("""
                 WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
-                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD')
-                SELECT EXISTS (SELECT 1 FROM (
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD'), pending AS (
+                SELECT f.feedback FROM (
                 """ + LATEST + """
                 ) f WHERE NOT EXISTS (
                     SELECT 1 FROM general_feedback_dispositions d
@@ -52,12 +56,14 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     AND d.action = 'DISMISS' AND d.head_sha = ?
                     AND d.head_version >= (SELECT version FROM last_head)
                     AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
-                    AND s.feedback = f.feedback)) OR EXISTS (
-                    SELECT 1 FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
+                    AND s.feedback = f.feedback) UNION ALL
+                    SELECT 'NEEDS_HUMAN' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND legacy.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND legacy.stable_finding_id IS NULL
                         AND legacy.status IN ('OPEN', 'ACKNOWLEDGED'))
-                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                SELECT CASE WHEN bool_or(feedback = 'ACTIONABLE') THEN 'ACTIONABLE'
+                    WHEN count(*) > 0 THEN 'NEEDS_HUMAN' ELSE 'CLEAR' END FROM pending
+                """, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
     }

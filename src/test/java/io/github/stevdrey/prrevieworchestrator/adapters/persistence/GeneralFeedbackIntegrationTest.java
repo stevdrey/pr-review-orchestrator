@@ -95,6 +95,29 @@ class GeneralFeedbackIntegrationTest {
     }
 
     @Test
+    void feedbackArrivingAfterCleanAssessmentStillBlocksItsCommit() {
+        UUID requestId = UUID.randomUUID();
+        var request = new ReviewRequest(PR, HEAD, "BASELINE", "github", ReviewRequest.Trigger.PR_OPENED, 1, false);
+        jdbc.update("""
+                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
+                VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 1, '1970-01-01', '1970-01-01')
+                """, requestId, request.key(), HEAD);
+        var run = new ReviewOutcome.Run(PR, HEAD, "github", ReviewOutcome.Stage.BASELINE,
+                requestId, cycle, "github", "reviewer");
+        var evidence = observe(cycle, HEAD, 0, source(Kind.REVIEW, Feedback.NONE, "", TIME));
+        var manager = new DataSourceTransactionManager(dataSource);
+        var outcomes = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)), authorization);
+        var assessment = new ReviewOutcome.Assessment(run, current().version(),
+                new ReviewOutcome.Completion(run, "general-1", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS), evidence.id());
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(assessment).verdict());
+        observe(cycle, HEAD, 1, source(Kind.REVIEW, Feedback.NEEDS_HUMAN, "LGTM, but verify the failure path", TIME.plusSeconds(1)));
+        assertEquals(ReviewConflict.Code.GUARD_REJECTED,
+                assertThrows(ReviewConflict.class, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR)).code());
+        assertNull(current().baselineCleanSha());
+    }
+
+    @Test
     void actionableAndAmbiguousGeneralOnlyFeedbackBlockDespiteCallerClearGates() {
         for (Kind kind : List.of(Kind.REVIEW, Kind.ISSUE_COMMENT)) {
             for (Feedback feedback : List.of(Feedback.ACTIONABLE, Feedback.NEEDS_HUMAN)) {
@@ -310,7 +333,7 @@ class GeneralFeedbackIntegrationTest {
                         baseline_clean_sha, deep_clean_sha) VALUES (101, 1001, 8, ?, 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD);
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(2, migration.migrate().migrationsExecuted);
+            assertEquals(3, migration.migrate().migrationsExecuted);
             assertEquals("NEEDS_HUMAN", scoped.queryForObject("SELECT feedback FROM review_evidence_sources", String.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM findings WHERE source_kind = 'REVIEW' AND thread_id IS NULL", Integer.class));
             assertEquals("ACTION_REQUIRED", scoped.queryForObject("SELECT state FROM pr_review_states WHERE pr_number = 7", String.class));
@@ -374,7 +397,7 @@ class GeneralFeedbackIntegrationTest {
                         """, observation.id(), HEAD, revision.bodySha256(), java.sql.Timestamp.from(revision.updatedAt()));
             }
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(2, migration.migrate().migrationsExecuted);
+            assertEquals(3, migration.migrate().migrationsExecuted);
             assertEquals(observations.size(), scoped.queryForObject("SELECT count(*) FROM review_evidence_sources", Integer.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
             assertEquals(2, scoped.queryForObject("SELECT count(*) FROM findings", Integer.class));

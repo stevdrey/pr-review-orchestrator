@@ -135,6 +135,27 @@ class GitHubReviewNormalizerTest {
         return normalizer.normalize(UUID.randomUUID(), UUID.randomUUID(), PR, HEAD,
                 Instant.parse("2026-11-16T11:00:00Z"), json.getBytes(StandardCharsets.UTF_8), severity);
     }
+
+    @Test
+    void genericLgtmAndStaleFollowUpRemainAmbiguousInOutcomeClassification() throws Exception {
+        String json = fixture().replace("Review summary, not a clean verdict", "LGTM")
+                .replace("CHANGES_REQUESTED", "APPROVED");
+        // Remove inline findings to prove that general approval alone prevents a clean verdict.
+        var normalized = normalize(json, Map.of());
+        var snapshot = new Snapshot(normalized.id(), normalized.cycleId(), PR, "github", HEAD, normalized.capturedAt(),
+                normalized.sources().stream().filter(s -> s.kind() == Kind.REVIEW).toList());
+        var run = new ReviewOutcome.Run(PR, HEAD, "codex", ReviewOutcome.Stage.BASELINE,
+                UUID.randomUUID(), snapshot.cycleId(), "github", "reviewer");
+        var completion = new ReviewOutcome.Completion(run, "R1", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var classifier = new ReviewOutcomeClassifier();
+        assertEquals(ReviewOutcome.Verdict.NEEDS_HUMAN,
+                classifier.classify(run, 2, completion, snapshot, ReviewOutcome.PendingFindings.CLEAR).verdict());
+        var stale = normalize(json.replace("\"commit\": { \"oid\": \"" + HEAD + "\" }", "\"commit\": { \"oid\": \"" + "b".repeat(40) + "\" }"), Map.of());
+        var staleSnapshot = new Snapshot(snapshot.id(), snapshot.cycleId(), PR, "github", HEAD, snapshot.capturedAt(),
+                stale.sources().stream().filter(s -> s.kind() == Kind.REVIEW).toList());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN,
+                classifier.classify(run, 2, completion, staleSnapshot, ReviewOutcome.PendingFindings.CLEAR).verdict());
+    }
     private Source source(Snapshot s, String id) {
         return s.sources().stream().filter(source -> source.id().equals(id)).findFirst().orElseThrow();
     }

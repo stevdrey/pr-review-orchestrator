@@ -30,6 +30,8 @@ Default **proposal**: max six automatic review requests per PR across the config
 
 ## Verdict contract
 
+Issue #19 implements [derived review outcomes](../development/review-outcomes.md): `CLEAN_FOR_SHA`, `ACTION_REQUIRED`, `NEEDS_HUMAN` and `UNKNOWN`. These are stage results; CI and readiness remain separate policy gates. Only clean outcomes can construct version-bound clean-stage transitions. Request/cycle correlation and retained findings are checked transactionally; provider completion authentication and current remote input gathering remain trusted integrations.
+
 - `BLOCKED`: confirmed blocking issue or CI failure.
 - `ACTION_REQUIRED`: remediation or explicit disposition pending.
 - `NEEDS_HUMAN`: ambiguous general comment, policy disagreement, inaccessible status, or exhausted limits.

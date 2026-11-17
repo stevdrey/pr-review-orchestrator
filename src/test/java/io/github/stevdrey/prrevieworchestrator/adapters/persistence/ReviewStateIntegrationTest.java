@@ -67,6 +67,197 @@ class ReviewStateIntegrationTest {
         return step(step(lifecycle.create(pr, HEAD), MARK_READY), START_REVIEW);
     }
 
+    AssessReviewOutcome outcomes() {
+        var manager = new DataSourceTransactionManager(dataSource);
+        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)),
+                new RepositoryAuthorization(Set.of(FIRST.scope(), SECOND.scope()), new JdbcInstallationAuthorization(jdbc)));
+    }
+
+    ReviewOutcome.Assessment outcome(PullRequestReview state, ReviewOutcome.Stage stage, ReviewOutcome.Conclusion conclusion) {
+        var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED, 1, false);
+        var ids = jdbc.query("SELECT id FROM review_requests WHERE request_key = ?", (rs, row) -> rs.getObject(1, UUID.class), request.key());
+        UUID requestId = ids.isEmpty() ? UUID.randomUUID() : ids.getFirst();
+        if (ids.isEmpty()) jdbc.update("""
+                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'codex', 1, 'COMMENT_CREATED', 1, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z')
+                """, requestId, request.key(), state.pr().scope().installationId(), state.pr().scope().repositoryId(),
+                state.pr().number(), state.headSha(), stage.name());
+        UUID cycleId = UUID.randomUUID();
+        int iteration = jdbc.queryForObject("SELECT count(*) + 1 FROM review_cycles", Integer.class);
+        jdbc.update("""
+                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider, iteration)
+                VALUES (?, ?, ?, ?, ?, ?, 'codex', ?)
+                """, cycleId, state.pr().scope().installationId(), state.pr().scope().repositoryId(), state.pr().number(),
+                state.headSha(), stage.name(), iteration);
+        var run = new ReviewOutcome.Run(state.pr(), state.headSha(), "codex", stage, requestId, cycleId, "github", "fixture-codex");
+        var source = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), state.headSha(), null, "0".repeat(64), java.time.Instant.EPOCH,
+                "COMMENTED", null, null, null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), state.pr(), "github", state.headSha(),
+                java.time.Instant.now(), List.of(source));
+        new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
+        return new ReviewOutcome.Assessment(run, state.version(),
+                new ReviewOutcome.Completion(run, "R1", ReviewOutcome.Status.COMPLETED, conclusion), snapshot.id());
+    }
+
+    @Test
+    void correlatedCleanStagesPersistButAmbiguousAndUnknownOutcomesCannotAdvance() {
+        var state = reviewing(FIRST);
+        var outcomes = outcomes();
+        for (var conclusion : List.of(ReviewOutcome.Conclusion.UNKNOWN, ReviewOutcome.Conclusion.UNSTRUCTURED,
+                ReviewOutcome.Conclusion.FINDINGS)) {
+            var result = outcome(state, ReviewOutcome.Stage.BASELINE, conclusion);
+            assertCode(GUARD_REJECTED, () -> outcomes.recordClean(result, UUID.randomUUID(), CLEAR));
+            assertEquals(state, lifecycle.find(FIRST).orElseThrow());
+        }
+        var baseline = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(baseline).verdict());
+        var commandId = UUID.randomUUID();
+        state = outcomes.recordClean(baseline, commandId, CLEAR);
+        assertEquals(DEEP_REVIEW, state.state());
+        assertNull(state.deepCleanSha());
+        var proof = jdbc.queryForMap("SELECT * FROM review_clean_evidence WHERE transition_id = ?", commandId);
+        assertEquals("codex", proof.get("provider"));
+        assertEquals("BASELINE", proof.get("stage"));
+        assertEquals(HEAD, proof.get("head_sha"));
+        assertEquals(baseline.snapshotId(), proof.get("snapshot_id"));
+        assertCode(DUPLICATE_TRANSITION, () -> outcomes().recordClean(baseline, commandId, CLEAR));
+        assertCode(TRANSITION_ID_REUSED, () -> outcomes.recordClean(new ReviewOutcome.Assessment(baseline.run(), baseline.expectedVersion(),
+                new ReviewOutcome.Completion(baseline.run(), "R2", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS),
+                baseline.snapshotId()), commandId, CLEAR));
+        var deep = outcome(state, ReviewOutcome.Stage.DEEP, ReviewOutcome.Conclusion.NO_FINDINGS);
+        state = outcomes.recordClean(deep, UUID.randomUUID(), CLEAR);
+        assertEquals(HEAD, newLifecycle().find(FIRST).orElseThrow().deepCleanSha());
+        // Readiness still requires independent CI/eligibility gates.
+        var pending = new Gates(true, false, false, true, false, Ci.UNKNOWN);
+        var ready = new ReviewTransition(UUID.randomUUID(), state.version(), HEAD, MARK_READY_FOR_HUMAN, null, pending);
+        assertCode(GUARD_REJECTED, () -> lifecycle.apply(FIRST, ready));
+        assertEquals(READY_FOR_HUMAN, step(state, MARK_READY_FOR_HUMAN).state());
+    }
+
+    @Test
+    void assessedCleanCannotSurviveForcePushBackToSameShaOrBeAppliedToAnotherStage() {
+        var state = reviewing(FIRST);
+        var outcomes = outcomes();
+        var late = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var wrongStage = outcome(state, ReviewOutcome.Stage.DEEP, ReviewOutcome.Conclusion.NO_FINDINGS);
+        assertCode(ILLEGAL_TRANSITION, () -> outcomes.recordClean(wrongStage, UUID.randomUUID(), CLEAR));
+        state = step(state, UPDATE_HEAD);
+        state = lifecycle.apply(FIRST, new ReviewTransition(UUID.randomUUID(), state.version(), NEXT, UPDATE_HEAD, HEAD, CLEAR));
+        state = step(state, START_REVIEW);
+        assertEquals(HEAD, state.headSha());
+        assertCode(STALE_VERSION, () -> outcomes.recordClean(late, UUID.randomUUID(), CLEAR));
+        assertCode(STALE_VERSION, () -> outcomes.assess(late));
+        var refreshed = new ReviewOutcome.Assessment(late.run(), state.version(), late.completion(), late.snapshotId());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(refreshed).verdict());
+        var current = state;
+        var foreignHead = new ReviewOutcome.Run(FIRST, NEXT, "codex", ReviewOutcome.Stage.BASELINE,
+                UUID.randomUUID(), UUID.randomUUID(), "github", "fixture-codex");
+        assertCode(STALE_HEAD, () -> outcomes.assess(new ReviewOutcome.Assessment(foreignHead, current.version(), null, null)));
+        assertNull(lifecycle.find(FIRST).orElseThrow().baselineCleanSha());
+    }
+
+    @Test
+    void authorizationIsRecheckedBetweenOutcomeAssessmentAndCleanCommit() {
+        var state = reviewing(FIRST);
+        var clean = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        long before = journalCount();
+        jdbc.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101");
+        var outcomes = outcomes();
+        assertThrows(AuthorizationDenied.class, () -> outcomes.recordClean(clean, UUID.randomUUID(), CLEAR));
+        assertThrows(AuthorizationDenied.class, () -> outcomes.assess(clean));
+        assertEquals(before, journalCount());
+    }
+
+    @Test
+    void durableCorrelationRejectsMissingWrongAndUnsentRequestsAndPreRequestReview() {
+        var state = reviewing(FIRST);
+        var assessment = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(assessment).verdict());
+        var run = assessment.run();
+        for (var invalidRun : List.of(
+                new ReviewOutcome.Run(FIRST, HEAD, "codex", run.stage(), UUID.randomUUID(), run.cycleId(), "github", run.reviewer()),
+                new ReviewOutcome.Run(FIRST, HEAD, "codex", run.stage(), run.requestId(), UUID.randomUUID(), "github", run.reviewer()),
+                new ReviewOutcome.Run(FIRST, HEAD, "other", run.stage(), run.requestId(), run.cycleId(), "github", run.reviewer()),
+                new ReviewOutcome.Run(FIRST, HEAD, "codex", ReviewOutcome.Stage.DEEP, run.requestId(), run.cycleId(), "github", run.reviewer()))) {
+            var invalid = new ReviewOutcome.Assessment(invalidRun, state.version(),
+                    new ReviewOutcome.Completion(invalidRun, "R1", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS),
+                    assessment.snapshotId());
+            assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(invalid).verdict());
+            assertCode(invalidRun.stage() == ReviewOutcome.Stage.DEEP ? ILLEGAL_TRANSITION : GUARD_REJECTED,
+                    () -> outcomes.recordClean(invalid, UUID.randomUUID(), CLEAR));
+        }
+        jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED', comment_id = NULL, completed_at = NULL WHERE id = ?", run.requestId());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        jdbc.update("UPDATE review_requests SET state = 'COMMENT_CREATED', comment_id = 1, completed_at = clock_timestamp(), created_at = clock_timestamp() WHERE id = ?", run.requestId());
+        // The independently reviewed source predates this request, despite matching the PR head.
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_clean_evidence", Integer.class));
+        assertNull(lifecycle.find(FIRST).orElseThrow().baselineCleanSha());
+    }
+
+    @Test
+    void newerSnapshotAndRetainedInlineFindingInvalidatePreviouslyCleanAssessment() {
+        var state = reviewing(FIRST);
+        var assessment = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(assessment).verdict());
+        var run = assessment.run();
+        var manager = new DataSourceTransactionManager(dataSource);
+        var ingestion = new JdbcReviewEvidenceStore(jdbc, manager);
+        var source = new ReviewEvidence.Source("C1", ReviewEvidence.Kind.REVIEW_COMMENT, "R1", "T1", null,
+                run.reviewer(), HEAD, null, "0".repeat(64), java.time.Instant.EPOCH, null, true, true,
+                "Example.java", null, 1, ReviewEvidence.Severity.HIGH);
+        var changed = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                java.time.Instant.now().plusSeconds(1), List.of(source));
+        ingestion.ingest(changed, () -> {});
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR));
+        // A subsequent read omits that root, but the retained finding must still block.
+        var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), java.time.Instant.EPOCH, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        var latest = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                changed.capturedAt().plusSeconds(1), List.of(review));
+        ingestion.ingest(latest, () -> {});
+        var rechecked = new ReviewOutcome.Assessment(run, state.version(), assessment.completion(), latest.id());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(rechecked).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(rechecked, UUID.randomUUID(), CLEAR));
+    }
+
+    @Test
+    void cleanEvidenceAndTransitionRollBackTogetherOnDeferredCommitFailure() {
+        var state = reviewing(FIRST);
+        var assessment = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        UUID commandId = UUID.randomUUID();
+        long before = journalCount();
+        jdbc.execute("""
+                CREATE FUNCTION reject_clean_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'synthetic private provider diagnostics'; END; $$
+                """);
+        jdbc.execute("""
+                CREATE CONSTRAINT TRIGGER reject_clean_commit AFTER INSERT ON review_clean_evidence
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_clean_commit()
+                """);
+        try {
+            var failure = assertThrows(ReviewStateUnavailable.class, () -> outcomes.recordClean(assessment, commandId, CLEAR));
+            assertTrue(failure.retryable());
+            assertNull(failure.getCause());
+            assertEquals(0, failure.getSuppressed().length);
+            assertEquals(state, lifecycle.find(FIRST).orElseThrow());
+            assertEquals(before, journalCount());
+            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_clean_evidence", Integer.class));
+        } finally {
+            jdbc.execute("DROP TRIGGER reject_clean_commit ON review_clean_evidence");
+            jdbc.execute("DROP FUNCTION reject_clean_commit()");
+        }
+        assertEquals(DEEP_REVIEW, outcomes.recordClean(assessment, commandId, CLEAR).state());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM review_clean_evidence", Integer.class));
+    }
+
     @Test
     void fullCycleAndPauseResumePersistAcrossAdapterRestart() {
         var state = reviewing(FIRST);
