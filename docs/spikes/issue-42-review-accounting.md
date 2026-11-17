@@ -108,7 +108,7 @@ the service has no live Codex command adapter.
     authorized operator, and any test PR closed only if created for this purpose.
     Preserve evidence comments; do not delete them as a substitute for revocation.
 
-### Snapshot record (manual review completed; first counter reading unchanged)
+### Snapshot record (manual review completed; two counter readings unchanged)
 
 Use one row per observation. Do not publish emails, account/workspace IDs,
 balances, invoices, tokens, signed URLs or unredacted screenshots.
@@ -119,7 +119,8 @@ balances, invoices, tokens, signed URLs or unredacted screenshots.
 | Trigger | 2026-11-17 03:22:47 UTC (2026-11-16 21:22:47 America/Costa_Rica) | Same owner-provided baseline; provider scope not independently accessible | One manual request | [Comment 6937120015](https://github.com/stevdrey/dokene/pull/406#issuecomment-6937120015), actor `stevdrey`, body exactly `@codex review`; connector credential type unknown |
 | Completion | 2026-11-17 03:24:45.607683 UTC (2026-11-16 21:24:45 America/Costa_Rica) | Provider GitHub summary | Completed, no findings reported | [Summary](https://github.com/stevdrey/dokene/pull/406#issuecomment-6919233848) binds full head `1d99ebb0dc4dfdd6e15463379dd8f42dd13cb214`; [separate receipt](https://github.com/stevdrey/dokene/pull/406#issuecomment-6937156523) at 03:24:44 UTC identifies short SHA `1d99ebb0dc`. Security-review state was null |
 | First reading after completion | Owner reported unchanged counters after completion; exact observation time and provider update time not supplied | Owner report for the same panel; settings/filters not independently verified | PRs reviewed: **47**; issues found: **12** | Provisional reading; no evidence that reporting had caught up with the completed review |
-| Visible difference / cleanup | First post-completion reading only | Rolling 7d activity metrics, not billing units | PRs reviewed: **0** change; issues found: **0** change | No attribution or zero-cost inference; cleanup recorded below |
+| Second reading after completion | Owner's second report received by 2026-11-17 03:36:44 UTC (2026-11-16 21:36:44 America/Costa_Rica); exact capture/provider update time not supplied | Owner reports the same panel; settings/filters not independently verified | PRs reviewed: **47**; issues found: **12** | Still no visible increment; reporting settlement, freshness and repeated-PR counting semantics remain unknown |
+| Visible difference / cleanup | Both post-completion readings | Rolling 7d activity metrics, not billing units | PRs reviewed: **0** change; issues found: **0** change | No attribution or zero-cost inference; cleanup recorded below |
 
 Screenshot was read from the owner's attachment; no image or private account
 identifier was copied into the repository. Treat its timestamp as filename-derived,
@@ -158,10 +159,16 @@ The owner reported that the counters remained unchanged, then noted that reporti
 could be delayed. This is the first post-completion reading, not proof of settled
 usage. A further owner-assisted observation around 2026-11-16 21:35
 America/Costa_Rica was proposed (2026-11-17 03:35 UTC). That interval is a local
-experiment choice, not a provider reporting SLA. Do not publish this investigation
-PR or start another review before the comparison window ends, to avoid adding
-activity to the account. No second review request will be sent to force a counter
-change.
+experiment choice, not a provider reporting SLA. The owner subsequently rechecked
+and reported the same 47 PRs reviewed and 12 issues found; that report was received
+by 03:36:44 UTC. The initial comparison window ends with that second report and
+its outcome is **inconclusive**. It does not establish that the counter has settled,
+that usage was free, or that either account paid. No investigation PR was opened
+during that window. Subsequent repository activity must be treated as outside this
+comparison window and could confound a later reading. No second review request
+will be sent to force a counter change. A later owner-supplied reading can be
+appended with its own capture/update times and concurrent-activity limitations;
+no delayed recheck or additional request is automated.
 
 Follow-up documentation check: OpenAI's Desktop usage guide acknowledges delayed
 historical/current-day reporting for the eligible workspace surfaces it describes.
@@ -227,14 +234,14 @@ confirmation becomes available, separately for each trigger and account context.
   documents; passed. These checks do not validate external billing attribution.
 
 Acceptance remains partial: individual accounting and written confirmation are
-missing; the two cases and safe fallback are documented. The first counter reading
-showed no increase, but reporting freshness is unknown and a delayed observation
-is pending. Manual trigger/completion evidence is confirmed for this
+missing; the two cases and safe fallback are documented. Both post-completion
+counter readings showed no increase, but reporting freshness is unknown. Manual
+trigger/completion evidence is confirmed for this
 connector-mediated test; per-review accounting remains unknown.
 
 | Issue #42 criterion | Current evidence / remaining requirement |
 | --- | --- |
 | Authoritative accounting source or written confirmation | Not achieved: no per-review account/workspace, correlation or mechanism established; provider request prepared, not submitted |
-| Separate manual and automatic assessments | Historical cases and the new connector manual test documented; units and billing identity remain unknown for each. First manual counter observation unchanged; delayed reading pending |
+| Separate manual and automatic assessments | Historical cases and the new connector manual test documented; units and billing identity remain unknown for each. Two manual counter observations unchanged; comparison inconclusive |
 | Safe production decision and fallback | Documented: both service request paths stay disabled, missing usage cannot bypass budget gates, owner handoff or separately approved metered provider |
-| Commands, dates, sanitized evidence and cleanup | Recorded above; one new request, SHA-bound completion, no new credentials or settings to undo. Final reporting observation remains outstanding |
+| Commands, dates, sanitized evidence and cleanup | Recorded above; one new request, SHA-bound completion, two owner-reported counter readings, no new credentials or settings to undo. Provider reporting freshness remains unavailable |

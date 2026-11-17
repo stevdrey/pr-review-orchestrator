@@ -32,9 +32,10 @@ Please assess these cases separately:
   `stevdrey`, but the connector does not expose its credential type. Do not treat
   this as verification of the GitHub App user-token flow. Before this request,
   the owner's Code review view showed 47 PRs reviewed and 12 issues found with
-  7d selected. The owner reported the same counters after completion; provider
-  update time is unavailable, so this reading may precede reporting settlement.
-  A later observation is pending.
+  7d selected. The owner reported the same counters twice after completion,
+  including a second check reported by 2026-11-17 03:36:44 UTC. Exact capture
+  times and provider update time are unavailable, so these readings may precede
+  reporting settlement. The counter experiment is inconclusive.
 
 For each case, could you confirm:
 
