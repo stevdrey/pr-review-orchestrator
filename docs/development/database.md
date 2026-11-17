@@ -49,7 +49,7 @@ Flyway applies V1 (`orchestration_foundation`), V2 (`webhook_routing_metadata`),
 | `finding_identities` | Stable scoped inline comment identities across review rounds |
 | `findings` | Separate actionable findings with comment/review/thread provenance, per-source ordinal key, reviewed SHA and disposition evidence |
 | `general_feedback_dispositions` | Scoped, revision/head-bound human decisions and proposed fix evidence |
-| `review_requests` | Permanent scoped request keys, one-shot send state, authorized actor ID and optional numeric comment receipt |
+| `review_requests` | Permanent scoped request keys, one-shot send state (including terminal `NOT_SENT` and head-unconfirmed receipts), authorized actor ID and optional numeric comment receipt |
 | `outbox_commands` | Unique command key, cycle, expected SHA, provider, bounded retry and lease metadata |
 | `queue_transitions` | Transactional work/correlation IDs, attempts, outcomes and sanitized error codes |
 | `audit_entries` | Scoped actor/action/outcome, correlation and evidence reference |

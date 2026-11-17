@@ -4,7 +4,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore;
 import java.time.Duration;
 import java.util.UUID;
-import java.util.function.LongSupplier;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -38,7 +38,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
     @Override public Reservation reserve(ReviewRequest request, long actorId, int limit, Runnable guards) {
         if (actorId <= 0 || limit < 1 || limit > 6) throw new IllegalArgumentException("Invalid review policy");
         return transaction(() -> {
-            JdbcGeneralFeedbackStore.lockPr(jdbc, request.pr());
+            PostgresLocks.lockPr(jdbc, request.pr());
             var existing = jdbc.query("""
                     SELECT id, state FROM review_requests WHERE request_key = ?
                     """, (rs, row) -> new Reservation(rs.getObject("id", UUID.class),
@@ -59,24 +59,55 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             return new Reservation(id, State.RESERVED, true);
         });
     }
-    @Override public void send(ReviewRequest request, UUID id, Runnable guards, LongSupplier effect) {
-        transaction(() -> {
-            guards.run();
-            int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
-                    id, request.key());
-            if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-            return null;
-        });
-        transaction(() -> {
-            guards.run(); // Holds live installation membership locks throughout the external effect.
-            var states = jdbc.query("SELECT state FROM review_requests WHERE id = ? AND request_key = ? FOR UPDATE",
-                    (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
-            if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-            long commentId = effect.getAsLong();
-            if (commentId <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-            jdbc.update("UPDATE review_requests SET state = 'COMMENT_CREATED', comment_id = ?, completed_at = clock_timestamp() WHERE id = ?",
-                    commentId, id);
-            return null;
-        });
+    @Override public void send(ReviewRequest request, UUID id, Runnable guards, Supplier<Receipt> effect) {
+        try {
+            transaction(() -> {
+                guards.run();
+                int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
+                        id, request.key());
+                if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                return null;
+            });
+        } catch (RuntimeException failure) {
+            // Another holder may own a non-RESERVED row; only our own still-RESERVED row is provably unsent.
+            if (!(failure instanceof ReviewRequestFailure known && known.code() == OUTCOME_UNKNOWN)) {
+                markNotSent(request, id, State.RESERVED);
+            }
+            throw failure;
+        }
+        var effectReturned = new AtomicBoolean();
+        try {
+            transaction(() -> {
+                guards.run(); // Holds live installation membership locks throughout the external effect.
+                var states = jdbc.query("SELECT state FROM review_requests WHERE id = ? AND request_key = ? FOR UPDATE",
+                        (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
+                if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                Receipt receipt = effect.get();
+                effectReturned.set(true);
+                if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                jdbc.update("UPDATE review_requests SET state = ?, comment_id = ?, completed_at = clock_timestamp() WHERE id = ?",
+                        (receipt.headConfirmed() ? State.COMMENT_CREATED : State.COMMENT_CREATED_HEAD_UNCONFIRMED).name(),
+                        receipt.commentId(), id);
+                return null;
+            });
+        } catch (RuntimeException failure) {
+            // After the effect returned, a statement or COMMIT failure may hide a created comment.
+            if (effectReturned.get() || failure instanceof ReviewRequestFailure known && known.code() == OUTCOME_UNKNOWN) {
+                throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+            }
+            markNotSent(request, id, State.ATTEMPTED);
+            throw failure;
+        }
+    }
+    /** Best effort: if this fails the row keeps its conservative RESERVED/ATTEMPTED state. */
+    private void markNotSent(ReviewRequest request, UUID id, State expected) {
+        try {
+            transaction(() -> jdbc.update("""
+                    UPDATE review_requests SET state = 'NOT_SENT', completed_at = clock_timestamp()
+                    WHERE id = ? AND request_key = ? AND state = ?
+                    """, id, request.key(), expected.name()));
+        } catch (RuntimeException ignored) {
+            // Keep the original actionable failure; never weaken the tombstone.
+        }
     }
 }

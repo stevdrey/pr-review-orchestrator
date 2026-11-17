@@ -69,7 +69,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     private boolean persist(Snapshot snapshot, String fingerprint) {
         var pr = snapshot.pr();
-        JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
+        PostgresLocks.lockPr(jdbc, pr);
         // Cycle locking serializes same-round updates and makes the current projection deterministic.
         var cycles = jdbc.query("""
                 SELECT id FROM review_cycles WHERE id = ? AND installation_id = ? AND repository_id = ?

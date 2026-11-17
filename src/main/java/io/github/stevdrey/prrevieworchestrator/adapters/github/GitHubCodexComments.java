@@ -3,6 +3,7 @@ package io.github.stevdrey.prrevieworchestrator.adapters.github;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
 import java.net.URI;
 import java.net.http.*;
 import java.time.Clock;
@@ -16,7 +17,9 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailur
  * HTTP 201 proves comment creation, never Codex acceptance, billing, completion or reviewed SHA.
  */
 public final class GitHubCodexComments {
-    private static final Duration DEADLINE = Duration.ofSeconds(1);
+    // Reads stay short; the single write gets more headroom. Worst case 3x1s + 3s stays inside the 8s send transaction.
+    private static final Duration READ_DEADLINE = Duration.ofSeconds(1);
+    private static final Duration WRITE_DEADLINE = Duration.ofSeconds(3);
     private final CodexUserCredentials credentials;
     private final Clock clock;
     private final URI api;
@@ -35,10 +38,10 @@ public final class GitHubCodexComments {
                 && "/".equals(api.getPath()) && api.getUserInfo() == null && api.getQuery() == null
                 && api.getFragment() == null)) throw new IllegalArgumentException("Invalid GitHub API origin");
         this.api = api;
-        this.http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).connectTimeout(DEADLINE).build();
+        this.http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).connectTimeout(READ_DEADLINE).build();
     }
 
-    public long create(ReviewRequest request, long actorId, Runnable finalGuards) {
+    public Receipt create(ReviewRequest request, long actorId, Runnable finalGuards) {
         boolean posting = false;
         try {
             Credential credential = credentials.current(request.pr().scope());
@@ -61,10 +64,19 @@ public final class GitHubCodexComments {
                     || comment.path("user").path("id").asLong() != actorId
                     || !"User".equals(comment.path("user").path("type").asString())
                     || !"@codex review".equals(comment.path("body").asString())) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+            long commentId = comment.path("id").asLong();
             // GitHub has no compare-and-swap comment API. Detect observed head changes, never claim
             // that the resulting review targets our SHA. Subsequent review evidence needs its own SHA.
-            requireReady(exchange(credential, prPath, false), request);
-            return comment.path("id").asLong();
+            // The receipt is proven at this point, so a failed verification read keeps the comment id.
+            try {
+                requireReady(exchange(credential, prPath, false), request);
+                return new Receipt(commentId, true);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return new Receipt(commentId, false);
+            } catch (Exception unverified) {
+                return new Receipt(commentId, false);
+            }
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
             throw new ReviewRequestFailure(posting ? OUTCOME_UNKNOWN : REMOTE_UNAVAILABLE);
@@ -90,7 +102,8 @@ public final class GitHubCodexComments {
     }
 
     private JsonNode exchange(Credential credential, String path, boolean post) throws Exception {
-        var builder = HttpRequest.newBuilder(api.resolve(path)).timeout(DEADLINE)
+        Duration deadline = post ? WRITE_DEADLINE : READ_DEADLINE;
+        var builder = HttpRequest.newBuilder(api.resolve(path)).timeout(deadline)
                 .header("Authorization", "Bearer " + credential.token())
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2026-03-10");
@@ -100,7 +113,7 @@ public final class GitHubCodexComments {
                 ? HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofString(), 262144).apply(info)
                 : HttpResponse.BodySubscribers.replacing(""));
         try {
-            var response = future.get(DEADLINE.toMillis(), TimeUnit.MILLISECONDS);
+            var response = future.get(deadline.toMillis(), TimeUnit.MILLISECONDS);
             if (response.statusCode() != (post ? 201 : 200)) {
                 throw new ReviewRequestFailure(post ? OUTCOME_UNKNOWN : REMOTE_UNAVAILABLE);
             }

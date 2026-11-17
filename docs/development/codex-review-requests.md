@@ -45,7 +45,7 @@ network. Enabling `orchestrator.codex.enabled=true` requires all of:
 
 The property alone cannot enable the adapter without these beans. Credential and
 approval operations must be bounded so each send transaction completes within eight
-seconds (HTTP itself uses at most four one-second exchanges). The lifetime attempt
+seconds (HTTP itself uses at most three one-second reads and one three-second comment write). The lifetime attempt
 cap defaults to six per installation/repository/PR across all SHA/provider/stage
 reservations in this store; `orchestrator.codex.max-requests` may lower it to 1–6.
 This is a conservative emergency ceiling, not the multi-provider monetary ledger.
@@ -74,10 +74,19 @@ review cycle. Both canonical-key and composite unique constraints enforce it.
    successful response bodies at 256 KiB and bounds headers and bodies together.
 5. Validate receipt author/body/ID, fetch PR state again, then commit
    `COMMENT_CREATED`. This is a GitHub comment receipt, not a completed Codex review.
+   If the post-write read fails or shows a different head/state, the proven receipt is
+   still committed as `COMMENT_CREATED_HEAD_UNCONFIRMED` with its comment ID.
 
-A duplicate completed request returns `DUPLICATE`. Any existing `RESERVED` or
-`ATTEMPTED` row returns `OUTCOME_UNKNOWN`, without executing the send again.
-Lost responses, malformed receipts, post-write SHA changes or local commit failure
+A guard or remote preflight failure that provably happened before the POST (for example
+`STALE_HEAD`, `PR_NOT_READY`, `ACTOR_DENIED`, revocation or a failed read) records the
+terminal `NOT_SENT` state. The key and lifetime slot stay consumed; it is never re-sent.
+
+A duplicate completed request (either receipt state) returns `DUPLICATE`. An existing
+`RESERVED` row returns `PENDING` (no send attempted yet: in flight, or crashed before the
+permit), `NOT_SENT` returns `NOT_SENT`, and `ATTEMPTED` returns `OUTCOME_UNKNOWN`. None
+executes the send again. On the first attempt, an uncertain outcome is likewise returned
+as `OUTCOME_UNKNOWN` rather than thrown; other failure codes are thrown and are unsent.
+Lost responses, malformed receipts or local statement/commit failure after the write
 retain the consumed permit even if a comment already exists remotely. The store
 itself prevents reuse of the send permit after rollback or restart.
 
@@ -104,6 +113,7 @@ there is no user-facing action endpoint yet.
 | `PR_NOT_READY` / `STALE_HEAD` | Fetch authoritative PR state; never reuse old SHA evidence. Existing reservation remains a tombstone. |
 | `LIMIT_REACHED` / `POLICY_DENIED` | Human intervention and approved budget/policy work; do not reset the counter or change identity to evade the limit. |
 | `REMOTE_UNAVAILABLE` | Inspect connectivity/permissions safely. The existing key remains reserved even if preflight failed. |
+| `PENDING` / `NOT_SENT` | No remote write happened from this row (a `RESERVED` row older than the send transaction bounds is a crashed reservation). The key stays consumed; never delete or reset it. |
 | `OUTCOME_UNKNOWN` / `STORE_UNAVAILABLE` | Stop. Inspect the row and remote comments/review activity under authorized read access. An absent search result cannot prove no request was received. Never delete/reset the tombstone to retry. |
 
 A provider connection/setup reply, missing reaction or missing review does not prove

@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.*;
@@ -63,7 +64,7 @@ class GitHubCodexCommentsTest {
             exchange.sendResponseHeaders(status, slowPost && post ? 0 : bytes.length);
             try (var output = exchange.getResponseBody()) {
                 if (slowPost && post) {
-                    output.write('{'); output.flush(); Thread.sleep(2000);
+                    output.write('{'); output.flush(); Thread.sleep(4000);
                 }
                 output.write(bytes);
             } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
@@ -88,7 +89,7 @@ class GitHubCodexCommentsTest {
 
     @Test void fixedCommandVerifiedIdentityAndFreshHeadWithNoCustomText() {
         var guards = new AtomicInteger();
-        assertEquals(9001, client().create(request, 42, guards::incrementAndGet));
+        assertEquals(new Receipt(9001, true), client().create(request, 42, guards::incrementAndGet));
         assertEquals(1, guards.get());
         assertEquals(1, writes.get());
         assertEquals("{\"body\":\"@codex review\"}", sentBody);
@@ -149,17 +150,35 @@ class GitHubCodexCommentsTest {
 
     @Test void slowResponseBodyIsBoundedAndNeverRetried() {
         slowPost = true;
-        assertTimeout(Duration.ofSeconds(3), () -> code(OUTCOME_UNKNOWN, () -> client().create(request, 42, () -> {})));
+        assertTimeout(Duration.ofSeconds(5), () -> code(OUTCOME_UNKNOWN, () -> client().create(request, 42, () -> {})));
         assertEquals(1, writes.get());
     }
 
-    @Test void oversizedReadCannotTriggerWriteAndHeadChangeAfterPostIsUncertain() {
+    @Test void oversizedReadCannotTriggerWriteAndHeadChangeAfterPostKeepsUnconfirmedReceipt() {
         oversized = true;
         code(REMOTE_UNAVAILABLE, () -> client().create(request, 42, () -> {}));
         assertEquals(0, writes.get());
         oversized = false;
         changeHead = true;
-        code(OUTCOME_UNKNOWN, () -> client().create(request, 42, () -> {}));
+        assertEquals(new Receipt(9001, false), client().create(request, 42, () -> {}));
+        assertEquals(1, writes.get());
+    }
+
+    @Test void postSlowerThanReadDeadlineButWithinWriteDeadlineSucceeds() {
+        server.removeContext("/");
+        server.createContext("/", exchange -> {
+            paths.add(exchange.getRequestURI().getPath());
+            boolean post = exchange.getRequestMethod().equals("POST");
+            String body = post ? receipt : exchange.getRequestURI().getPath().equals("/user") ? user : pr;
+            if (post) {
+                writes.incrementAndGet();
+                try { Thread.sleep(1500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(post ? 201 : 200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        assertEquals(new Receipt(9001, true), client().create(request, 42, () -> {}));
         assertEquals(1, writes.get());
     }
 

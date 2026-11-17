@@ -7,7 +7,7 @@ import static io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Resul
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.UNSUPPORTED_TRIGGER;
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.CAPABILITY_UNVERIFIED;
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.LIMIT_REACHED;
-import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.STORE_UNAVAILABLE;
+import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.STALE_HEAD;
 
 import io.github.stevdrey.prrevieworchestrator.adapters.github.*;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
@@ -52,7 +52,7 @@ class ReviewRequestIntegrationTest {
         effects = new AtomicInteger();
         when(comments.create(any(), eq(42L), any())).thenAnswer(call -> {
             call.getArgument(2, Runnable.class).run();
-            return 1000L + effects.incrementAndGet();
+            return new ReviewRequestStore.Receipt(1000L + effects.incrementAndGet(), true);
         });
     }
     ReviewRequest request(String head) {
@@ -87,7 +87,7 @@ class ReviewRequestIntegrationTest {
             for (var future : futures) {
                 var result = future.get(15, TimeUnit.SECONDS);
                 if (result == COMMENT_CREATED) created++;
-                else assertTrue(result == DUPLICATE || result == OUTCOME_UNKNOWN);
+                else assertTrue(result == DUPLICATE || result == PENDING || result == OUTCOME_UNKNOWN);
             }
             assertEquals(1, created);
         }
@@ -100,13 +100,13 @@ class ReviewRequestIntegrationTest {
             effects.incrementAndGet();
             throw new ReviewRequestFailure(ReviewRequestFailure.Code.OUTCOME_UNKNOWN);
         });
-        code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> adapter().request(request(HEAD)));
+        assertEquals(OUTCOME_UNKNOWN, adapter().request(request(HEAD)));
         assertEquals(OUTCOME_UNKNOWN, adapter().request(request(HEAD)));
         assertEquals(1, effects.get());
         assertEquals("ATTEMPTED", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
         var crash = request("b".repeat(40));
         store().reserve(crash, 42, 6, () -> authorization.requireAuthorized(SCOPE));
-        assertEquals(OUTCOME_UNKNOWN, adapter().request(crash));
+        assertEquals(PENDING, adapter().request(crash));
         assertEquals(1, effects.get());
     }
 
@@ -118,7 +118,7 @@ class ReviewRequestIntegrationTest {
             throw new ReviewRequestFailure(ReviewRequestFailure.Code.OUTCOME_UNKNOWN);
         }));
         code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), () -> {
-            effects.incrementAndGet(); return 1001;
+            effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1001, true);
         }));
         assertEquals(1, effects.get());
     }
@@ -160,8 +160,9 @@ class ReviewRequestIntegrationTest {
         var reserved = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE));
         jdbc.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101");
         assertThrows(AuthorizationDenied.class, () -> store().send(r, reserved.id(),
-                () -> authorization.requireAuthorized(SCOPE), () -> { effects.incrementAndGet(); return 1; }));
+                () -> authorization.requireAuthorized(SCOPE), () -> { effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1, true); }));
         assertEquals(0, effects.get());
+        assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
     }
 
     @Test void acceptedCommentWithDeferredCommitFailureRetainsConsumedPermit() {
@@ -175,7 +176,7 @@ class ReviewRequestIntegrationTest {
                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_review_receipt()
                 """);
         try {
-            code(STORE_UNAVAILABLE, () -> adapter().request(request(HEAD)));
+            assertEquals(OUTCOME_UNKNOWN, adapter().request(request(HEAD)));
             assertEquals(1, effects.get());
             assertEquals(OUTCOME_UNKNOWN, adapter().request(request(HEAD)));
             assertEquals(1, effects.get());
@@ -184,6 +185,23 @@ class ReviewRequestIntegrationTest {
             jdbc.execute("DROP TRIGGER fail_review_receipt ON review_requests");
             jdbc.execute("DROP FUNCTION reject_review_receipt()");
         }
+    }
+
+    @Test void provablyUnsentPreflightFailureIsTerminalNotSentAndNeverRedriven() {
+        when(comments.create(any(), anyLong(), any())).thenThrow(new ReviewRequestFailure(STALE_HEAD));
+        code(STALE_HEAD, () -> adapter().request(request(HEAD)));
+        assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
+        assertEquals(NOT_SENT, adapter().request(request(HEAD)));
+        verify(comments, times(1)).create(any(), anyLong(), any());
+        assertEquals(1, rows());
+    }
+
+    @Test void unconfirmedHeadReceiptPersistsCommentIdAndIsDuplicateOnRedelivery() {
+        when(comments.create(any(), anyLong(), any())).thenReturn(new ReviewRequestStore.Receipt(555, false));
+        assertEquals(COMMENT_CREATED, adapter().request(request(HEAD)));
+        assertEquals("COMMENT_CREATED_HEAD_UNCONFIRMED", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
+        assertEquals(555L, jdbc.queryForObject("SELECT comment_id FROM review_requests", Long.class));
+        assertEquals(DUPLICATE, adapter().request(request(HEAD)));
     }
 
     @Test void lifetimeCapCountsUnknownsAndAllHeadShasAndCannotBeResetByRestart() {

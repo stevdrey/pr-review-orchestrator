@@ -39,10 +39,19 @@ public final class CodexReviewAdapter implements ReviewProvider {
             approval.requirePermitted(request);
         };
         var reserved = store.reserve(request, actorId, limit, guards);
-        if (!reserved.created()) return reserved.state() == ReviewRequestStore.State.COMMENT_CREATED
-                ? Result.DUPLICATE : Result.OUTCOME_UNKNOWN;
-        store.send(request, reserved.id(), guards, () -> comments.create(request, actorId,
-                () -> { authorization.requireAuthorized(request.pr().scope()); approval.requirePermitted(request); }));
+        if (!reserved.created()) return switch (reserved.state()) {
+            case RESERVED -> Result.PENDING;
+            case ATTEMPTED -> Result.OUTCOME_UNKNOWN;
+            case NOT_SENT -> Result.NOT_SENT;
+            case COMMENT_CREATED, COMMENT_CREATED_HEAD_UNCONFIRMED -> Result.DUPLICATE;
+        };
+        try {
+            store.send(request, reserved.id(), guards, () -> comments.create(request, actorId, guards));
+        } catch (ReviewRequestFailure failure) {
+            // Uncertain outcomes share one channel with redelivery; other codes are actionable and unsent.
+            if (failure.code() == OUTCOME_UNKNOWN) return Result.OUTCOME_UNKNOWN;
+            throw failure;
+        }
         return Result.COMMENT_CREATED;
     }
 }

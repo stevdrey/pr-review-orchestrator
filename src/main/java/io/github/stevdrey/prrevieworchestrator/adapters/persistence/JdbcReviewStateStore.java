@@ -63,7 +63,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     public PullRequestReview create(PullRequestId pr, String headSha, Runnable authorize) {
         PullRequestReview initial = PullRequestReview.initial(pr, headSha);
         return transaction(authorize, () -> {
-            JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
+            PostgresLocks.lockPr(jdbc, pr);
             int inserted = jdbc.update("""
                     INSERT INTO pr_review_states (installation_id, repository_id, pr_number, head_sha)
                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
@@ -92,7 +92,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     public PullRequestReview apply(PullRequestId pr, ReviewTransition command, Runnable authorize) {
         java.util.Objects.requireNonNull(command);
         return transaction(authorize, () -> {
-            JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
+            PostgresLocks.lockPr(jdbc, pr);
             PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
             String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
                     ? command.newHeadSha() : command.expectedHeadSha();

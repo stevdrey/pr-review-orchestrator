@@ -24,12 +24,6 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
         transactions.setTimeout(3);
     }
 
-    /** Shared with ingestion and lifecycle transitions, including before a PR aggregate exists. */
-    static void lockPr(JdbcTemplate jdbc, PullRequestId pr) {
-        jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> {},
-                "review-pr:" + pr.scope().installationId() + ":" + pr.scope().repositoryId() + ":" + pr.number());
-    }
-
     private static final String LATEST = """
             SELECT f.*, s.body_sha256, s.source_updated_at, s.feedback
             FROM findings f
@@ -101,7 +95,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 try {
                     PostgresDeadlines.apply(jdbc, DEADLINE);
                     authorize.run();
-                    lockPr(jdbc, pr);
+                    PostgresLocks.lockPr(jdbc, pr);
                     return persist(pr, command);
                 } catch (RuntimeException failure) { throw sanitized(failure); }
             }));
