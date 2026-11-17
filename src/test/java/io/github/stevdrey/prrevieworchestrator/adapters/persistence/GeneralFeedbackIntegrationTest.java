@@ -15,6 +15,9 @@ import java.util.concurrent.*;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.*;
 import org.testcontainers.junit.jupiter.*;
@@ -146,6 +149,53 @@ class GeneralFeedbackIntegrationTest {
         blocked(BASELINE_CLEAN);
         assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
         assertNotEquals(initial.id(), reread.id());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"REVIEW,false,false", "REVIEW,false,true", "REVIEW,true,false", "REVIEW,true,true",
+            "ISSUE_COMMENT,false,false", "ISSUE_COMMENT,false,true", "ISSUE_COMMENT,true,false", "ISSUE_COMMENT,true,true"})
+    void latestBlankRevisionGovernsRegardlessOfArrivalOrder(Kind kind, boolean crossRound, boolean reverse) {
+        UUID newerCycle = crossRound ? cycle(HEAD, 2) : cycle;
+        var older = new Snapshot(UUID.randomUUID(), cycle, PR, "github", HEAD, TIME,
+                List.of(source(kind, Feedback.NEEDS_HUMAN, "Concern", TIME)));
+        var newer = new Snapshot(UUID.randomUUID(), newerCycle, PR, "github", HEAD, TIME.plusSeconds(1),
+                List.of(source(kind, Feedback.NONE, "", TIME.plusSeconds(1))));
+        if (reverse) {
+            assertTrue(ingestion.ingest(newer));
+            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
+            assertTrue(ingestion.ingest(older));
+        } else {
+            assertTrue(ingestion.ingest(older));
+            assertTrue(ingestion.ingest(newer));
+        }
+        assertFalse(ingestion.ingest(older));
+        assertFalse(ingestion.ingest(newer));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
+        assertEquals(crossRound ? 2 : 1, jdbc.queryForObject("SELECT count(*) FROM findings", Integer.class));
+        assertEquals(newer.id(), jdbc.queryForObject("SELECT evidence_snapshot_id FROM findings WHERE review_cycle_id = ?",
+                UUID.class, newerCycle));
+        assertThrows(Conflict.class, () -> dispositions.dispose(PR, command(older, GeneralFeedback.Action.DISMISS, HEAD)));
+        blocked(BASELINE_CLEAN);
+        assertTrue(dispositions.dispose(PR, command(newer, GeneralFeedback.Action.DISMISS, HEAD)));
+        assertEquals(PullRequestReview.State.DEEP_REVIEW, step(current(), BASELINE_CLEAN).state());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deterministicDispositionErrorsStayNonRetryableAndRollBack(boolean invalidActor) {
+        var snapshot = observe(cycle, HEAD, 0, source(Kind.REVIEW, Feedback.NEEDS_HUMAN, "Concern", TIME));
+        var valid = command(snapshot, GeneralFeedback.Action.DISMISS, HEAD);
+        var invalid = new Disposition(valid.id(), valid.findingId(), valid.expectedSnapshotId(), HEAD, valid.expectedVersion(),
+                valid.action(), invalidActor ? "actor\0" : valid.actor(), invalidActor ? valid.reason() : "reason\0", null);
+        var failure = assertThrows(Unavailable.class, () -> dispositions.dispose(PR, invalid));
+        assertFalse(failure.retryable());
+        assertNull(failure.getCause());
+        assertEquals(0, failure.getSuppressed().length);
+        assertEquals("Review evidence unavailable", failure.getMessage());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM general_feedback_dispositions", Integer.class));
+        assertEquals("OPEN", jdbc.queryForObject("SELECT status FROM findings", String.class));
+        blocked(BASELINE_CLEAN);
+        assertTrue(dispositions.dispose(PR, valid)); // The rejected command did not consume its idempotency key.
     }
 
     @Test
@@ -332,6 +382,7 @@ class GeneralFeedbackIntegrationTest {
         try {
             var failure = assertThrows(Unavailable.class, () -> dispositions.dispose(PR,
                     command(snapshot, GeneralFeedback.Action.DISMISS, HEAD)));
+            assertTrue(failure.retryable());
             assertNull(failure.getCause());
             assertEquals("Review evidence unavailable", failure.getMessage());
             assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM general_feedback_dispositions", Integer.class));

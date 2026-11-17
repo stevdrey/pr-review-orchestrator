@@ -152,6 +152,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
         if (failure instanceof AuthorizationDenied) return new AuthorizationDenied();
         if (failure instanceof AuthorizationUnavailable) return new AuthorizationUnavailable();
         if (failure instanceof ReviewEvidence.Conflict) return new ReviewEvidence.Conflict();
+        if (failure instanceof ReviewEvidence.Unavailable known) return new ReviewEvidence.Unavailable(known.retryable());
         return new ReviewEvidence.Unavailable(!(failure instanceof IllegalArgumentException
                 || failure instanceof org.springframework.dao.DataIntegrityViolationException));
     }

@@ -19,7 +19,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Repository
 public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
     private static final Duration DEADLINE = Duration.ofSeconds(3);
-    /** The occurrence's linked source revision equals the incoming one (inserted earlier in this transaction). */
+    /** The occurrence's linked source revision equals the incoming retained source revision. */
     private static final String UNCHANGED = """
             EXISTS (SELECT 1 FROM review_evidence_sources p JOIN review_evidence_sources n
                     ON n.snapshot_id = excluded.evidence_snapshot_id AND n.source_id = p.source_id
@@ -27,6 +27,21 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                     AND p.body_sha256 = n.body_sha256
                     AND p.source_updated_at IS NOT DISTINCT FROM n.source_updated_at
                     AND p.feedback = n.feedback)""";
+    private static final String UPDATE_FINDING = """
+                ON CONFLICT (review_cycle_id, source_provider, source_kind, source_id, source_ordinal)
+                DO UPDATE SET thread_id = excluded.thread_id, severity = excluded.severity,
+                    thread_resolved = excluded.thread_resolved, stable_finding_id = excluded.stable_finding_id,
+                    pr_number = excluded.pr_number,
+                    status = CASE WHEN %1$s THEN findings.status ELSE 'OPEN' END,
+                    evidence_sha = CASE WHEN %1$s THEN findings.evidence_sha END,
+                    verified_at = CASE WHEN %1$s THEN findings.verified_at END,
+                    disposition_actor = CASE WHEN %1$s THEN findings.disposition_actor END,
+                    disposition_reason = CASE WHEN %1$s THEN findings.disposition_reason END,
+                    evidence_snapshot_id = excluded.evidence_snapshot_id
+                WHERE findings.evidence_snapshot_id IS NULL OR
+                    (SELECT captured_at FROM review_evidence_snapshots WHERE id = findings.evidence_snapshot_id) <
+                    (SELECT captured_at FROM review_evidence_snapshots WHERE id = excluded.evidence_snapshot_id)
+                """.formatted(UNCHANGED);
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
 
@@ -106,6 +121,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         var candidates = snapshot.sources().stream()
                 .filter(s -> s.candidate() || s.general() && tracked.contains(s.id())).toList();
         if (!candidates.isEmpty()) projectFindings(snapshot, candidates);
+        reconcileGeneralHistory(snapshot);
         JdbcGeneralFeedbackStore.invalidateClean(jdbc, pr);
         return true;
     }
@@ -135,23 +151,38 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                     source_provider, source_kind, source_id, thread_id, body_ref, severity, thread_resolved,
                     stable_finding_id, evidence_snapshot_id, pr_number)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (review_cycle_id, source_provider, source_kind, source_id, source_ordinal)
-                DO UPDATE SET thread_id = excluded.thread_id, severity = excluded.severity,
-                    thread_resolved = excluded.thread_resolved, stable_finding_id = excluded.stable_finding_id,
-                    pr_number = excluded.pr_number,
-                    status = CASE WHEN %1$s THEN findings.status ELSE 'OPEN' END,
-                    evidence_sha = CASE WHEN %1$s THEN findings.evidence_sha END,
-                    verified_at = CASE WHEN %1$s THEN findings.verified_at END,
-                    disposition_actor = CASE WHEN %1$s THEN findings.disposition_actor END,
-                    disposition_reason = CASE WHEN %1$s THEN findings.disposition_reason END,
-                    evidence_snapshot_id = excluded.evidence_snapshot_id
-                WHERE findings.evidence_snapshot_id IS NULL OR
-                    (SELECT captured_at FROM review_evidence_snapshots WHERE id = findings.evidence_snapshot_id) < ?
-                """.formatted(UNCHANGED), candidates.stream().map(source -> new Object[] {UUID.randomUUID(),
+                """ + UPDATE_FINDING, candidates.stream().map(source -> new Object[] {UUID.randomUUID(),
                 snapshot.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(), snapshot.headSha(),
                 snapshot.provider(), source.kind().name(), source.id(), source.threadId(), "github-node:" + source.id(),
-                source.severity().name(), source.resolved(), identities.get(source.id()), snapshot.id(), pr.number(),
-                Timestamp.from(snapshot.capturedAt())}).toList());
+                source.severity().name(), source.resolved(), identities.get(source.id()), snapshot.id(), pr.number()}).toList());
+    }
+
+    /** A delayed first candidate must also track newer blank revisions already retained in other reads/rounds. */
+    private void reconcileGeneralHistory(Snapshot snapshot) {
+        var pr = snapshot.pr();
+        // The PR lock covers every affected round. One set-based write avoids a query per retained observation.
+        jdbc.update("""
+                INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha,
+                    source_provider, source_kind, source_id, thread_id, body_ref, severity, thread_resolved,
+                    stable_finding_id, evidence_snapshot_id, pr_number)
+                SELECT gen_random_uuid(), latest.review_cycle_id, latest.installation_id, latest.repository_id,
+                    latest.head_sha, latest.provider, latest.source_kind, latest.source_id, NULL,
+                    'github-node:' || latest.source_id, latest.severity, NULL, latest.stable_finding_id,
+                    latest.snapshot_id, latest.pr_number
+                FROM (
+                    SELECT DISTINCT ON (o.review_cycle_id, s.source_kind, s.source_id)
+                        o.review_cycle_id, o.installation_id, o.repository_id, o.pr_number, o.head_sha, o.provider,
+                        s.source_kind, s.source_id, s.severity, s.snapshot_id, i.id AS stable_finding_id
+                    FROM review_evidence_sources s
+                    JOIN review_evidence_snapshots o ON o.id = s.snapshot_id
+                    JOIN finding_identities i ON i.installation_id = o.installation_id
+                        AND i.repository_id = o.repository_id AND i.pr_number = o.pr_number
+                        AND i.provider = o.provider AND i.source_kind = s.source_kind AND i.source_id = s.source_id
+                    WHERE o.installation_id = ? AND o.repository_id = ? AND o.pr_number = ? AND o.provider = ?
+                        AND s.source_kind IN ('REVIEW', 'ISSUE_COMMENT')
+                    ORDER BY o.review_cycle_id, s.source_kind, s.source_id, o.captured_at DESC
+                ) latest WHERE true
+                """ + UPDATE_FINDING, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.provider());
     }
 
     /** Copy only stable metadata; deterministic data failures are not retryable. */
