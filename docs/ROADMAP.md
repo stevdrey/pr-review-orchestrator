@@ -36,6 +36,7 @@ Issue #17 adds [internal general-feedback tracking and audited dispositions](dev
 ## Architecture spikes (must precede assumptions)
 
 - Confirm whether a GitHub App user access token can request Codex in the **desired account and subscription billing context**; fallback to supported automatic reviews or a different review provider.
+- [Issue #42 accounting investigation](spikes/issue-42-review-accounting.md) concluded with an owner-accepted limitation: +4 review activity and +1 finding correlate with four observed manual runs and one P2, while individual financial attribution remains unverified. Closure does not waive accounting or budget prerequisites; keep Codex dispatch disabled until they are verified.
 - Verify GitHub review-thread state event semantics and API permission boundaries.
 - Verify **current** Dot/MCP event subscription support and access requirements in a real eligible client before relying on it. Keep core event orchestration independent.
 - Validate OpenAI model names, pricing and any API credits with the actual account and live pricing before establishing production quotas.
