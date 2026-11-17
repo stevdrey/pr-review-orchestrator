@@ -32,7 +32,9 @@ Please assess these cases separately:
   `stevdrey`, but the connector does not expose its credential type. Do not treat
   this as verification of the GitHub App user-token flow. Before this request,
   the owner's Code review view showed 47 PRs reviewed and 12 issues found with
-  7d selected; the final counter observation is pending.
+  7d selected. The owner reported the same counters after completion; provider
+  update time is unavailable, so this reading may precede reporting settlement.
+  A later observation is pending.
 
 For each case, could you confirm:
 

@@ -16,6 +16,7 @@ or written provider confirmation is obtained.
 | [Pricing](https://learn.chatgpt.com/docs/pricing#what-counts-as-code-review-usage) | GitHub manual and automatic reviews are Code Review usage; API-key access excludes GitHub cloud review | A usage category or published rate is not an individual charge record; do not calculate subscription consumption using API prices |
 | [Analytics API](https://learn.chatgpt.com/docs/enterprise/analytics-api) | Workspace-scoped aggregate daily usage; endpoint availability must be confirmed | Not a raw audit log; the guide does not establish a review-to-charge join |
 | [Usage Insights](https://learn.chatgpt.com/docs/enterprise/usage-insights#code-review) | Code review measures include PRs reviewed and findings | Activity counts do not identify an allowance debit, credit debit or invoice charge |
+| [Desktop usage and Personal Analytics](https://help.openai.com/en/articles/20001478-reviewing-work-and-codex-usage-and-using-personal-analytics-in-chatgpt-desktop#understand-cost-estimates-and-data-freshness) | For eligible Enterprise/Edu workspaces, historical usage charts refresh less frequently than chat/monthly totals; current-day activity may appear later | Supports reporting-delay caution, but does not specify the refresh interval or repeated-PR counting semantics for the owner's Code review chart. Do not apply the guide's roughly one-minute chat/monthly refresh rate to that chart |
 | [Compliance API](https://learn.chatgpt.com/docs/enterprise/compliance-api) and [Admin API reference](https://chatgpt.com/public/admin/api-reference) | Supported audit records may help correlate activity; schema and entitlement require verification | Reference was not inspectable through the available web reader beyond its landing page; no authorized workspace export was supplied. An audit event alone is not a billing record |
 
 No authoritative per-review accounting source was established through these
@@ -107,7 +108,7 @@ the service has no live Codex command adapter.
     authorized operator, and any test PR closed only if created for this purpose.
     Preserve evidence comments; do not delete them as a substitute for revocation.
 
-### Snapshot record (manual review completed; counter comparison pending)
+### Snapshot record (manual review completed; first counter reading unchanged)
 
 Use one row per observation. Do not publish emails, account/workspace IDs,
 balances, invoices, tokens, signed URLs or unredacted screenshots.
@@ -117,8 +118,8 @@ balances, invoices, tokens, signed URLs or unredacted screenshots.
 | Before | Screenshot filename: 2026-11-16 21:20:34 America/Costa_Rica (2026-11-17 03:20:34 UTC); provider update time not visible | Owner-provided usage view, alias `owner-A`; Code review tab, rolling 7d selected; exact boundaries/timezone not visible | PRs reviewed: **47**; issues found: **12** | Owner supplied the screenshot and PR #406. Screenshot has no PR/account join; an already-reviewed PR may not increase a unique-PR count |
 | Trigger | 2026-11-17 03:22:47 UTC (2026-11-16 21:22:47 America/Costa_Rica) | Same owner-provided baseline; provider scope not independently accessible | One manual request | [Comment 6937120015](https://github.com/stevdrey/dokene/pull/406#issuecomment-6937120015), actor `stevdrey`, body exactly `@codex review`; connector credential type unknown |
 | Completion | 2026-11-17 03:24:45.607683 UTC (2026-11-16 21:24:45 America/Costa_Rica) | Provider GitHub summary | Completed, no findings reported | [Summary](https://github.com/stevdrey/dokene/pull/406#issuecomment-6919233848) binds full head `1d99ebb0dc4dfdd6e15463379dd8f42dd13cb214`; [separate receipt](https://github.com/stevdrey/dokene/pull/406#issuecomment-6937156523) at 03:24:44 UTC identifies short SHA `1d99ebb0dc`. Security-review state was null |
-| After | Pending | Same scope required | Unknown | Reporting freshness and concurrent activity pending |
-| Delta / cleanup | Pending | Same units required | Unknown | No inference of billing mechanism permitted |
+| First reading after completion | Owner reported unchanged counters after completion; exact observation time and provider update time not supplied | Owner report for the same panel; settings/filters not independently verified | PRs reviewed: **47**; issues found: **12** | Provisional reading; no evidence that reporting had caught up with the completed review |
+| Visible difference / cleanup | First post-completion reading only | Rolling 7d activity metrics, not billing units | PRs reviewed: **0** change; issues found: **0** change | No attribution or zero-cost inference; cleanup recorded below |
 
 Screenshot was read from the owner's attachment; no image or private account
 identifier was copied into the repository. Treat its timestamp as filename-derived,
@@ -153,8 +154,20 @@ completed at 03:24:45.607683 UTC. Re-read PR state after completion: still open,
 head unchanged. The receipt reports no major findings; this does not verify the
 code's correctness or establish consumed units. No security review was shown in
 the inspected summary, which does not independently verify repository settings.
-Requested the owner's final counter reading after completion. No second review
-request will be sent to force a counter change.
+The owner reported that the counters remained unchanged, then noted that reporting
+could be delayed. This is the first post-completion reading, not proof of settled
+usage. A further owner-assisted observation around 2026-11-16 21:35
+America/Costa_Rica was proposed (2026-11-17 03:35 UTC). That interval is a local
+experiment choice, not a provider reporting SLA. Do not publish this investigation
+PR or start another review before the comparison window ends, to avoid adding
+activity to the account. No second review request will be sent to force a counter
+change.
+
+Follow-up documentation check: OpenAI's Desktop usage guide acknowledges delayed
+historical/current-day reporting for the eligible workspace surfaces it describes.
+It does not establish an update deadline for this owner's Code review counters
+or whether repeat reviews of one PR increment `PRs reviewed`. Both remain unknown;
+neither a ten-minute wait nor an unchanged total settles billing attribution.
 
 Cleanup for this run: no temporary App/token or test PR was created; no shared
 setting was changed, so no credential or setting rollback is required. The
@@ -214,6 +227,14 @@ confirmation becomes available, separately for each trigger and account context.
   documents; passed. These checks do not validate external billing attribution.
 
 Acceptance remains partial: individual accounting and written confirmation are
-missing; the two cases and safe fallback are documented. Counter comparison is
-pending the final counter observation. Manual trigger/completion evidence is
-confirmed for this connector-mediated test; per-review accounting remains unknown.
+missing; the two cases and safe fallback are documented. The first counter reading
+showed no increase, but reporting freshness is unknown and a delayed observation
+is pending. Manual trigger/completion evidence is confirmed for this
+connector-mediated test; per-review accounting remains unknown.
+
+| Issue #42 criterion | Current evidence / remaining requirement |
+| --- | --- |
+| Authoritative accounting source or written confirmation | Not achieved: no per-review account/workspace, correlation or mechanism established; provider request prepared, not submitted |
+| Separate manual and automatic assessments | Historical cases and the new connector manual test documented; units and billing identity remain unknown for each. First manual counter observation unchanged; delayed reading pending |
+| Safe production decision and fallback | Documented: both service request paths stay disabled, missing usage cannot bypass budget gates, owner handoff or separately approved metered provider |
+| Commands, dates, sanitized evidence and cleanup | Recorded above; one new request, SHA-bound completion, no new credentials or settings to undo. Final reporting observation remains outstanding |
