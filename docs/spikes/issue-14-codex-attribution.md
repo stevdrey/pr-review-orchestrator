@@ -3,6 +3,8 @@
 **Status: trigger investigation completed with an owner-accepted limitation;
 per-review usage attribution remains unverified.** Billing verification continues
 in [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42).
+See the [accounting investigation and counter experiment](issue-42-review-accounting.md)
+for current source checks, separate case assessments and the prepared provider escalation.
 This spike does not authorize enabling a review adapter. Tracked by
 [issue #14](https://github.com/stevdrey/pr-review-orchestrator/issues/14).
 Documentation checked 2026-11-13; product behavior and entitlements can change.

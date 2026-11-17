@@ -68,6 +68,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Codex attribution spike and test protocol](docs/spikes/issue-14-codex-attribution.md)
+- [Per-review accounting investigation and counter experiment](docs/spikes/issue-42-review-accounting.md)
 - [Contributing](CONTRIBUTING.md)
 - [Agent instructions](AGENTS.md) and [skills](.agents/skills/README.md)
 - [Project management and labels](docs/contributing/project-management.md)

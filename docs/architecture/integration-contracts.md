@@ -12,6 +12,12 @@ Outbound GitHub: limited to app-authorized operations; use user-to-server author
 
 The [Codex attribution spike](../spikes/issue-14-codex-attribution.md) records observed trigger behavior, attribution limits, the controlled test protocol and a fail-closed fallback. User-token and automatic triggers succeeded in the tested configuration; per-review usage attribution remains unverified and is tracked in [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42).
 
+The [issue #42 accounting investigation](../spikes/issue-42-review-accounting.md)
+assesses available provider sources and defines an owner-assisted counter experiment.
+An aggregate increase is activity correlation, not an individual debit or billing
+identity. Keep both request paths disabled until accounting and enforceable budget
+controls are verified; missing usage must not be recorded as zero.
+
 ## ReviewProvider port
 
 Proposed operations: `requestReview(ReviewRequest)`, `getReviewOutcome(ProviderReference)`, `summarizeFindings(ReviewContext)`. Providers can be async; commands must carry idempotency key, review stage, budget reservation and expected head SHA. No generic provider contract should require a human login or a fixed model name.
