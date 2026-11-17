@@ -7,44 +7,40 @@ import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
 import java.sql.Timestamp;
-import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
-import java.util.function.Supplier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
-import org.springframework.transaction.*;
-import org.springframework.transaction.support.TransactionTemplate;
 
 /** Correlation and clean commit share the same serialized, authorized PR transaction. */
 @Repository
 public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
     private final JdbcTemplate jdbc;
     private final JdbcReviewStateStore states;
-    private final TransactionTemplate transactions;
     private final ReviewOutcomeClassifier classifier = new ReviewOutcomeClassifier();
 
-    public JdbcReviewOutcomeStore(JdbcTemplate jdbc, PlatformTransactionManager manager, JdbcReviewStateStore states) {
-        this.jdbc = jdbc;
-        this.states = states;
-        PostgresDeadlines.requireTransactionTimeout(jdbc, "review outcome");
-        transactions = new TransactionTemplate(manager);
-        transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-        transactions.setTimeout(3);
+    /** Reuses the state store's bounded transaction, PR lock and failure sanitization. */
+    public JdbcReviewOutcomeStore(JdbcTemplate jdbc, JdbcReviewStateStore states) {
+        this.jdbc = Objects.requireNonNull(jdbc);
+        this.states = Objects.requireNonNull(states);
     }
+
+    /** A persisted snapshot plus its database-assigned ingestion time (null for rows ingested before V9). */
+    private record Loaded(Snapshot snapshot, Instant ingestedAt) {}
 
     @Override
     public ReviewOutcome assess(Assessment assessment, Runnable authorize) {
-        return transaction(assessment.run().pr(), authorize, () -> classify(assessment));
+        return states.locked(assessment.run().pr(), authorize, () -> classify(assessment));
     }
 
     @Override
     public PullRequestReview recordClean(Assessment assessment, UUID commandId, ReviewTransition.Gates gates, Runnable authorize) {
-        return transaction(assessment.run().pr(), authorize, () -> {
+        return states.locked(assessment.run().pr(), authorize, () -> {
             rejectReplay(assessment, commandId);
             Run run = assessment.run();
             var transition = new ReviewTransition(commandId, assessment.expectedVersion(), run.headSha(),
-                    run.stage() == Stage.BASELINE ? ReviewTransition.Action.BASELINE_CLEAN : ReviewTransition.Action.DEEP_CLEAN,
-                    null, gates);
+                    run.stage().cleanAction(), null, gates);
+            // CLEAN_FOR_SHA already requires no pending inline/general findings, so it replaces the default guard.
             var state = states.applyLocked(run.pr(), transition, () -> {
                 if (classify(assessment).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
             });
@@ -74,25 +70,12 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 && Objects.equals(p.get("cycle_id"), run.cycleId()) && Objects.equals(p.get("snapshot_id"), assessment.snapshotId())
                 && Objects.equals(p.get("head_sha"), run.headSha()) && Objects.equals(p.get("expected_head_sha"), run.headSha())
                 && Objects.equals(p.get("expected_version"), assessment.expectedVersion())
-                && Objects.equals(p.get("action"), run.stage() == Stage.BASELINE ? "BASELINE_CLEAN" : "DEEP_CLEAN")
+                && Objects.equals(p.get("action"), run.stage().cleanAction().name())
                 && Objects.equals(p.get("stage"), run.stage().name()) && Objects.equals(p.get("provider"), run.provider())
                 && Objects.equals(p.get("evidence_provider"), run.evidenceProvider()) && Objects.equals(p.get("reviewer"), run.reviewer())
                 && completion != null && run.equals(completion.run()) && completion.status() == Status.COMPLETED
                 && completion.conclusion() == Conclusion.NO_FINDINGS && Objects.equals(p.get("review_source_id"), completion.reviewId());
         throw new ReviewConflict(exact ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
-    }
-
-    private <T> T transaction(PullRequestId pr, Runnable authorize, Supplier<T> operation) {
-        try {
-            return transactions.execute(status -> {
-                try {
-                    PostgresDeadlines.apply(jdbc, Duration.ofSeconds(3));
-                    authorize.run();
-                    PostgresLocks.lockPr(jdbc, pr);
-                    return operation.get();
-                } catch (RuntimeException failure) { throw sanitized(failure); }
-            });
-        } catch (RuntimeException failure) { throw sanitized(failure); }
     }
 
     private ReviewOutcome classify(Assessment assessment) {
@@ -119,35 +102,47 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
                 """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(), run.provider());
-        Snapshot snapshot = loadSnapshot(assessment);
+        Loaded loaded = loadSnapshot(assessment);
+        Snapshot snapshot = loaded == null ? null : loaded.snapshot();
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");
-        // Do not reuse a pre-request review/read or an older observation after any newer evidence.
-        if (requests.size() != 1 || snapshot == null || snapshot.capturedAt().isBefore(requests.getFirst())
-                || changed != null && snapshot.capturedAt().isBefore(changed.toInstant())
+        // Known retained blockers decide the outcome even when correlation is unavailable.
+        var pending = JdbcGeneralFeedbackStore.pending(jdbc, pr, run.headSha());
+        // Do not reuse a pre-request review/read or an older observation after any newer evidence. Ingestion,
+        // request and head-change times all come from the PostgreSQL clock, and the PR lock serializes ingestion
+        // after UPDATE_HEAD. The GitHub review time is an additional guard, bounded by clock skew.
+        if (requests.size() != 1 || snapshot == null || loaded.ingestedAt() == null
+                || loaded.ingestedAt().isBefore(requests.getFirst())
+                || changed != null && loaded.ingestedAt().isBefore(changed.toInstant())
                 || snapshot.sources().stream().filter(s -> s.kind() == Kind.REVIEW
                     && assessment.completion() != null && s.id().equals(assessment.completion().reviewId()))
                     .anyMatch(s -> s.updatedAt().isBefore(requests.getFirst())
                         || changed != null && s.updatedAt().isBefore(changed.toInstant()))) {
-            return classifier.classify(run, assessment.expectedVersion(), null, null, PendingFindings.UNKNOWN);
+            return classifier.classify(run, assessment.expectedVersion(), null, null, pending);
         }
-        var pending = pending(pr, run.headSha());
         var dismissed = JdbcGeneralFeedbackStore.dismissedSources(jdbc, snapshot);
-        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending, dismissed);
+        // Valid only for the uniquely latest snapshot: retained occurrences link to it, and ingesting a changed
+        // source revision reopens its finding.
+        var closedInline = Set.copyOf(jdbc.queryForList("""
+                SELECT source_id FROM findings WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT'
+                    AND status IN ('DISMISSED', 'VERIFIED_FIXED')
+                """, String.class, snapshot.id()));
+        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
+                dismissed, closedInline);
     }
 
-    private Snapshot loadSnapshot(Assessment assessment) {
+    private Loaded loadSnapshot(Assessment assessment) {
         if (assessment.snapshotId() == null) return null;
         var run = assessment.run();
         var pr = run.pr();
-        var captures = jdbc.query("""
-                SELECT captured_at FROM review_evidence_snapshots o
+        var captures = jdbc.queryForList("""
+                SELECT captured_at, ingested_at FROM review_evidence_snapshots o
                 WHERE o.id = ? AND o.review_cycle_id = ? AND o.installation_id = ? AND o.repository_id = ?
                     AND o.pr_number = ? AND o.head_sha = ? AND o.provider = ?
                     AND NOT EXISTS (SELECT 1 FROM review_evidence_snapshots n
                         WHERE n.installation_id = o.installation_id AND n.repository_id = o.repository_id
                             AND n.pr_number = o.pr_number AND n.provider = o.provider
                             AND n.id <> o.id AND n.captured_at >= o.captured_at)
-                """, (rs, row) -> rs.getTimestamp(1).toInstant(), assessment.snapshotId(), run.cycleId(),
+                """, assessment.snapshotId(), run.cycleId(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.evidenceProvider());
         if (captures.size() != 1) return null;
         var sources = jdbc.query("SELECT * FROM review_evidence_sources WHERE snapshot_id = ?", (rs, row) -> {
@@ -160,29 +155,9 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     rs.getString("path"), rs.getObject("line", Integer.class), rs.getObject("original_line", Integer.class),
                     Severity.valueOf(rs.getString("severity")), Feedback.valueOf(rs.getString("feedback")));
         }, assessment.snapshotId());
-        return new Snapshot(assessment.snapshotId(), run.cycleId(), pr, run.evidenceProvider(), run.headSha(), captures.getFirst(), sources);
-    }
-
-    private PendingFindings pending(PullRequestId pr, String head) {
-        // Missing candidates from a later snapshot do not remove previously retained inline findings.
-        boolean inline = Boolean.TRUE.equals(jdbc.queryForObject("""
-                SELECT EXISTS (SELECT 1 FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
-                    LEFT JOIN review_evidence_snapshots o ON o.id = f.evidence_snapshot_id
-                    WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
-                        AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD') AND f.status IN ('OPEN', 'ACKNOWLEDGED')
-                        AND NOT EXISTS (SELECT 1 FROM findings n JOIN review_evidence_snapshots newer ON newer.id = n.evidence_snapshot_id
-                            WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at))
-                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
-        if (inline) return PendingFindings.ACTIONABLE;
-        return JdbcGeneralFeedbackStore.pending(jdbc, pr, head);
-    }
-
-    private RuntimeException sanitized(RuntimeException failure) {
-        if (failure instanceof ReviewConflict conflict) return new ReviewConflict(conflict.code());
-        if (failure instanceof AuthorizationDenied) return new AuthorizationDenied();
-        if (failure instanceof AuthorizationUnavailable) return new AuthorizationUnavailable();
-        if (failure instanceof ReviewStateUnavailable known) return new ReviewStateUnavailable(known.retryable());
-        return new ReviewStateUnavailable(!(failure instanceof IllegalArgumentException
-                || failure instanceof org.springframework.dao.DataIntegrityViolationException));
+        var row = captures.getFirst();
+        Timestamp ingested = (Timestamp) row.get("ingested_at");
+        return new Loaded(new Snapshot(assessment.snapshotId(), run.cycleId(), pr, run.evidenceProvider(), run.headSha(),
+                ((Timestamp) row.get("captured_at")).toInstant(), sources), ingested == null ? null : ingested.toInstant());
     }
 }

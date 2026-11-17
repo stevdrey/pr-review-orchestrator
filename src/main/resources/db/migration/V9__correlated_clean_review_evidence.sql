@@ -33,3 +33,8 @@ CREATE TABLE review_clean_evidence (
 CREATE INDEX review_clean_evidence_request_idx ON review_clean_evidence (request_id);
 CREATE INDEX review_clean_evidence_cycle_idx ON review_clean_evidence (cycle_id);
 CREATE INDEX review_clean_evidence_source_idx ON review_clean_evidence (snapshot_id, review_source_id);
+
+-- Database-assigned ingestion time keeps freshness comparisons on one (PostgreSQL) clock.
+-- Existing snapshots keep NULL: no ingestion time is invented, so they cannot establish clean evidence.
+ALTER TABLE review_evidence_snapshots ADD COLUMN ingested_at timestamptz;
+ALTER TABLE review_evidence_snapshots ALTER COLUMN ingested_at SET DEFAULT clock_timestamp();

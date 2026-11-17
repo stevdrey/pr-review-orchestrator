@@ -57,6 +57,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
         return pending(jdbc, pr, head) != ReviewOutcome.PendingFindings.CLEAR;
     }
 
+    /** Retained inline findings, general feedback and legacy rows: the single guard for every transition path. */
     static ReviewOutcome.PendingFindings pending(JdbcTemplate jdbc, PullRequestId pr, String head) {
         // The last head change is constant per PR: compute it once, not per finding row.
         return ReviewOutcome.PendingFindings.valueOf(jdbc.queryForObject(LAST_HEAD + """
@@ -69,11 +70,20 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     SELECT 'NEEDS_HUMAN' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND legacy.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND legacy.stable_finding_id IS NULL
-                        AND legacy.status IN ('OPEN', 'ACKNOWLEDGED'))
+                        AND legacy.status IN ('OPEN', 'ACKNOWLEDGED')
+                UNION ALL
+                    -- Missing candidates from a later snapshot do not remove previously retained inline findings.
+                    SELECT 'ACTIONABLE' FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
+                    LEFT JOIN review_evidence_snapshots o ON o.id = f.evidence_snapshot_id
+                    WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
+                        AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD') AND f.status IN ('OPEN', 'ACKNOWLEDGED')
+                        AND NOT EXISTS (SELECT 1 FROM findings n JOIN review_evidence_snapshots newer ON newer.id = n.evidence_snapshot_id
+                            WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at))
                 SELECT CASE WHEN bool_or(feedback = 'ACTIONABLE') THEN 'ACTIONABLE'
                     WHEN count(*) > 0 THEN 'NEEDS_HUMAN' ELSE 'CLEAR' END FROM pending
                 """, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
     }
 

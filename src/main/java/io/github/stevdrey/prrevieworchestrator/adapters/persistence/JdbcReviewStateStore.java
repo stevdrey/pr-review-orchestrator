@@ -91,14 +91,22 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     @Override
     public PullRequestReview apply(PullRequestId pr, ReviewTransition command, Runnable authorize) {
         java.util.Objects.requireNonNull(command);
+        return locked(pr, authorize, () -> applyLocked(pr, command, null));
+    }
+
+    /** Shared bounded, authorized, PR-serialized transaction with sanitized failures for persistence adapters. */
+    <T> T locked(PullRequestId pr, Runnable authorize, Supplier<T> operation) {
         return transaction(authorize, () -> {
             PostgresLocks.lockPr(jdbc, pr);
-            return applyLocked(pr, command, () -> {});
+            return operation.get();
         });
     }
 
-    /** Caller holds the PR lock and authorized transaction; validation runs before any write. */
-    PullRequestReview applyLocked(PullRequestId pr, ReviewTransition command, Runnable validateEvidence) {
+    /**
+     * Caller holds the PR lock and authorized transaction; validation runs before any write.
+     * A supplied evidence guard must prove no pending findings; it replaces the default pending-findings query.
+     */
+    PullRequestReview applyLocked(PullRequestId pr, ReviewTransition command, Runnable evidenceGuard) {
         PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
         String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
                 ? command.newHeadSha() : command.expectedHeadSha();
@@ -112,9 +120,10 @@ public class JdbcReviewStateStore implements ReviewStateStore {
         // A UUID reused for a different command must not be mistaken for an already-committed retry.
         if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
         PullRequestReview next = current.transition(command);
-        validateEvidence.run();
         // After domain validation so stale/illegal commands keep their own conflict codes.
-        if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
+        if (evidenceGuard != null) {
+            evidenceGuard.run();
+        } else if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
                 || command.action() == ReviewTransition.Action.DEEP_CLEAN
                 || command.action() == ReviewTransition.Action.MARK_READY_FOR_HUMAN)
                 && JdbcGeneralFeedbackStore.blocking(jdbc, pr, current.headSha())) {

@@ -6,7 +6,14 @@ import java.util.UUID;
 /** A derived verdict, never an approval to merge or invoke a provider. */
 public final class ReviewOutcome {
     public enum Verdict { CLEAN_FOR_SHA, ACTION_REQUIRED, NEEDS_HUMAN, UNKNOWN }
-    public enum Stage { BASELINE, DEEP }
+    public enum Stage {
+        BASELINE, DEEP;
+
+        /** The only lifecycle action a clean verdict for this stage may journal. */
+        public ReviewTransition.Action cleanAction() {
+            return this == BASELINE ? ReviewTransition.Action.BASELINE_CLEAN : ReviewTransition.Action.DEEP_CLEAN;
+        }
+    }
     public enum Status { COMPLETED, PENDING, FAILED, TIMED_OUT, UNKNOWN }
     public enum Conclusion { NO_FINDINGS, FINDINGS, UNSTRUCTURED, UNKNOWN }
     public enum PendingFindings { CLEAR, ACTIONABLE, NEEDS_HUMAN, UNKNOWN }
@@ -69,13 +76,14 @@ public final class ReviewOutcome {
     public Verdict verdict() { return verdict; }
     public Reason reason() { return reason; }
 
-    /** Version-bound command; a changed head (even away and back) cannot reuse this result. */
-    public ReviewTransition cleanTransition(UUID commandId, ReviewTransition.Gates gates) {
+    /**
+     * Version-bound command for domain policy tests only. Production clean transitions go through
+     * ReviewOutcomeStore.recordClean, which reclassifies and journals evidence in the same transaction.
+     */
+    ReviewTransition cleanTransition(UUID commandId, ReviewTransition.Gates gates) {
         if (verdict != Verdict.CLEAN_FOR_SHA) {
             throw new ReviewConflict(ReviewConflict.Code.GUARD_REJECTED);
         }
-        return new ReviewTransition(commandId, version, run.headSha(),
-                run.stage() == Stage.BASELINE ? ReviewTransition.Action.BASELINE_CLEAN : ReviewTransition.Action.DEEP_CLEAN,
-                null, gates);
+        return new ReviewTransition(commandId, version, run.headSha(), run.stage().cleanAction(), null, gates);
     }
 }

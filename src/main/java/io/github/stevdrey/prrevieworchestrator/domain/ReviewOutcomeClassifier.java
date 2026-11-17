@@ -12,14 +12,17 @@ import java.util.Set;
 public final class ReviewOutcomeClassifier {
     public ReviewOutcome classify(Run expected, long version, Completion completion,
             Snapshot snapshot, PendingFindings pending) {
-        return classify(expected, version, completion, snapshot, pending, Set.of());
+        return classify(expected, version, completion, snapshot, pending, Set.of(), Set.of());
     }
 
-    /** Dismissed IDs must come from audited decisions for the exact snapshot revisions and current head. */
-    public ReviewOutcome classify(Run expected, long version, Completion completion,
-            Snapshot snapshot, PendingFindings pending, Set<String> dismissedGeneralSources) {
+    /**
+     * Dismissed IDs must come from audited decisions for the exact snapshot revisions and current head.
+     * Closed inline IDs must come from retained findings (DISMISSED/VERIFIED_FIXED) linked to this exact snapshot.
+     */
+    public ReviewOutcome classify(Run expected, long version, Completion completion, Snapshot snapshot,
+            PendingFindings pending, Set<String> dismissedGeneralSources, Set<String> closedInlineSources) {
         Objects.requireNonNull(expected); Objects.requireNonNull(pending);
-        Objects.requireNonNull(dismissedGeneralSources);
+        Objects.requireNonNull(dismissedGeneralSources); Objects.requireNonNull(closedInlineSources);
         if (version < 0 || version == Long.MAX_VALUE) throw new IllegalArgumentException("Invalid state version");
         if (pending == PendingFindings.ACTIONABLE) return result(expected, version, ACTION_REQUIRED, BLOCKING_FINDINGS);
         if (pending == PendingFindings.UNKNOWN) return result(expected, version, UNKNOWN, INCOMPLETE_EVIDENCE);
@@ -40,9 +43,14 @@ public final class ReviewOutcomeClassifier {
                     || "CHANGES_REQUESTED".equals(source.reviewState()))) {
             return unavailable(expected, version, pending, UNVERIFIED_REVIEW);
         }
-        // Dismissals apply only to general feedback, never to inline candidates or the completion itself.
+        // Inline candidates clear only through their retained finding status, never through general dismissals.
+        // A completion whose own body is actionable contradicts NO_FINDINGS, so dismissing it cannot clear it;
+        // its ambiguous (NEEDS_HUMAN) body can be dismissed like any other general feedback.
         var candidates = snapshot.sources().stream().filter(Source::candidate)
-                .filter(s -> !s.general() || !dismissedGeneralSources.contains(s.id())).toList();
+                .filter(s -> s.general()
+                        ? s.id().equals(completion.reviewId()) && s.feedback() == Feedback.ACTIONABLE
+                            || !dismissedGeneralSources.contains(s.id())
+                        : !closedInlineSources.contains(s.id())).toList();
         if (candidates.stream().anyMatch(s -> !s.general() || s.feedback() == Feedback.ACTIONABLE)
                 || "CHANGES_REQUESTED".equals(source.reviewState()) || completion.conclusion() == Conclusion.FINDINGS) {
             return result(expected, version, ACTION_REQUIRED, BLOCKING_FINDINGS);

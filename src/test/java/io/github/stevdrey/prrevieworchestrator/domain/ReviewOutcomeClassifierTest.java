@@ -137,6 +137,25 @@ class ReviewOutcomeClassifierTest {
     }
 
     @Test
+    void closedInlineOccurrencesAndDismissedAmbiguousCompletionDoNotBlock() {
+        var inline = new Source("C1", Kind.REVIEW_COMMENT, "older-review", "T1", null, "reviewer", "b".repeat(40),
+                null, "0".repeat(64), time, null, true, true, "file.java", null, 1, Severity.HIGH);
+        var completion = completion(Conclusion.NO_FINDINGS);
+        assertEquals(CLEAN_FOR_SHA, classifier.classify(run, 2, completion, snapshot(cleanReview(), inline),
+                PendingFindings.CLEAR, Set.of(), Set.of("C1")).verdict());
+        // General dismissals never clear inline candidates.
+        assertBlocked(ACTION_REQUIRED, classifier.classify(run, 2, completion, snapshot(cleanReview(), inline),
+                PendingFindings.CLEAR, Set.of("C1"), Set.of()));
+        var ambiguous = review(head, run.reviewer(), "COMMENTED", Feedback.NEEDS_HUMAN);
+        assertEquals(CLEAN_FOR_SHA, classifier.classify(run, 2, completion, snapshot(ambiguous),
+                PendingFindings.CLEAR, Set.of("R1"), Set.of()).verdict());
+        // An actionable completion body contradicts NO_FINDINGS and cannot be dismissed into a clean result.
+        var actionable = review(head, run.reviewer(), "COMMENTED", Feedback.ACTIONABLE);
+        assertBlocked(ACTION_REQUIRED, classifier.classify(run, 2, completion, snapshot(actionable),
+                PendingFindings.CLEAR, Set.of("R1"), Set.of()));
+    }
+
+    @Test
     void generalFollowUpCommentsAndRetainedFindingsCannotBeClearedByNewCleanReview() {
         var followUp = new Source("I1", Kind.ISSUE_COMMENT, null, null, null, "author", null, null,
                 "0".repeat(64), time.minusSeconds(3600), null, null, null, null, null, null, Severity.UNKNOWN, Feedback.NEEDS_HUMAN);

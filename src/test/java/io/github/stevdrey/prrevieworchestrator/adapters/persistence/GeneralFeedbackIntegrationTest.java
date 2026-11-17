@@ -108,7 +108,7 @@ class GeneralFeedbackIntegrationTest {
 
     AssessReviewOutcome outcomes() {
         var manager = new DataSourceTransactionManager(dataSource);
-        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)), authorization);
+        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, new JdbcReviewStateStore(jdbc, manager)), authorization);
     }
 
     ReviewOutcome.Assessment assessment(ReviewOutcome.Run run, Snapshot snapshot, String reviewId, ReviewOutcome.Conclusion conclusion) {

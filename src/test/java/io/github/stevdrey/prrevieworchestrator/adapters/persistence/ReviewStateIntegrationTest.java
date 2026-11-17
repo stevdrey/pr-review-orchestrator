@@ -69,7 +69,7 @@ class ReviewStateIntegrationTest {
 
     AssessReviewOutcome outcomes() {
         var manager = new DataSourceTransactionManager(dataSource);
-        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)),
+        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, new JdbcReviewStateStore(jdbc, manager)),
                 new RepositoryAuthorization(Set.of(FIRST.scope(), SECOND.scope()), new JdbcInstallationAuthorization(jdbc)));
     }
 
@@ -213,7 +213,8 @@ class ReviewStateIntegrationTest {
         var changed = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
                 java.time.Instant.now().plusSeconds(1), List.of(source));
         ingestion.ingest(changed, () -> {});
-        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        // The superseded reference cannot prove completion, but the known retained blocker still decides.
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(assessment).verdict());
         assertCode(GUARD_REJECTED, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR));
         // A subsequent read omits that root, but the retained finding must still block.
         var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
@@ -225,6 +226,54 @@ class ReviewStateIntegrationTest {
         var rechecked = new ReviewOutcome.Assessment(run, state.version(), assessment.completion(), latest.id());
         assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(rechecked).verdict());
         assertCode(GUARD_REJECTED, () -> outcomes.recordClean(rechecked, UUID.randomUUID(), CLEAR));
+    }
+
+    @Test
+    void retainedInlineFindingsGateEveryPathUntilClosedForTheCurrentSnapshot() {
+        var state = reviewing(FIRST);
+        var assessment = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var run = assessment.run();
+        var outcomes = outcomes();
+        var ingestion = new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource));
+        var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), java.time.Instant.EPOCH, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        java.util.function.Function<String, ReviewEvidence.Source> inline = id -> new ReviewEvidence.Source(id,
+                ReviewEvidence.Kind.REVIEW_COMMENT, "R1", "T-" + id, null, "human", HEAD, null, "0".repeat(64),
+                java.time.Instant.EPOCH, null, false, false, "Example.java", 1, 1, ReviewEvidence.Severity.HIGH);
+        var withInline = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                java.time.Instant.now().plusSeconds(1), List.of(review, inline.apply("C1")));
+        ingestion.ingest(withInline, () -> {});
+        var current = new ReviewOutcome.Assessment(run, state.version(), assessment.completion(), withInline.id());
+
+        // The shared lifecycle guard sees retained inline findings, not only general feedback.
+        var current0 = state;
+        assertCode(GUARD_REJECTED, () -> lifecycle.apply(FIRST, command(current0, BASELINE_CLEAN)));
+        // Missing correlation still reports the known blocker instead of UNKNOWN.
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(
+                new ReviewOutcome.Assessment(run, state.version(), assessment.completion(), null)).verdict());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(current).verdict());
+
+        // A closed occurrence linked to this exact snapshot no longer blocks the visible comment.
+        jdbc.update("""
+                UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'not applicable'
+                WHERE source_id = 'C1' AND evidence_snapshot_id = ?
+                """, withInline.id());
+        // Snapshots without a database ingestion time (pre-V9) cannot establish clean evidence.
+        jdbc.update("UPDATE review_evidence_snapshots SET ingested_at = NULL WHERE id = ?", withInline.id());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(current).verdict());
+        jdbc.update("UPDATE review_evidence_snapshots SET ingested_at = clock_timestamp() WHERE id = ?", withInline.id());
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(current).verdict());
+        state = outcomes.recordClean(current, UUID.randomUUID(), CLEAR);
+        assertEquals(HEAD, state.baselineCleanSha());
+
+        // A new inline finding revokes the recorded clean stage during ingestion.
+        var newer = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                withInline.capturedAt().plusSeconds(1), List.of(review, inline.apply("C1"), inline.apply("C2")));
+        ingestion.ingest(newer, () -> {});
+        var revoked = lifecycle.find(FIRST).orElseThrow();
+        assertNull(revoked.baselineCleanSha());
+        assertEquals(ACTION_REQUIRED, revoked.state());
     }
 
     @Test
