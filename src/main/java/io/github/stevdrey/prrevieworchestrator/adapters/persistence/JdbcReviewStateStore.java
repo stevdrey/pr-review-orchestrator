@@ -63,6 +63,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     public PullRequestReview create(PullRequestId pr, String headSha, Runnable authorize) {
         PullRequestReview initial = PullRequestReview.initial(pr, headSha);
         return transaction(authorize, () -> {
+            JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
             int inserted = jdbc.update("""
                     INSERT INTO pr_review_states (installation_id, repository_id, pr_number, head_sha)
                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
@@ -91,6 +92,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     public PullRequestReview apply(PullRequestId pr, ReviewTransition command, Runnable authorize) {
         java.util.Objects.requireNonNull(command);
         return transaction(authorize, () -> {
+            JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
             PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
             String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
                     ? command.newHeadSha() : command.expectedHeadSha();
@@ -104,6 +106,13 @@ public class JdbcReviewStateStore implements ReviewStateStore {
             // A UUID reused for a different command must not be mistaken for an already-committed retry.
             if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
             PullRequestReview next = current.transition(command);
+            // After domain validation so stale/illegal commands keep their own conflict codes.
+            if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
+                    || command.action() == ReviewTransition.Action.DEEP_CLEAN
+                    || command.action() == ReviewTransition.Action.MARK_READY_FOR_HUMAN)
+                    && JdbcGeneralFeedbackStore.blocking(jdbc, pr, current.headSha())) {
+                throw new ReviewConflict(GUARD_REJECTED);
+            }
             jdbc.update("""
                     UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,
                     baseline_clean_sha = ?, deep_clean_sha = ?

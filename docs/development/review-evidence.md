@@ -4,7 +4,7 @@
 
 `GitHubReviewNormalizer` converts a complete, authorized GitHub GraphQL response into provider-neutral `ReviewEvidence.Snapshot` data. `IngestReviewEvidence` authorizes the installation/repository inside the PostgreSQL transaction and persists the snapshot, immutable source metadata and conservative inline finding occurrences atomically. The use case is available as an internal Spring bean. No HTTP ingestion endpoint, GitHub API fetcher, automatic polling, event planner or provider command is enabled by this increment. Webhook ingress continues to store routing metadata; approved workers must fetch authoritative review state before using this adapter.
 
-This implements normalization and durable ingestion, not live webhook-to-review automation. A snapshot cannot advance the PR lifecycle, supply a clean verdict, spend a provider budget or verify a fix. General review bodies are stored as review **observations**, not actionable findings; general-feedback classification remains issue #17.
+This implements normalization and durable ingestion, not live webhook-to-review automation. A snapshot cannot advance the PR lifecycle, supply a clean verdict, spend a provider budget or verify a fix. Issue #17 extends this boundary with [general-feedback classification, findings and audited dispositions](general-feedback.md). Non-empty review bodies and PR issue comments now require explicit disposition; they cannot imply a clean verdict.
 
 ## Trusted caller contract
 
@@ -19,6 +19,10 @@ repository(owner: $owner, name: $name) {
   databaseId
   pullRequest(number: $number) {
     number headRefOid
+    comments(first: 100) {
+      pageInfo { hasNextPage }
+      nodes { id body updatedAt author { login } }
+    }
     reviews(first: 100) {
       pageInfo { hasNextPage }
       nodes { id state body updatedAt author { login } commit { oid } }
@@ -45,13 +49,13 @@ The checked fixture is synthetic, shaped after these fields, and does not demons
 
 ## Identity, provenance and freshness
 
-- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Different observations with the same cycle/capture time conflict because their order is ambiguous.
+- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Different observations with the same PR/provider/capture time conflict because their order is ambiguous.
 - `review_evidence_sources` retains every supplied review, thread and comment revision: provider node IDs, review/thread/reply relationships, author login, source update time, review state, file/line/original line, severity and SHA-256 of the body. Bodies and private diffs are neither persisted nor logged. A hash detects revisions; it cannot reconstruct deleted text. `github-node:<id>` references remain on finding occurrences. Provider is `github`; the source author preserves reviewer attribution, without claiming Codex billing identity.
-- Each root inline comment is a **candidate** finding with one stable `finding_identities.id`, scoped by installation/repository/PR/provider/source kind/comment ID. Replies, review summaries and empty threads remain evidence only. Severity defaults to `UNKNOWN`; an optional explicit classification map supplies severity by comment node ID. No prose, approval or “looks good” text can set a disposition. Classification is advisory data for future policy.
+- Each root inline comment is a **candidate** finding with one stable `finding_identities.id`, scoped by installation/repository/PR/provider/source kind/comment ID. Replies and empty threads remain evidence only. General summaries/comments follow the separate issue #17 contract. Severity defaults to `UNKNOWN`; an optional explicit classification map supplies severity by comment node ID. No prose, approval or “looks good” text can set a disposition. Classification is advisory data for future policy.
 - `findings` keeps one occurrence per cycle/source and links it to the stable identity and latest source snapshot for that occurrence. Reusing the same comment across rounds shares identity; edits do not create new findings. New comments, even with identical text or a shared path, remain separate candidates. Semantic correlation of distinct provider comments is deliberately unsupported.
 - `findings.reviewed_sha` is the **round's** head (the existing cycle foreign-key contract). The linked source's `reviewed_sha` is the actual comment/review commit, and `original_sha` is the original comment commit. Never use the round's SHA as proof the source reviewed that head. `Source.staleFor(head)` also considers GitHub's `isOutdated` flag. Thread observations have no commit and cannot prove freshness.
 
-Per-cycle locks serialize writes. Older captured snapshots remain in history and cannot overwrite a newer finding projection. Cross-cycle, cross-PR and cross-installation links are checked by composite foreign keys. There is no new current-head authority: compare with authoritative PR state before any later decision. Prior-round occurrences retain their historical resolution signal; consult the latest thread observation across rounds for current resolution.
+PR transaction locks serialize writes across cycles. Older captured snapshots remain in history and cannot overwrite a newer finding projection. Cross-cycle, cross-PR and cross-installation links are checked by composite foreign keys. There is no new current-head authority: compare with authoritative PR state before any later decision. Prior-round occurrences retain their historical resolution signal; consult the latest thread observation across rounds for current resolution.
 
 ## Resolution, edits and absence
 
@@ -87,4 +91,4 @@ Focused verification:
 
 Tests cover metadata provenance and edits, stale/outdated threads, resolution before a fix, explicit severity, replies, multiple rounds, out-of-order snapshots, conflicting/concurrent retries, recreated-store persistence, scope/SHA mismatches, revoked authorization, deferred commit rollback, empty threads, missing sources and V5→V6 migration retaining legacy findings. PostgreSQL uses the pinned disposable Testcontainers image. Full build: `./gradlew clean build --offline`.
 
-Live API reads, webhook reconciliation, deployment load, production data retention, semantic/general feedback classification, disposition verification and automatic lifecycle integration remain unverified or unimplemented as stated above.
+Live API reads, webhook reconciliation, deployment load, production data retention, semantic prose classification, fix verification and automatic lifecycle integration remain unverified or unimplemented as stated above.

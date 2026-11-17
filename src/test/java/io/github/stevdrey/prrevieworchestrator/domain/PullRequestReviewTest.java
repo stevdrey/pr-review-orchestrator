@@ -68,7 +68,7 @@ class PullRequestReviewTest {
                 WAITING_FOR_FIX, Set.of(PAUSE, UPDATE_HEAD),
                 DEEP_REVIEW, Set.of(DEEP_CLEAN, MARK_READY_FOR_HUMAN, BLOCKING_FINDINGS, PAUSE, UPDATE_HEAD),
                 READY_FOR_HUMAN, Set.of(BLOCKING_FINDINGS, PAUSE, UPDATE_HEAD),
-                PAUSED, Set.of(RESUME, UPDATE_HEAD));
+                PAUSED, Set.of(RESUME, UPDATE_HEAD, BLOCKING_FINDINGS));
         for (Action action : Action.values()) {
             var state = at(source);
             if (source == DEEP_REVIEW && action == MARK_READY_FOR_HUMAN) state = step(state, DEEP_CLEAN);
@@ -81,6 +81,17 @@ class PullRequestReviewTest {
                         () -> current.transition(request), source + "/" + action).code());
             }
         }
+    }
+
+    @Test
+    void feedbackWhilePausedPreservesPauseAndRevokesBothCleanStages() {
+        var state = step(at(READY_FOR_HUMAN), PAUSE);
+        state = step(state, BLOCKING_FINDINGS);
+        assertEquals(PAUSED, state.state());
+        assertEquals(ACTION_REQUIRED, state.resumeState());
+        assertNull(state.baselineCleanSha());
+        assertNull(state.deepCleanSha());
+        assertEquals(ACTION_REQUIRED, step(state, RESUME).state());
     }
 
     @ParameterizedTest

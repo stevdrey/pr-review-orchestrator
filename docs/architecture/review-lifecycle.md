@@ -40,6 +40,8 @@ Default **proposal**: max six automatic review requests per PR across the config
 
 GitHub review-thread resolution only applies to resolvable conversations. General PR issue comments / review body feedback have no resolve control. Track them as local findings with stable IDs and explicit dispositions (`fixed at SHA`, `won't fix with reason`, `false positive with reason`, `needs verification`). A changed SHA triggers re-validation; never confuse “acknowledged” with “fixed”.
 
+Issue #17 implements [general findings and audited internal dispositions](../development/general-feedback.md). Acknowledgment and commit-bearing fix claims remain blocking; explicit dismissal applies only to a source revision at the current head. Persisted guards protect all clean-stage transitions and revoke existing clean readiness when new pending feedback arrives.
+
 ## Notifications
 
 Send human notifications only for state changes (ready, paused, budget, required intervention) with a per-recipient dedupe key. Default notice for clean review: link to PR, SHA, provider stages, CI evidence and caveat that the code still requires human merge authorization.

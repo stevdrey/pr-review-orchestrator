@@ -1,6 +1,6 @@
 # ADR 0005: Durable findings and per-head-SHA review evidence
 
-**Status:** Accepted (persistent PR state and SHA-bound clean evidence implemented; internal inline finding normalization implemented; general-feedback classification and live provider correlation pending)
+**Status:** Accepted (persistent PR state and SHA-bound clean evidence implemented; internal inline finding normalization implemented; general-feedback tracking/dispositions and stage guards implemented; live provider correlation and fix verification pending)
 **Date:** 2026-11-13
 
 ## Context
@@ -26,3 +26,5 @@ General-only feedback; deleted/edited comment; no-finding review; thread resolve
 Issue #15 implements the [persistent local review state contract](../development/review-state-machine.md), including guarded transitions, version/key rejection, pause/resume and invalidation of both clean stage SHAs after every head change. Existing cycle/finding schema and provenance are preserved. This does not itself prove or ingest live provider results or finding dispositions.
 
 Issue #16 implements [durable internal inline normalization](../development/review-evidence.md): metadata-only review/thread/comment revisions, per-round occurrences and stable scoped source identities. Explicit severity and thread resolution are preserved without inferring a fix or clean verdict. Source reviewed/original SHAs remain distinct from the cycle head. General-feedback classification and live API/event integration remain separate work.
+
+Issue #17 implements [general-feedback tracking, conservative classification and audited internal dispositions](../development/general-feedback.md). Exact-revision/head decisions govern clean-stage guards; new pending evidence atomically revokes clean readiness. Fix claims retain commit evidence without asserting verification. Author authentication endpoints and live reconciliation remain separate integrations.

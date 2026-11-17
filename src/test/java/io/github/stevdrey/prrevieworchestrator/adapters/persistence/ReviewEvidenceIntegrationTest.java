@@ -49,7 +49,9 @@ class ReviewEvidenceIntegrationTest {
         secondCycle = cycle(NEXT, 2);
         ingestion = newIngestion();
         try (var stream = getClass().getResourceAsStream("/github/review-snapshot.json")) {
-            json = new String(Objects.requireNonNull(stream).readAllBytes(), StandardCharsets.UTF_8);
+            // This suite isolates inline projection; general-only bodies have their own suite.
+            json = new String(Objects.requireNonNull(stream).readAllBytes(), StandardCharsets.UTF_8)
+                    .replace("Review summary, not a clean verdict", "");
         }
     }
 
@@ -260,7 +262,7 @@ class ReviewEvidenceIntegrationTest {
                     VALUES (?, ?, 101, 1001, ?, 'github', 'REVIEW_COMMENT', 'legacy-comment', 'legacy-thread', true)
                     """, finding, cycle, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             var row = jdbc.queryForMap("SELECT * FROM review_upgrade_fixture.findings WHERE id = ?", finding);
             assertEquals("legacy-comment", row.get("source_id"));
             assertEquals("legacy-thread", row.get("thread_id"));
