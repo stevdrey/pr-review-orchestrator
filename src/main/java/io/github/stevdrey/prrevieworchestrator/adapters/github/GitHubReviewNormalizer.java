@@ -24,6 +24,12 @@ public final class GitHubReviewNormalizer {
     /** Severity classifications are explicit caller input; review prose cannot change dispositions. */
     public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
             Instant capturedAt, byte[] response, Map<String, Severity> severities) {
+        return normalize(observationId, cycleId, pr, expectedHead, capturedAt, response, severities, Set.of());
+    }
+
+    /** Explicit actionable IDs are advisory; every other nonblank general body requires human disposition. */
+    public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
+            Instant capturedAt, byte[] response, Map<String, Severity> severities, Set<String> actionableIds) {
         try {
             require(response.length <= 2 * 1024 * 1024);
             JsonNode root = JSON.readTree(response);
@@ -42,7 +48,14 @@ public final class GitHubReviewNormalizer {
                 sources.add(new Source(id, Kind.REVIEW, id, null, null, author(review),
                         optionalString(review.path("commit"), "oid"), null, hash(body(review)),
                         Instant.parse(string(review, "updatedAt")), string(review, "state"),
-                        null, null, null, null, null, Severity.UNKNOWN));
+                        null, null, null, null, null, Severity.UNKNOWN, feedback(review, actionableIds)));
+            }
+            for (JsonNode comment : nodes(pull.path("comments"))) {
+                String id = string(comment, "id");
+                sources.add(new Source(id, Kind.ISSUE_COMMENT, null, null, null, author(comment),
+                        null, null, hash(body(comment)), Instant.parse(string(comment, "updatedAt")),
+                        null, null, null, null, null, null, severities.getOrDefault(id, Severity.UNKNOWN),
+                        feedback(comment, actionableIds)));
             }
             for (JsonNode thread : nodes(pull.path("reviewThreads"))) {
                 String threadId = string(thread, "id");
@@ -68,6 +81,11 @@ public final class GitHubReviewNormalizer {
             // No provider text, response bodies, URLs or parser diagnostics in failure paths.
             throw new IllegalArgumentException("Incomplete or invalid GitHub review snapshot");
         }
+    }
+
+    private Feedback feedback(JsonNode node, Set<String> actionableIds) {
+        if (body(node).isBlank()) return Feedback.NONE;
+        return actionableIds.contains(string(node, "id")) ? Feedback.ACTIONABLE : Feedback.NEEDS_HUMAN;
     }
 
     private Iterable<JsonNode> nodes(JsonNode connection) {

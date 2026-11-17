@@ -25,7 +25,8 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                     ON n.snapshot_id = excluded.evidence_snapshot_id AND n.source_id = p.source_id
                 WHERE p.snapshot_id = findings.evidence_snapshot_id AND p.source_id = findings.source_id
                     AND p.body_sha256 = n.body_sha256
-                    AND p.source_updated_at IS NOT DISTINCT FROM n.source_updated_at)""";
+                    AND p.source_updated_at IS NOT DISTINCT FROM n.source_updated_at
+                    AND p.feedback = n.feedback)""";
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
 
@@ -39,7 +40,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     @Override
     public boolean ingest(Snapshot snapshot, Runnable authorize) {
-        String fingerprint = fingerprint(snapshot);
+        String fingerprint = fingerprint(snapshot, true);
         try {
             return Boolean.TRUE.equals(transactions.execute(status -> {
                 try {
@@ -53,6 +54,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     private boolean persist(Snapshot snapshot, String fingerprint) {
         var pr = snapshot.pr();
+        JdbcGeneralFeedbackStore.lockPr(jdbc, pr);
         // Cycle locking serializes same-round updates and makes the current projection deterministic.
         var cycles = jdbc.query("""
                 SELECT id FROM review_cycles WHERE id = ? AND installation_id = ? AND repository_id = ?
@@ -60,36 +62,51 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 """, (rs, row) -> rs.getObject(1, UUID.class), snapshot.cycleId(), pr.scope().installationId(),
                 pr.scope().repositoryId(), pr.number(), snapshot.headSha());
         if (cycles.isEmpty()) throw new Conflict();
-        var existing = jdbc.query("SELECT fingerprint FROM review_evidence_snapshots WHERE id = ?",
-                (rs, row) -> rs.getString(1), snapshot.id());
+        var existing = jdbc.queryForList("SELECT fingerprint, fingerprint_version FROM review_evidence_snapshots WHERE id = ?", snapshot.id());
         if (!existing.isEmpty()) {
-            if (!existing.getFirst().equals(fingerprint)) throw new Conflict();
+            var previous = existing.getFirst();
+            String expected = ((Number) previous.get("fingerprint_version")).intValue() == 1
+                    ? fingerprint(snapshot, false) : fingerprint;
+            if (!previous.get("fingerprint").equals(expected)) throw new Conflict();
             return false;
         }
         // Equal observation times cannot establish ordering; do not silently choose a winner.
-        if (!jdbc.query("SELECT id FROM review_evidence_snapshots WHERE review_cycle_id = ? AND captured_at = ?",
-                (rs, row) -> rs.getObject(1, UUID.class), snapshot.cycleId(), Timestamp.from(snapshot.capturedAt())).isEmpty()) {
+        if (!jdbc.query("""
+                SELECT id FROM review_evidence_snapshots WHERE installation_id = ? AND repository_id = ?
+                AND pr_number = ? AND provider = ? AND captured_at = ?
+                """,
+                (rs, row) -> rs.getObject(1, UUID.class), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.provider(),
+                Timestamp.from(snapshot.capturedAt())).isEmpty()) {
             throw new Conflict();
         }
         jdbc.update("""
                 INSERT INTO review_evidence_snapshots (id, review_cycle_id, installation_id, repository_id,
-                    pr_number, head_sha, provider, captured_at, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pr_number, head_sha, provider, captured_at, fingerprint, fingerprint_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
                 """, snapshot.id(), snapshot.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(),
                 pr.number(), snapshot.headSha(), snapshot.provider(), Timestamp.from(snapshot.capturedAt()), fingerprint);
         // Batched: a fixed number of round trips regardless of source count keeps large PRs within the deadline.
         jdbc.batchUpdate("""
                 INSERT INTO review_evidence_sources (snapshot_id, source_id, source_kind, review_id, thread_id,
                     reply_to_id, author_login, reviewed_sha, original_sha, body_sha256, source_updated_at,
-                    review_state, thread_resolved, thread_outdated, path, line, original_line, severity)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    review_state, thread_resolved, thread_outdated, path, line, original_line, severity, feedback)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, snapshot.sources().stream().map(source -> new Object[] {snapshot.id(), source.id(),
                 source.kind().name(), source.reviewId(), source.threadId(), source.replyToId(), source.author(),
                 source.reviewedSha(), source.originalSha(), source.bodySha256(),
                 source.updatedAt() == null ? null : Timestamp.from(source.updatedAt()),
                 source.reviewState(), source.resolved(), source.outdated(),
-                source.path(), source.line(), source.originalLine(), source.severity().name()}).toList());
-        var candidates = snapshot.sources().stream().filter(Source::candidate).toList();
+                source.path(), source.line(), source.originalLine(), source.severity().name(), source.feedback().name()}).toList());
+        // Once tracked, blanking a body is an edit requiring a new human decision, not a fix.
+        var tracked = new HashSet<String>();
+        jdbc.query("""
+                SELECT source_id FROM finding_identities WHERE installation_id = ? AND repository_id = ?
+                    AND pr_number = ? AND provider = ? AND source_kind IN ('REVIEW', 'ISSUE_COMMENT')
+                """, rs -> { tracked.add(rs.getString(1)); }, pr.scope().installationId(), pr.scope().repositoryId(),
+                pr.number(), snapshot.provider());
+        var candidates = snapshot.sources().stream()
+                .filter(s -> s.candidate() || s.general() && tracked.contains(s.id())).toList();
         if (!candidates.isEmpty()) projectFindings(snapshot, candidates);
+        JdbcGeneralFeedbackStore.invalidateClean(jdbc, pr);
         return true;
     }
 
@@ -98,16 +115,16 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         // DO NOTHING avoids rewriting (and locking) unchanged identity rows on every observation.
         jdbc.batchUpdate("""
                 INSERT INTO finding_identities (id, installation_id, repository_id, pr_number, provider, source_kind, source_id)
-                VALUES (?, ?, ?, ?, ?, 'REVIEW_COMMENT', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (installation_id, repository_id, pr_number, provider, source_kind, source_id) DO NOTHING
                 """, candidates.stream().map(source -> new Object[] {UUID.randomUUID(), pr.scope().installationId(),
-                pr.scope().repositoryId(), pr.number(), snapshot.provider(), source.id()}).toList());
+                pr.scope().repositoryId(), pr.number(), snapshot.provider(), source.kind().name(), source.id()}).toList());
         Array ids = jdbc.execute((ConnectionCallback<Array>) connection ->
                 connection.createArrayOf("text", candidates.stream().map(Source::id).toArray()));
         var identities = new HashMap<String, UUID>();
         jdbc.query("""
                 SELECT source_id, id FROM finding_identities WHERE installation_id = ? AND repository_id = ?
-                    AND pr_number = ? AND provider = ? AND source_kind = 'REVIEW_COMMENT' AND source_id = ANY(?)
+                    AND pr_number = ? AND provider = ? AND source_id = ANY(?)
                 """, rs -> { identities.put(rs.getString(1), rs.getObject(2, UUID.class)); },
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.provider(), ids);
         // Each round has its own occurrence, but all observations of this source share one stable identity.
@@ -117,7 +134,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha,
                     source_provider, source_kind, source_id, thread_id, body_ref, severity, thread_resolved,
                     stable_finding_id, evidence_snapshot_id, pr_number)
-                VALUES (?, ?, ?, ?, ?, ?, 'REVIEW_COMMENT', ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (review_cycle_id, source_provider, source_kind, source_id, source_ordinal)
                 DO UPDATE SET thread_id = excluded.thread_id, severity = excluded.severity,
                     thread_resolved = excluded.thread_resolved, stable_finding_id = excluded.stable_finding_id,
@@ -132,7 +149,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                     (SELECT captured_at FROM review_evidence_snapshots WHERE id = findings.evidence_snapshot_id) < ?
                 """.formatted(UNCHANGED), candidates.stream().map(source -> new Object[] {UUID.randomUUID(),
                 snapshot.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(), snapshot.headSha(),
-                snapshot.provider(), source.id(), source.threadId(), "github-node:" + source.id(),
+                snapshot.provider(), source.kind().name(), source.id(), source.threadId(), "github-node:" + source.id(),
                 source.severity().name(), source.resolved(), identities.get(source.id()), snapshot.id(), pr.number(),
                 Timestamp.from(snapshot.capturedAt())}).toList());
     }
@@ -150,7 +167,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
     }
 
     /** Length-prefixed fields avoid delimiter collisions in untrusted paths, logins and provider IDs. */
-    private String fingerprint(Snapshot snapshot) {
+    private String fingerprint(Snapshot snapshot, boolean includeFeedback) {
         try {
             var bytes = new ByteArrayOutputStream();
             var out = new DataOutputStream(bytes);
@@ -161,6 +178,7 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 fields(out, s.id(), s.kind(), s.reviewId(), s.threadId(), s.replyToId(), s.author(),
                         s.reviewedSha(), s.originalSha(), s.bodySha256(), s.updatedAt(), s.reviewState(),
                         s.resolved(), s.outdated(), s.path(), s.line(), s.originalLine(), s.severity());
+                if (includeFeedback) fields(out, s.feedback());
             }
             return Sha256.hex(bytes.toByteArray());
         } catch (IOException ignored) { throw new Unavailable(false); }
