@@ -116,4 +116,8 @@ repository scope. The latest screenshot extends this comparison through its
 filename-derived 23:42:12 capture. Evidence publication and subsequent activity
 remain separately timed; publishing the earlier audit did not produce another
 visible provider review in the #51 timeline inspected during this recheck.
-Keep issue #42 open; no additional billable experiment is authorized by this audit.
+The owner accepted closing issue #42 with the financial limitation documented.
+The aggregate activity correlation does not satisfy the original per-review
+accounting requirement or enable production dispatch. Reopen the issue or track
+the accounting prerequisite in a follow-up before enabling the request path.
+No additional billable experiment is authorized by this audit.

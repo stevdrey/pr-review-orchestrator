@@ -1,8 +1,10 @@
 # Issue 14: Codex trigger and usage attribution spike
 
 **Status: trigger investigation completed with an owner-accepted limitation;
-per-review usage attribution remains unverified.** Billing verification continues
-in [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42).
+per-review usage attribution remains unverified.** The accounting follow-up in
+[issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42) concluded
+with an owner-accepted financial-attribution limitation; production verification
+remains required.
 See the [accounting investigation and counter experiment](issue-42-review-accounting.md)
 for current source checks, separate case assessments and the prepared provider escalation.
 This spike does not authorize enabling a review adapter. Tracked by

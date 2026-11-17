@@ -10,7 +10,7 @@ Implemented ingress: `POST /webhooks/github`. Verify bounded raw HMAC-SHA256 byt
 
 Outbound GitHub: limited to app-authorized operations; use user-to-server authorization where necessary for account attribution and verify Codex subscription ownership in an integration test. GitHub comment author identity and Codex billable identity may differ.
 
-The [Codex attribution spike](../spikes/issue-14-codex-attribution.md) records observed trigger behavior, attribution limits, the controlled test protocol and a fail-closed fallback. User-token and automatic triggers succeeded in the tested configuration; per-review usage attribution remains unverified and is tracked in [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42).
+The [Codex attribution spike](../spikes/issue-14-codex-attribution.md) records observed trigger behavior, attribution limits, the controlled test protocol and a fail-closed fallback. User-token and automatic triggers succeeded in the tested configuration. [Issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42) concludes the accounting investigation with an owner-accepted limitation: per-review financial attribution remains unverified and is still a prerequisite for enabling a request path.
 
 The [issue #42 accounting investigation](../spikes/issue-42-review-accounting.md)
 assesses available provider sources and defines an owner-assisted counter experiment.

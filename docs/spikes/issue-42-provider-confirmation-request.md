@@ -5,6 +5,10 @@
 after checking the content. Add private account/workspace details only within the
 provider's secure support channel, never in this repository.
 
+The owner accepted closing the research spike with billing attribution unresolved.
+This draft remains available for the accounting verification required before
+production enablement; closing issue #42 does not imply Support confirmed it.
+
 Subject: Per-review usage attribution for manual and automatic Codex GitHub reviews
 
 We are validating an integration before enabling automated review requests. We

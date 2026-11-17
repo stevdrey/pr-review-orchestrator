@@ -1,12 +1,16 @@
 # Issue 42: Codex review accounting
 
-**Status: investigation in progress; account attribution unresolved.**
+**Status: spike concluded with owner-accepted accounting limitation.**
 Checked on 2026-11-16 (America/Costa_Rica; 2026-11-17 UTC).
 Tracked by [issue #42](https://github.com/stevdrey/pr-review-orchestrator/issues/42),
 following the [issue #14 trigger experiment](issue-14-codex-attribution.md).
 This is a research record and operator protocol, not a production review adapter
-or an implemented budget ledger. Keep issue #42 open until the accounting source
-or written provider confirmation is obtained.
+or an implemented budget ledger. On 2026-11-16 the owner accepted closing issue
+#42 with financial attribution explicitly unresolved. This accepts the research
+outcome; it does not establish the missing accounting facts or waive the
+production prerequisites in ADR 0002/0004. The evidence is published in
+[PR #51](https://github.com/stevdrey/pr-review-orchestrator/pull/51); issue closure
+does not imply that the documentation PR is merged or that a review adapter ships.
 
 ## Findings and available sources
 
@@ -267,7 +271,8 @@ Escalation owner: repository/account owner. Use the
 **Prepared, not submitted; no provider response received.** Public evidence does
 not establish that Support is unable to supply the missing records. Keep the
 ticket ID and raw response private; publish only a redacted conclusion approved
-by the owner. Reopen accounting verification when a supported source or written
+by the owner. Reopen issue #42 or track accounting verification in a follow-up
+before enabling the request path, when a supported source or written
 confirmation becomes available, separately for each trigger and account context.
 
 ## Verification and operation log
@@ -294,14 +299,15 @@ confirmation becomes available, separately for each trigger and account context.
   targets and checked common credential patterns across all six changed
   documents; passed. These checks do not validate external billing attribution.
 
-Acceptance remains partial: individual accounting and written confirmation are
-missing; the two historical cases, two new connector manual experiments and safe
+The owner accepted closure of the spike with the original financial acceptance
+criteria incomplete: individual accounting and written confirmation are missing;
+the two historical cases, two new connector manual experiments and safe
 fallback are documented. Initial readings showed no increase; subsequent captures
 show +2/0 and then cumulative +4 reviews/+1 finding, matching the four observed
 manual runs and one P2. Manual trigger/completion and aggregate activity correlation
 are established in the inspected scope; per-review financial accounting remains unknown.
 
-| Issue #42 criterion | Current evidence / remaining requirement |
+| Original issue #42 criterion | Evidence / owner-accepted closure limitation |
 | --- | --- |
 | Authoritative accounting source or written confirmation | Not achieved: no per-review account/workspace, correlation or mechanism established; provider request prepared, not submitted |
 | Separate manual and automatic assessments | Historical cases and two new connector manual tests documented; cumulative +4/+1 activity matches four observed manual runs and one P2. Per-run financial units, billing identity and automatic-review attribution remain unknown |
