@@ -46,6 +46,16 @@ Please assess these cases separately:
   reviewed` counts unique PRs or individual review runs, including repeat reviews
   and manually reviewed drafts, and its expected reporting delay?
 
+Later observation: the owner's screenshot named 2026-11-16 22:39:24
+America/Costa_Rica (2026-11-17 04:39:24 UTC) shows **49 PRs reviewed / 12 issues
+found**, a +2/0 change. An [open-PR audit](issue-42-open-pr-correlation.md) found
+two additional manual requests on Dokene #410 at 03:55:13 and 04:02:43 UTC,
+with receipts at 03:57:33 and 04:04:05 UTC. The first produced one visible P2
+finding. Thus four visible manual requests compete with the +2 counter difference;
+we cannot identify which requests or findings the screenshot includes. Please
+clarify reporting cutoff, repeat-review counting and finding inclusion semantics
+as well as the individual accounting correlation.
+
 For each case, could you confirm:
 
 1. Which account/workspace was charged, and how it was selected? Does the rule
