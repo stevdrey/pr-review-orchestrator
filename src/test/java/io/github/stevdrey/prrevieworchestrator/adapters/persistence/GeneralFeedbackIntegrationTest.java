@@ -326,6 +326,91 @@ class GeneralFeedbackIntegrationTest {
         } finally { jdbc.execute("DROP SCHEMA IF EXISTS general_upgrade_fixture CASCADE"); }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void v6CrossRoundBlankUpgradeRequiresLatestRevisionDisposition(boolean includeOtherProvider) {
+        String schema = "cross_round_upgrade_fixture";
+        String url = POSTGRES.getJdbcUrl();
+        var scopedDataSource = new DriverManagerDataSource(url + (url.contains("?") ? "&" : "?")
+                + "currentSchema=" + schema, POSTGRES.getUsername(), POSTGRES.getPassword());
+        var scoped = new JdbcTemplate(scopedDataSource);
+        UUID oldCycle = UUID.fromString("00000000-0000-0000-0000-000000000002");
+        UUID newCycle = UUID.fromString("00000000-0000-0000-0000-000000000004");
+        var older = new Snapshot(UUID.fromString("00000000-0000-0000-0000-000000000001"), oldCycle, PR,
+                "github", HEAD, TIME, List.of(source(Kind.REVIEW, Feedback.NEEDS_HUMAN, "legacy body", TIME)));
+        var newer = new Snapshot(UUID.fromString("00000000-0000-0000-0000-000000000003"), newCycle, PR,
+                "github", HEAD, TIME.plusSeconds(1), List.of(source(Kind.REVIEW, Feedback.NONE, "", TIME.plusSeconds(1))));
+        var other = new Snapshot(UUID.fromString("00000000-0000-0000-0000-000000000005"), newCycle, PR,
+                "other", HEAD, TIME.plusSeconds(2), List.of(source(Kind.REVIEW, Feedback.NONE, "", TIME.plusSeconds(2))));
+        var observations = new ArrayList<>(List.of(older, newer));
+        if (includeOtherProvider) observations.add(other);
+        // Frozen V6 fingerprints: exercise old persistence retries without using the current private serializer.
+        var fingerprints = Map.of(
+                older.id(), "e45cbd342fcb82ad2a0766efaf7341adc2a7e2cdf500fb88b65b3bbb32986771",
+                newer.id(), "3c84aa0f05350dcb39084d50d42256a66330aad138d7c8b0dcbb6de1fc422503",
+                other.id(), "b43da5a98fc1a33f149ad2332b6514ab253135cb255874e9f25c985879e71568");
+        try {
+            Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).target("6").load().migrate();
+            scoped.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
+            scoped.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+            for (var round : List.of(oldCycle, newCycle)) {
+                scoped.update("""
+                        INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider, iteration)
+                        VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'github', ?)
+                        """, round, HEAD, round.equals(oldCycle) ? 1 : 2);
+            }
+            for (var observation : observations) {
+                scoped.update("""
+                        INSERT INTO review_evidence_snapshots (id, review_cycle_id, installation_id, repository_id,
+                            pr_number, head_sha, provider, captured_at, fingerprint)
+                        VALUES (?, ?, 101, 1001, 7, ?, ?, ?, ?)
+                        """, observation.id(), observation.cycleId(), HEAD, observation.provider(),
+                        java.sql.Timestamp.from(observation.capturedAt()), fingerprints.get(observation.id()));
+                var revision = observation.sources().getFirst();
+                scoped.update("""
+                        INSERT INTO review_evidence_sources (snapshot_id, source_id, source_kind, review_id, author_login,
+                            reviewed_sha, body_sha256, source_updated_at, review_state, severity)
+                        VALUES (?, 'general-1', 'REVIEW', 'general-1', 'reviewer', ?, ?, ?, 'APPROVED', 'UNKNOWN')
+                        """, observation.id(), HEAD, revision.bodySha256(), java.sql.Timestamp.from(revision.updatedAt()));
+            }
+            var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
+            assertEquals(1, migration.migrate().migrationsExecuted);
+            assertEquals(observations.size(), scoped.queryForObject("SELECT count(*) FROM review_evidence_sources", Integer.class));
+            assertEquals(1, scoped.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
+            assertEquals(2, scoped.queryForObject("SELECT count(*) FROM findings", Integer.class));
+            assertEquals(newer.id(), scoped.queryForObject("SELECT evidence_snapshot_id FROM findings WHERE review_cycle_id = ?",
+                    UUID.class, newCycle));
+            var manager = new DataSourceTransactionManager(scopedDataSource);
+            var auth = new RepositoryAuthorization(Set.of(PR.scope()), new JdbcInstallationAuthorization(scoped));
+            var upgraded = new IngestReviewEvidence(auth, new JdbcReviewEvidenceStore(scoped, manager));
+            for (var observation : observations) assertFalse(upgraded.ingest(observation));
+            assertEquals(2, scoped.queryForObject("SELECT count(*) FROM findings", Integer.class));
+            var upgradedLifecycle = new ReviewLifecycle(new JdbcReviewStateStore(scoped, manager), auth);
+            var state = upgradedLifecycle.create(PR, HEAD);
+            for (var action : List.of(MARK_READY, START_REVIEW)) {
+                state = upgradedLifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), state.version(), HEAD, action, null, CLEAR));
+            }
+            var reviewing = state;
+            UUID finding = scoped.queryForObject("SELECT id FROM finding_identities", UUID.class);
+            var upgradedDispositions = new DisposeGeneralFeedback(auth, new JdbcGeneralFeedbackStore(scoped, manager));
+            assertThrows(Conflict.class, () -> upgradedDispositions.dispose(PR, new Disposition(UUID.randomUUID(), finding,
+                    older.id(), HEAD, reviewing.version(), GeneralFeedback.Action.DISMISS, "fixture-author", "Stale decision", null)));
+            assertTrue(JdbcGeneralFeedbackStore.blocking(scoped, PR, HEAD));
+            assertEquals(ReviewConflict.Code.GUARD_REJECTED, assertThrows(ReviewConflict.class,
+                    () -> upgradedLifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), reviewing.version(), HEAD,
+                            BASELINE_CLEAN, null, CLEAR))).code());
+            assertTrue(upgradedDispositions.dispose(PR, new Disposition(UUID.randomUUID(), finding,
+                    newer.id(), HEAD, reviewing.version(), GeneralFeedback.Action.DISMISS, "fixture-author", "Current decision", null)));
+            assertFalse(JdbcGeneralFeedbackStore.blocking(scoped, PR, HEAD));
+            state = upgradedLifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), reviewing.version(), HEAD,
+                    BASELINE_CLEAN, null, CLEAR));
+            assertEquals(PullRequestReview.State.DEEP_REVIEW, state.state());
+            assertEquals(HEAD, state.baselineCleanSha());
+            assertTrue(migration.validateWithResult().validationSuccessful);
+            assertEquals(0, migration.migrate().migrationsExecuted);
+        } finally { jdbc.execute("DROP SCHEMA IF EXISTS cross_round_upgrade_fixture CASCADE"); }
+    }
+
     @Test
     void concurrentExactRetriesAndConflictingIdsAreSafeAndAuthorizationIsRechecked() throws Exception {
         var snapshot = observe(cycle, HEAD, 0, source(Kind.REVIEW, Feedback.NEEDS_HUMAN, "Concern", TIME));

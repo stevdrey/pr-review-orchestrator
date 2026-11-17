@@ -59,16 +59,16 @@ FROM (SELECT DISTINCT o.installation_id, o.repository_id, o.pr_number, o.provide
     FROM review_evidence_sources s JOIN review_evidence_snapshots o ON o.id = s.snapshot_id
     WHERE s.source_kind = 'REVIEW' AND s.feedback = 'NEEDS_HUMAN') existing
 ON CONFLICT DO NOTHING;
+-- For each tracked identity, retain the latest revision in every round, including blank-only rounds.
+-- The scoped identity join below excludes reviews that were always blank for that PR/provider.
 INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, pr_number, reviewed_sha,
     source_provider, source_kind, source_id, body_ref, stable_finding_id, evidence_snapshot_id)
 SELECT gen_random_uuid(), o.review_cycle_id, o.installation_id, o.repository_id, o.pr_number, o.head_sha,
     o.provider, 'REVIEW', s.source_id, 'github-node:' || s.source_id, i.id, s.snapshot_id
-FROM (SELECT DISTINCT ON (o.review_cycle_id, s.source_id) s.*
+FROM (SELECT DISTINCT ON (o.review_cycle_id, o.provider, s.source_id) s.*
     FROM review_evidence_sources s JOIN review_evidence_snapshots o ON o.id = s.snapshot_id
-    WHERE s.source_kind = 'REVIEW' AND EXISTS (
-        SELECT 1 FROM review_evidence_sources p JOIN review_evidence_snapshots q ON q.id = p.snapshot_id
-        WHERE q.review_cycle_id = o.review_cycle_id AND p.source_id = s.source_id AND p.feedback = 'NEEDS_HUMAN')
-    ORDER BY o.review_cycle_id, s.source_id, o.captured_at DESC) s
+    WHERE s.source_kind = 'REVIEW'
+    ORDER BY o.review_cycle_id, o.provider, s.source_id, o.captured_at DESC) s
 JOIN review_evidence_snapshots o ON o.id = s.snapshot_id
 JOIN finding_identities i ON i.installation_id = o.installation_id AND i.repository_id = o.repository_id
     AND i.pr_number = o.pr_number AND i.provider = o.provider AND i.source_kind = 'REVIEW' AND i.source_id = s.source_id
