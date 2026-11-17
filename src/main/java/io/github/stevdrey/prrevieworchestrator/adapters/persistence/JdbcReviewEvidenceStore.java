@@ -111,16 +111,10 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 source.updatedAt() == null ? null : Timestamp.from(source.updatedAt()),
                 source.reviewState(), source.resolved(), source.outdated(),
                 source.path(), source.line(), source.originalLine(), source.severity().name(), source.feedback().name()}).toList());
-        // Once tracked, blanking a body is an edit requiring a new human decision, not a fix.
-        var tracked = new HashSet<String>();
-        jdbc.query("""
-                SELECT source_id FROM finding_identities WHERE installation_id = ? AND repository_id = ?
-                    AND pr_number = ? AND provider = ? AND source_kind IN ('REVIEW', 'ISSUE_COMMENT')
-                """, rs -> { tracked.add(rs.getString(1)); }, pr.scope().installationId(), pr.scope().repositoryId(),
-                pr.number(), snapshot.provider());
-        var candidates = snapshot.sources().stream()
-                .filter(s -> s.candidate() || s.general() && tracked.contains(s.id())).toList();
+        var candidates = snapshot.sources().stream().filter(Source::candidate).toList();
         if (!candidates.isEmpty()) projectFindings(snapshot, candidates);
+        // Once tracked, blanking a body is an edit requiring a new human decision, not a fix:
+        // reconciliation also projects tracked blank general sources from this snapshot.
         reconcileGeneralHistory(snapshot);
         JdbcGeneralFeedbackStore.invalidateClean(jdbc, pr);
         return true;
@@ -160,6 +154,10 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
     /** A delayed first candidate must also track newer blank revisions already retained in other reads/rounds. */
     private void reconcileGeneralHistory(Snapshot snapshot) {
         var pr = snapshot.pr();
+        // Only sources in this snapshot can gain an identity or a newer revision; bound work to them.
+        var general = snapshot.sources().stream().filter(Source::general).map(Source::id).toArray();
+        if (general.length == 0) return;
+        Array ids = jdbc.execute((ConnectionCallback<Array>) connection -> connection.createArrayOf("text", general));
         // The PR lock covers every affected round. One set-based write avoids a query per retained observation.
         jdbc.update("""
                 INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha,
@@ -179,10 +177,11 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                         AND i.repository_id = o.repository_id AND i.pr_number = o.pr_number
                         AND i.provider = o.provider AND i.source_kind = s.source_kind AND i.source_id = s.source_id
                     WHERE o.installation_id = ? AND o.repository_id = ? AND o.pr_number = ? AND o.provider = ?
-                        AND s.source_kind IN ('REVIEW', 'ISSUE_COMMENT')
+                        AND s.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND s.source_id = ANY(?)
                     ORDER BY o.review_cycle_id, s.source_kind, s.source_id, o.captured_at DESC
                 ) latest WHERE true
-                """ + UPDATE_FINDING, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.provider());
+                """ + UPDATE_FINDING, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                snapshot.provider(), ids);
     }
 
     /** Copy only stable metadata; deterministic data failures are not retryable. */

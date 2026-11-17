@@ -56,7 +56,9 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
             }
             case BLOCKING_FINDINGS -> {
                 if (state == State.PAUSED) {
-                    guard(resume == State.REVIEWING || resume == State.DEEP_REVIEW || resume == State.READY_FOR_HUMAN);
+                    if (resume != State.REVIEWING && resume != State.DEEP_REVIEW && resume != State.READY_FOR_HUMAN) {
+                        throw new ReviewConflict(ILLEGAL_TRANSITION);
+                    }
                     resume = State.ACTION_REQUIRED;
                 } else {
                     requireState(State.REVIEWING, State.DEEP_REVIEW, State.READY_FOR_HUMAN);

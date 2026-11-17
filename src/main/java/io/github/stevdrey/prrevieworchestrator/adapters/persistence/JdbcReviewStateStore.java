@@ -105,13 +105,14 @@ public class JdbcReviewStateStore implements ReviewStateStore {
                     pr.number(), command.id());
             // A UUID reused for a different command must not be mistaken for an already-committed retry.
             if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
+            PullRequestReview next = current.transition(command);
+            // After domain validation so stale/illegal commands keep their own conflict codes.
             if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
                     || command.action() == ReviewTransition.Action.DEEP_CLEAN
                     || command.action() == ReviewTransition.Action.MARK_READY_FOR_HUMAN)
                     && JdbcGeneralFeedbackStore.blocking(jdbc, pr, current.headSha())) {
                 throw new ReviewConflict(GUARD_REJECTED);
             }
-            PullRequestReview next = current.transition(command);
             jdbc.update("""
                     UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,
                     baseline_clean_sha = ?, deep_clean_sha = ?

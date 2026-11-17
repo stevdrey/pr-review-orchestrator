@@ -15,14 +15,17 @@ public final class ReviewEvidence {
             String author, String reviewedSha, String originalSha, String bodySha256,
             Instant updatedAt, String reviewState, Boolean resolved, Boolean outdated,
             String path, Integer line, Integer originalLine, Severity severity, Feedback feedback) {
-        /** Compatibility constructor for inline evidence and conservative review observations. */
+        /** Compatibility constructor for inline evidence only; general kinds must state their feedback explicitly. */
         public Source(String id, Kind kind, String reviewId, String threadId, String replyToId,
                 String author, String reviewedSha, String originalSha, String bodySha256,
                 Instant updatedAt, String reviewState, Boolean resolved, Boolean outdated,
                 String path, Integer line, Integer originalLine, Severity severity) {
             this(id, kind, reviewId, threadId, replyToId, author, reviewedSha, originalSha, bodySha256,
-                    updatedAt, reviewState, resolved, outdated, path, line, originalLine, severity,
-                    kind == Kind.REVIEW || kind == Kind.ISSUE_COMMENT ? Feedback.NEEDS_HUMAN : Feedback.NONE);
+                    updatedAt, reviewState, resolved, outdated, path, line, originalLine, severity, inlineOnly(kind));
+        }
+        private static Feedback inlineOnly(Kind kind) {
+            if (general(kind)) invalid();
+            return Feedback.NONE;
         }
         public Source {
             text(id); Objects.requireNonNull(kind);

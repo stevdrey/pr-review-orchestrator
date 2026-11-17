@@ -44,7 +44,10 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     /** Called while holding the PR transaction lock. Missing/ambiguous feedback always blocks. */
     static boolean blocking(JdbcTemplate jdbc, PullRequestId pr, String head) {
+        // The last head change is constant per PR: compute it once, not per finding row.
         return Boolean.TRUE.equals(jdbc.queryForObject("""
+                WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD')
                 SELECT EXISTS (SELECT 1 FROM (
                 """ + LATEST + """
                 ) f WHERE NOT EXISTS (
@@ -53,16 +56,15 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     WHERE d.id = (SELECT id FROM general_feedback_dispositions
                         WHERE stable_finding_id = f.stable_finding_id ORDER BY disposition_order DESC LIMIT 1)
                     AND d.action = 'DISMISS' AND d.head_sha = ?
-                    AND d.head_version >= coalesce((SELECT max(t.resulting_version) FROM pr_review_transitions t
-                        WHERE t.installation_id = f.installation_id AND t.repository_id = f.repository_id
-                            AND t.pr_number = f.pr_number AND t.action = 'UPDATE_HEAD'), 0)
+                    AND d.head_version >= (SELECT version FROM last_head)
                     AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
                     AND s.feedback = f.feedback)) OR EXISTS (
                     SELECT 1 FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND legacy.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND legacy.stable_finding_id IS NULL
                         AND legacy.status IN ('OPEN', 'ACKNOWLEDGED'))
-                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
     }
 
@@ -132,13 +134,16 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
         if (latest.size() != 1) throw new ReviewEvidence.Conflict();
         var f = latest.getFirst();
         if (!c.expectedSnapshotId().equals(f.get("evidence_snapshot_id"))) throw new ReviewEvidence.Conflict();
-        jdbc.update("""
+        // The PR lock does not cover a concurrent reuse of this UUID on another PR: report that as a conflict.
+        int inserted = jdbc.update("""
                 INSERT INTO general_feedback_dispositions (id, stable_finding_id, installation_id, repository_id,
                     pr_number, provider, source_kind, source_id, snapshot_id, head_sha, head_version, action, actor, reason, evidence_sha)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO NOTHING
                 """, c.id(), c.findingId(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 f.get("source_provider"), f.get("source_kind"), f.get("source_id"), c.expectedSnapshotId(),
                 c.expectedHeadSha(), c.expectedVersion(), c.action().name(), c.actor(), c.reason(), c.evidenceSha());
+        if (inserted != 1) throw new ReviewEvidence.Conflict();
         // A fix claim is only acknowledged. It cannot manufacture VERIFIED_FIXED or verified_at.
         jdbc.update("""
                 UPDATE findings SET status = ?, disposition_actor = ?, disposition_reason = ?,
