@@ -56,6 +56,15 @@ we cannot identify which requests or findings the screenshot includes. Please
 clarify reporting cutoff, repeat-review counting and finding inclusion semantics
 as well as the individual accounting correlation.
 
+A subsequent screenshot named 2026-11-16 23:42:12 America/Costa_Rica
+(2026-11-17 05:42:12 UTC) shows **51 reviews / 13 findings**: cumulative +4/+1,
+matching the four completed manual runs and one visible P2. A repeat open-PR and
+recently closed-PR check found no additional requests in the inspected scope.
+This strengthens the delayed-reporting explanation, but the panel exposes only
+day/count, not a processing watermark or per-run accounting. Please confirm whether
+the review counter counts executions, including repeated reviews of one PR, and
+which allowance/credits/billing mechanism these runs consumed.
+
 For each case, could you confirm:
 
 1. Which account/workspace was charged, and how it was selected? Does the rule

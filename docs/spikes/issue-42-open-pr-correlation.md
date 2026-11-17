@@ -1,24 +1,27 @@
 # Issue 42: delayed counter update and open-PR correlation
 
-**Result: aggregate activity increased, but individual attribution remains
-unresolved.** This extends the [accounting investigation](issue-42-review-accounting.md).
-The owner supplied a second screenshot named `Screenshot From 2026-11-16
-22-39-24.png`; filename time is interpreted as America/Costa_Rica
-(2026-11-17 04:39:24 UTC), not independently verified provider freshness.
+**Result: cumulative +4 review activity and +1 finding match the four observed
+manual runs and one visible P2; financial attribution remains unresolved.** This
+extends the [accounting investigation](issue-42-review-accounting.md).
+The owner supplied screenshots named `Screenshot From 2026-11-16
+22-39-24.png` and `Screenshot From 2026-11-16 23-42-12.png`; filename times are
+interpreted as America/Costa_Rica (2026-11-17 04:39:24 and 05:42:12 UTC),
+not independently verified provider freshness.
 No screenshot or private account identifiers were copied into the repository.
 
 ## Counter comparison
 
-| Metric, Code review tab with 7d selected | Baseline, 21:20:34 local | Later capture, 22:39:24 local | Visible change |
-| --- | --- | --- | --- |
-| PRs reviewed | 47 | 49 | **+2** |
-| Issues found | 12 | 12 | **0** |
+| Metric, Code review tab with 7d selected | Baseline, 21:20:34 local | Capture, 22:39:24 local | Capture, 23:42:12 local | Total change |
+| --- | --- | --- | --- | --- |
+| PRs reviewed | 47 | 49 | 51 | **+4** |
+| Issues found | 12 | 12 | 13 | **+1** |
 
 Intermediate owner readings stayed at 47/12 after the two controlled requests.
 The later capture is 78 minutes 50 seconds after the baseline and approximately
 57 minutes after completion of the PR #51 test. These are observation intervals,
 not measured refresh latency or a provider reporting SLA. The account/workspace
-and provider update timestamp are not shown. The reporting period is rolling;
+and provider update timestamp are not shown. The owner confirmed that the panel
+shows day/count only, without a processing-time watermark. The reporting period is rolling;
 exact date boundaries and timezone are not established.
 
 ## Open-PR audit scope
@@ -45,7 +48,7 @@ the three PRs with triggers and the submitted reviews for Dokene #410.
 This audit covers PRs returned by these two searches at inspection, not all
 historical or closed PRs, deleted comments, other identities, or every repository
 that could contribute to the account's seven-day counter. It does not attempt to
-reconstruct all 49 recorded reviews. Empty timelines establish no visible request
+reconstruct all 51 recorded reviews. Empty timelines establish no visible request
 or provider review there, not zero billable activity elsewhere.
 
 ## Four requests during the observation window
@@ -71,27 +74,46 @@ reviewed head and #51 retained `5cb41c2`; #51 was still a draft.
 
 ## Interpretation and remaining evidence
 
-- The supplied account view now shows two additional units of review activity.
-  Its initial unchanged readings were insufficient to establish settled counts.
-- The increase is **consistent with** delayed recording of the two controlled
-  requests, but does not identify them: two additional requests and their provider
-  outcomes on #410 occurred before the later screenshot. The window was not isolated.
-- Four visible requests and a +2 counter difference do not establish whether
-  `PRs reviewed` counts runs, unique PRs, or another grouping. Delayed batches,
-  reporting scope and rolling-window boundaries remain possible explanations.
-  Two concrete hypotheses fit the review-count delta: a delayed batch containing
-  the two clean controlled runs (#406 and #51), or a unique-PR count adding the
-  two newly reviewed PRs (#51 and #410) while not incrementing repeats. Neither
-  hypothesis is established by the screenshot.
-- The visible P2 finding on #410 alongside an unchanged Issues found total is
-  another mismatch to investigate. The screenshot does not establish whether that
-  finding is included, delayed, filtered or aggregated differently. Do not infer
-  billing or fix verification from the latest no-findings summary.
+- At 22:39:24, +2 reviews and unchanged findings fit either a delayed batch
+  containing the two clean controlled runs or a unique-PR count adding #51 and
+  #410. That intermediate capture alone could not distinguish these explanations.
+- At 23:42:12, another +2 reviews and +1 finding produce a cumulative **+4/+1**,
+  exactly matching the four observed completed runs on three PRs and the one
+  visible P2. This materially strengthens the delayed-batch interpretation.
+  Within this observed window, the counter behaves consistently with counting
+  review executions, including repeats, rather than simply distinct PRs. This is
+  empirical correlation, not a provider-defined metric contract or a per-run join.
+- The chronological hypothesis is now better supported: the two earlier clean
+  runs could explain the first +2/0, and the later two #410 runs (one with a P2)
+  could explain the next +2/+1. The panel still supplies no watermark to prove the
+  exact batch membership, processing order, refresh interval or reporting SLA.
+  The two later captures are 62 minutes 48 seconds apart; this is an observation
+  interval, not evidence of an hourly refresh schedule.
+- Preserve the original #410 finding even though its latest summary reports no
+  findings. A later clean run or thread resolution does not independently verify
+  the fix. The +1 finding count is activity evidence, not fix or billing evidence.
 - Account allowance, credits, invoice charge, units consumed per run and native
   automatic-review attribution remain unknown. Preserve the fail-closed production
   decision and request provider correlation/semantics through the
   [prepared Support request](issue-42-provider-confirmation-request.md).
 
-The later screenshot closes this comparison at its filename-derived capture
-time. Evidence publication or any subsequent reviews are outside that window.
+## Recheck after the 23:42:12 screenshot
+
+At approximately 23:43 local, repeat searches returned 11 owner PRs and 8
+involvement PRs, again 11 unique currently open PRs. #410 was no longer open:
+GitHub records it merged at **23:00:21 local** (2026-11-17 05:00:21 UTC).
+New Dokene #411, created at 23:33:16 local, replaced it in the open list and had
+an empty timeline. Re-read all 11 open timelines plus #410's retained timeline:
+no additional trigger comments or new provider results were visible after the
+22:39:24 screenshot. The same four in-window requests remained in the inspected
+histories. The additional closed-PR search
+`user:stevdrey is:closed updated:>=2026-11-17T03:20:34Z` (`topn=100`)
+returned only #410. No new review was requested for this recheck.
+
+These results strengthen the correlation but retain the search/visibility limits
+above; they do not prove absence of activity outside the inspected account and
+repository scope. The latest screenshot extends this comparison through its
+filename-derived 23:42:12 capture. Evidence publication and subsequent activity
+remain separately timed; publishing the earlier audit did not produce another
+visible provider review in the #51 timeline inspected during this recheck.
 Keep issue #42 open; no additional billable experiment is authorized by this audit.

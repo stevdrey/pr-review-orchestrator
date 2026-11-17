@@ -34,11 +34,14 @@ and that visible review counts cannot be linked to a specific PR. The owner
 proposed a before/after counter experiment. Its results must be recorded separately
 from verified billing attribution.
 
-**Later observation:** the 22:39:24 local screenshot showed **49 PRs reviewed /
-12 issues found**, a +2/0 change. The [open-PR correlation audit](issue-42-open-pr-correlation.md)
-found four manual requests within the window, including two additional runs on
-Dokene #410. Aggregate activity increased, but the individual reviews and billing
-mechanism cannot be assigned from that counter.
+**Later observations:** the panel moved from **47/12** to **49/12** at 22:39:24
+local and **51/13** at 23:42:12. The cumulative **+4 reviews / +1 finding**
+matches the four completed manual runs and one visible P2 in the
+[correlation audit](issue-42-open-pr-correlation.md), including two additional
+runs on Dokene #410. Rechecking open and recently closed PRs found no further
+visible requests in the inspected scope. This strongly supports delayed aggregate
+reporting and counting executions in this window; the account's billing mechanism,
+per-review debit and provider processing timestamps remain unknown.
 
 ## Separate case assessment
 
@@ -293,14 +296,14 @@ confirmation becomes available, separately for each trigger and account context.
 
 Acceptance remains partial: individual accounting and written confirmation are
 missing; the two historical cases, two new connector manual experiments and safe
-fallback are documented. Initial readings showed no increase; the later screenshot
-shows +2 reviews, with four competing manual requests observed in open PRs during
-the window. Manual trigger/completion evidence is confirmed for both new tests;
-per-review accounting remains unknown.
+fallback are documented. Initial readings showed no increase; subsequent captures
+show +2/0 and then cumulative +4 reviews/+1 finding, matching the four observed
+manual runs and one P2. Manual trigger/completion and aggregate activity correlation
+are established in the inspected scope; per-review financial accounting remains unknown.
 
 | Issue #42 criterion | Current evidence / remaining requirement |
 | --- | --- |
 | Authoritative accounting source or written confirmation | Not achieved: no per-review account/workspace, correlation or mechanism established; provider request prepared, not submitted |
-| Separate manual and automatic assessments | Historical cases and two new connector manual tests documented; units and billing identity remain unknown for each. Later +2 aggregate review activity competes with four observed manual requests; attribution inconclusive |
+| Separate manual and automatic assessments | Historical cases and two new connector manual tests documented; cumulative +4/+1 activity matches four observed manual runs and one P2. Per-run financial units, billing identity and automatic-review attribution remain unknown |
 | Safe production decision and fallback | Documented: both service request paths stay disabled, missing usage cannot bypass budget gates, owner handoff or separately approved metered provider |
-| Commands, dates, sanitized evidence and cleanup | Recorded above and in the correlation audit; two separately authorized requests with SHA-bound completion, initial unchanged readings and a later +2 screenshot, read-only inspection of 11 open PRs, no new credentials or settings to undo. Provider reporting freshness remains unavailable |
+| Commands, dates, sanitized evidence and cleanup | Recorded above and in the correlation audit; two separately authorized requests with SHA-bound completion, initial unchanged readings and later +2/0 and +4/+1 captures, read-only open/closed PR recheck, no new credentials or settings to undo. Provider processing-time watermark remains unavailable |
