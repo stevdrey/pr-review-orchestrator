@@ -8,6 +8,8 @@ Issue #16 implements [internal GitHub review/thread snapshot normalization and d
 
 Issue #17 adds [internal general-feedback tracking and audited dispositions](development/general-feedback.md): complete issue-comment/review-body capture, stable local IDs, conservative human escalation, commit-bearing fix claims and deterministic blocking of clean-stage transitions. New pending feedback revokes existing readiness, including while paused. Live author authentication/action endpoints, verified-fix processing and semantic prose classification remain future integrations.
 
+Issue #18 implements the [internal Codex user-comment request adapter](development/codex-review-requests.md): scoped persistent deduplication, one-shot send permits, comment/bot loop filtering, actor/PR/SHA checks and a lifetime request ceiling. It remains disabled by default. Approved user OAuth and capability/accounting/budget implementations are required and are not supplied; issue #42's accepted limitation does not enable dispatch. Live provider acceptance and event-to-request integration remain unverified.
+
 ## Milestones
 
 | Phase | Priority | Outcome | Exit condition |

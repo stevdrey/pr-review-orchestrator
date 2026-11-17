@@ -2,7 +2,7 @@
 
 ## Current coverage
 
-`./gradlew clean build` runs `DatabaseIntegrationTest` against disposable PostgreSQL 17.11 using Testcontainers. It covers Spring Boot migration from an empty database (V1/V2/V3/V4/V5/V6 history rows, no baseline), checksum validation and a no-op second application startup against the migrated database, disabled clean, application/database health, duplicate delivery/command/cycle keys, installation/repository/SHA references, finding idempotency keys, comment/thread distinctions, explicit fix evidence distinct from the reviewed SHA, retry bounds, processing leases and terminal timestamps, trigger-maintained `updated_at`, inbox recording of installation-level and not-yet-known installation/repository events and transactional rollback of event/command/audit writes. Missing Docker is a failure, not a skipped test. Tests read the pinned image digest from `compose.yaml`.
+`./gradlew clean build` runs `DatabaseIntegrationTest` against disposable PostgreSQL 17.11 using Testcontainers. It covers Spring Boot migration from an empty database (V1–V8 history rows, no baseline), checksum validation and a no-op second application startup against the migrated database, disabled clean, application/database health, duplicate delivery/command/cycle keys, installation/repository/SHA references, finding idempotency keys, comment/thread distinctions, explicit fix evidence distinct from the reviewed SHA, retry bounds, processing leases and terminal timestamps, trigger-maintained `updated_at`, inbox recording of installation-level and not-yet-known installation/repository events and transactional rollback of event/command/audit writes. Missing Docker is a failure, not a skipped test. Tests read the pinned image digest from `compose.yaml`.
 
 Issue #11 adds `RepositoryAuthorizationTest`, `GitHubAppConfigurationTest` and `GitHubCredentialsTest` for paired allowlists, live denial/unavailable authority, default-disabled startup, RS256 JWT signatures/lifetime, per-operation repository-scoped tokens, atomic key replacement, redacted failures, redirect/API/network errors, malformed/expired/over-scoped credentials, revocation during token exchange (with best-effort remote revocation of rejected tokens), response size caps and exchange deadlines. `DatabaseIntegrationTest` also exercises the JDBC authorization adapter across enabled/disabled and ACTIVE/SUSPENDED/REVOKED states. The focused command is `./gradlew test --tests '*GitHubAppConfiguration*' --tests '*GitHubCredentials*' --tests '*RepositoryAuthorization*'`; it uses local HTTP fixtures and generated keys, without GitHub credentials or Docker.
 
@@ -54,3 +54,19 @@ Run `./gradlew test --tests '*PullRequestReviewTest' --tests '*ReviewStateIntegr
 `GitHubReviewNormalizerTest` checks source metadata, body revisions without retained prose, explicit severity, reply/root distinction, resolution/outdated signals, scope and SHA mismatch, malformed/partial/paginated responses and duplicate IDs. `ReviewEvidenceIntegrationTest` checks atomic PostgreSQL ingestion, out-of-order edits, stable identities across rounds, distinct round/source SHAs, concurrent idempotent retries, conflicting keys, recreated-store persistence, authorization revocation, scope foreign keys, deferred commit rollback, empty-thread evidence, conservative absence handling and V5→V6 migration preserving legacy findings.
 
 Run `./gradlew test --offline --tests '*GitHubReviewNormalizerTest' --tests '*ReviewEvidenceIntegrationTest' --tests '*DatabaseIntegrationTest'`; Docker is required. Fixtures are synthetic GraphQL-shaped responses, not live API captures. The [internal caller contract and limitations](../development/review-evidence.md) remain essential; no live webhook-to-review workflow, semantic classification or fix verifier is claimed.
+
+## Codex review requests (issue #18)
+
+`ReviewRequestIntegrationTest` checks PostgreSQL concurrency, event-independent keys,
+restart persistence, one-shot send permits, deferred commit failure after remote
+acceptance, ambiguous response handling, request ceilings, revoked/foreign scopes,
+comment/bot loop filtering and unsupported capability. `GitHubCodexCommentsTest`
+checks fixed user-comment requests with local HTTP fixtures, actor/expiry/scope,
+readiness and SHA checks, final authorization/policy denial, redirect refusal,
+body caps, body deadlines and redacted failures. `CodexReviewConfigurationTest`
+checks default-disabled behavior and missing approved integrations.
+
+Run `./gradlew test --tests '*ReviewRequestIntegrationTest' --tests '*GitHubCodexCommentsTest' --tests '*CodexReviewConfigurationTest'`;
+Docker is required. These tests do not prove live OAuth provenance, actual Codex
+trigger acceptance/reviewed SHA, accounting/budgets or end-to-end dispatch. See
+[activation, recovery and rollback limits](../development/codex-review-requests.md).
