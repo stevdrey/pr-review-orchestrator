@@ -1,6 +1,6 @@
 # ADR 0006: Provider-neutral review and event/agent adapters
 
-**Status:** Accepted (implementation pending)  
+**Status:** Accepted (internal review request port and default-disabled Codex adapter implemented; outcome, agent and event adapters pending)
 **Date:** 2026-11-13
 
 ## Context

@@ -57,3 +57,16 @@ Issue #15 adds an internal current-PR aggregate and transactional transition jou
 Issue #16 adds an internal authorized review-evidence transaction, not a new Internet endpoint. Source text is hashed and discarded; source IDs, author login, path/line metadata, commit SHAs and resolution signals are retained as untrusted observations. Composite keys bind observations and finding occurrences to the same installation/repository/PR/cycle. Callers must fetch complete authoritative API state under an authorized scoped credential; arbitrary caller timestamps, body hashes or resolved flags cannot establish a fresh clean verdict or verify a fix. See [caller, retention and rollout limits](../development/review-evidence.md).
 
 Issue #17 extends this internal boundary to general comments and review bodies. Non-empty unstructured feedback is escalated and blocks advancement; prose/approval state cannot authorize disposition. The trusted action adapter must authenticate an author/maintainer and bind the actor before invoking the internal disposition bean; no public action endpoint exists. Live paired authorization, source revision, current aggregate head, scoped foreign keys, PR transaction serialization and UUID deduplication protect the audit/projection transaction. Proposed fix commits remain unverified and blocking. Pending feedback invalidates prior clean readiness atomically, including paused states. Raw text is discarded; bounded human reasons and proposed commit SHAs are retained as sensitive audit metadata. Privileged database audit immutability, production retention and user-facing authentication remain unimplemented. See the [caller and rollback contract](../development/general-feedback.md).
+
+Issue #18 adds an internal, default-disabled user-comment request boundary. A
+trusted credential source must establish consented App-user token provenance and
+exact scope; a separately approved capability/policy integration must establish
+entitlement, individual accounting and hard reserved budgets. Neither is supplied.
+Live authorization locks cover the bounded effect; HTTP checks user ID/type and PR
+repository/readiness/head, posts only a fixed command, refuses redirects and bounds
+response size/time. Persisted one-shot permits prevent duplicate sends after
+ambiguous responses or commit failures, while all comment/review and bot events are
+excluded as triggers. GitHub comments lack atomic SHA preconditions: independent
+reviewed-SHA evidence remains mandatory, and the adapter cannot be used as the
+durable command gateway. No new public endpoint, OAuth flow, merged verdict or
+automatic review loop is introduced. See [trust contracts and recovery limits](../development/codex-review-requests.md).

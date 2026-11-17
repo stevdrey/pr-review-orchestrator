@@ -52,7 +52,7 @@ class DurableDispatchIntegrationTest {
         dataSource = new DriverManagerDataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
         Flyway.configure().dataSource(dataSource).load().migrate();
         jdbc = new JdbcTemplate(dataSource);
-        jdbc.execute("TRUNCATE general_feedback_dispositions, review_evidence_sources, review_evidence_snapshots, finding_identities, pr_review_transitions, pr_review_states, queue_transitions, audit_entries, findings, outbox_commands, inbox_events, review_cycles, installation_repositories, installations");
+        jdbc.execute("TRUNCATE review_requests, general_feedback_dispositions, review_evidence_sources, review_evidence_snapshots, finding_identities, pr_review_transitions, pr_review_states, queue_transitions, audit_entries, findings, outbox_commands, inbox_events, review_cycles, installation_repositories, installations");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true), (202, 2002, true)");
         queue = newQueue();

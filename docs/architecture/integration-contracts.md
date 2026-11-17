@@ -20,7 +20,9 @@ controls are verified; missing usage must not be recorded as zero.
 
 ## ReviewProvider port
 
-Proposed operations: `requestReview(ReviewRequest)`, `getReviewOutcome(ProviderReference)`, `summarizeFindings(ReviewContext)`. Providers can be async; commands must carry idempotency key, review stage, budget reservation and expected head SHA. No generic provider contract should require a human login or a fixed model name.
+Issue #18 implements the narrow internal `ReviewProvider.request(ReviewRequest)` request boundary and [disabled-by-default Codex adapter](../development/codex-review-requests.md), with durable one-shot request reservations. Its GitHub comment receipt is distinct from provider acceptance/completion and cannot establish reviewed SHA. Approved OAuth and accounting/budget integrations are required; no default live dispatcher wiring exists.
+
+Other proposed operations: `requestReview(ReviewRequest)`, `getReviewOutcome(ProviderReference)`, `summarizeFindings(ReviewContext)`. Providers can be async; commands must carry idempotency key, review stage, budget reservation and expected head SHA. No generic provider contract should require a human login or a fixed model name.
 
 ## AgentEventPublisher / MCP
 
