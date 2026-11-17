@@ -158,10 +158,9 @@ reviewed recovery plan. Privileged database users can still alter rows; immutabl
 audit and production backup/retention policy remain outside this increment.
 
 Verification record for this increment (2026-11-17, America/Costa_Rica): base
-`2167961917ff98178403abfaf342758e56b75106`; focused command above passed 20 tests
-before adding the deferred-commit case. The final `./gradlew clean build` passed
-all 196 tests (including 21 request-adapter tests), with zero failures/errors/skips.
-The first full build exposed the old dispatch fixture's explicit table cleanup;
-adding V8's table to that cleanup resolved its foreign-key failures. No live
-credential, GitHub write, Codex invocation or production rollout was used for
-verification.
+`2167961917ff98178403abfaf342758e56b75106`, implementation
+`d40ed26fe0c1cb480474779864cded4d28fecf86`. The current JUnit reports contain
+199 tests (including 24 request-adapter tests), with zero failures/errors/skips.
+[Java CI](https://github.com/stevdrey/pr-review-orchestrator/actions/runs/44036939416)
+also passed `./gradlew build` for that implementation. No live credential, GitHub
+write, Codex invocation or production rollout was used for verification.
