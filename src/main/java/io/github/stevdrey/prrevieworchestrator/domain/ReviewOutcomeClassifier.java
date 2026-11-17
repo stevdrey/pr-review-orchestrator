@@ -6,41 +6,48 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Verdi
 
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import java.util.Objects;
+import java.util.Set;
 
 /** Pure policy. No body text, keyword matcher, resolution shortcut or model decision is authoritative. */
 public final class ReviewOutcomeClassifier {
     public ReviewOutcome classify(Run expected, long version, Completion completion,
             Snapshot snapshot, PendingFindings pending) {
+        return classify(expected, version, completion, snapshot, pending, Set.of());
+    }
+
+    /** Dismissed IDs must come from audited decisions for the exact snapshot revisions and current head. */
+    public ReviewOutcome classify(Run expected, long version, Completion completion,
+            Snapshot snapshot, PendingFindings pending, Set<String> dismissedGeneralSources) {
         Objects.requireNonNull(expected); Objects.requireNonNull(pending);
+        Objects.requireNonNull(dismissedGeneralSources);
         if (version < 0 || version == Long.MAX_VALUE) throw new IllegalArgumentException("Invalid state version");
         if (pending == PendingFindings.ACTIONABLE) return result(expected, version, ACTION_REQUIRED, BLOCKING_FINDINGS);
-        if (pending == PendingFindings.NEEDS_HUMAN) return result(expected, version, NEEDS_HUMAN, AMBIGUOUS_FEEDBACK);
         if (pending == PendingFindings.UNKNOWN) return result(expected, version, UNKNOWN, INCOMPLETE_EVIDENCE);
-        if (completion == null) return result(expected, version, UNKNOWN, MISSING_COMPLETION);
-        if (!expected.equals(completion.run())) return result(expected, version, UNKNOWN, UNCORRELATED_COMPLETION);
-        if (completion.status() != Status.COMPLETED) return result(expected, version, UNKNOWN, PROVIDER_NOT_COMPLETED);
+        if (completion == null) return unavailable(expected, version, pending, MISSING_COMPLETION);
+        if (!expected.equals(completion.run())) return unavailable(expected, version, pending, UNCORRELATED_COMPLETION);
+        if (completion.status() != Status.COMPLETED) return unavailable(expected, version, pending, PROVIDER_NOT_COMPLETED);
         if (snapshot == null || !snapshot.pr().equals(expected.pr())
                 || !snapshot.cycleId().equals(expected.cycleId()) || !snapshot.headSha().equals(expected.headSha())
                 || !snapshot.provider().equals(expected.evidenceProvider())) {
-            return result(expected, version, UNKNOWN, INCOMPLETE_EVIDENCE);
+            return unavailable(expected, version, pending, INCOMPLETE_EVIDENCE);
         }
         var review = snapshot.sources().stream()
                 .filter(s -> s.kind() == Kind.REVIEW && s.id().equals(completion.reviewId())).findFirst();
-        if (review.isEmpty()) return result(expected, version, UNKNOWN, MISSING_REVIEW);
+        if (review.isEmpty()) return unavailable(expected, version, pending, MISSING_REVIEW);
         Source source = review.orElseThrow();
         if (!expected.reviewer().equals(source.author()) || source.staleFor(expected.headSha())
                 || !("APPROVED".equals(source.reviewState()) || "COMMENTED".equals(source.reviewState())
                     || "CHANGES_REQUESTED".equals(source.reviewState()))) {
-            return result(expected, version, UNKNOWN, UNVERIFIED_REVIEW);
+            return unavailable(expected, version, pending, UNVERIFIED_REVIEW);
         }
-        // All top-level inline candidates block, even outdated/resolved ones. Retained findings
-        // missing from this snapshot must also be included in the caller's pending assessment.
-        if (snapshot.sources().stream().anyMatch(s -> s.kind() == Kind.REVIEW_COMMENT && s.candidate()
-                || s.feedback() == Feedback.ACTIONABLE)
+        // Dismissals apply only to general feedback, never to inline candidates or the completion itself.
+        var candidates = snapshot.sources().stream().filter(Source::candidate)
+                .filter(s -> !s.general() || !dismissedGeneralSources.contains(s.id())).toList();
+        if (candidates.stream().anyMatch(s -> !s.general() || s.feedback() == Feedback.ACTIONABLE)
                 || "CHANGES_REQUESTED".equals(source.reviewState()) || completion.conclusion() == Conclusion.FINDINGS) {
             return result(expected, version, ACTION_REQUIRED, BLOCKING_FINDINGS);
         }
-        if (snapshot.sources().stream().anyMatch(s -> s.feedback() == Feedback.NEEDS_HUMAN)
+        if (pending == PendingFindings.NEEDS_HUMAN || !candidates.isEmpty()
                 || completion.conclusion() == Conclusion.UNSTRUCTURED) {
             return result(expected, version, NEEDS_HUMAN, AMBIGUOUS_FEEDBACK);
         }
@@ -50,6 +57,12 @@ public final class ReviewOutcomeClassifier {
             return result(expected, version, UNKNOWN, CONTRADICTORY_EVIDENCE);
         }
         return result(expected, version, CLEAN_FOR_SHA, CORRELATED_NO_FINDINGS);
+    }
+
+    private ReviewOutcome unavailable(Run expected, long version, PendingFindings pending, Reason reason) {
+        return pending == PendingFindings.NEEDS_HUMAN
+                ? result(expected, version, NEEDS_HUMAN, AMBIGUOUS_FEEDBACK)
+                : result(expected, version, UNKNOWN, reason);
     }
 
     private ReviewOutcome result(Run run, long version, Verdict verdict, Reason reason) {

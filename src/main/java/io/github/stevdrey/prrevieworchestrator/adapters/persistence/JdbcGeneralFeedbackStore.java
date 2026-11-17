@@ -36,6 +36,22 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at)
             """;
 
+    private static final String LAST_HEAD = """
+            WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD')
+            """;
+    private static final String VALID_DISMISSAL = """
+            EXISTS (
+                SELECT 1 FROM general_feedback_dispositions d
+                JOIN review_evidence_sources s ON s.snapshot_id = d.snapshot_id AND s.source_id = d.source_id
+                WHERE d.id = (SELECT id FROM general_feedback_dispositions
+                    WHERE stable_finding_id = f.stable_finding_id ORDER BY disposition_order DESC LIMIT 1)
+                AND d.action = 'DISMISS' AND d.head_sha = ?
+                AND d.head_version >= (SELECT version FROM last_head)
+                AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
+                AND s.feedback = f.feedback)
+            """;
+
     /** Called while holding the PR transaction lock. Missing/ambiguous feedback always blocks. */
     static boolean blocking(JdbcTemplate jdbc, PullRequestId pr, String head) {
         return pending(jdbc, pr, head) != ReviewOutcome.PendingFindings.CLEAR;
@@ -43,20 +59,13 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     static ReviewOutcome.PendingFindings pending(JdbcTemplate jdbc, PullRequestId pr, String head) {
         // The last head change is constant per PR: compute it once, not per finding row.
-        return ReviewOutcome.PendingFindings.valueOf(jdbc.queryForObject("""
-                WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
-                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD'), pending AS (
+        return ReviewOutcome.PendingFindings.valueOf(jdbc.queryForObject(LAST_HEAD + """
+                , pending AS (
                 SELECT f.feedback FROM (
                 """ + LATEST + """
-                ) f WHERE NOT EXISTS (
-                    SELECT 1 FROM general_feedback_dispositions d
-                    JOIN review_evidence_sources s ON s.snapshot_id = d.snapshot_id AND s.source_id = d.source_id
-                    WHERE d.id = (SELECT id FROM general_feedback_dispositions
-                        WHERE stable_finding_id = f.stable_finding_id ORDER BY disposition_order DESC LIMIT 1)
-                    AND d.action = 'DISMISS' AND d.head_sha = ?
-                    AND d.head_version >= (SELECT version FROM last_head)
-                    AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
-                    AND s.feedback = f.feedback) UNION ALL
+                ) f WHERE NOT
+                """ + VALID_DISMISSAL + """
+                UNION ALL
                     SELECT 'NEEDS_HUMAN' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND legacy.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND legacy.stable_finding_id IS NULL
@@ -66,6 +75,26 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 """, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
+    }
+
+    /** Under the PR lock, match audited dismissals to the exact sources in this snapshot. */
+    static Set<String> dismissedSources(JdbcTemplate jdbc, ReviewEvidence.Snapshot snapshot) {
+        if (snapshot.sources().stream().noneMatch(s -> s.general() && s.candidate())) return Set.of();
+        var pr = snapshot.pr();
+        return Set.copyOf(jdbc.queryForList(LAST_HEAD + """
+                SELECT f.source_id FROM (
+                    SELECT s.source_id, i.id AS stable_finding_id, s.body_sha256, s.source_updated_at, s.feedback
+                    FROM review_evidence_snapshots o
+                    JOIN review_evidence_sources s ON s.snapshot_id = o.id
+                    JOIN finding_identities i ON i.installation_id = o.installation_id
+                        AND i.repository_id = o.repository_id AND i.pr_number = o.pr_number AND i.provider = o.provider
+                        AND i.source_kind = s.source_kind AND i.source_id = s.source_id
+                    WHERE o.id = ? AND o.installation_id = ? AND o.repository_id = ? AND o.pr_number = ?
+                        AND o.head_sha = ? AND s.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND s.feedback <> 'NONE'
+                ) f WHERE
+                """ + VALID_DISMISSAL, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                snapshot.id(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.headSha(),
+                snapshot.headSha()));
     }
 
     /** New pending feedback revokes already-recorded readiness in the same transaction. */

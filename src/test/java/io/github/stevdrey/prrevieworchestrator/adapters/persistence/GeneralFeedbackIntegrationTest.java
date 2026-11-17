@@ -94,8 +94,7 @@ class GeneralFeedbackIntegrationTest {
                 assertThrows(ReviewConflict.class, () -> step(current(), action)).code());
     }
 
-    @Test
-    void feedbackArrivingAfterCleanAssessmentStillBlocksItsCommit() {
+    ReviewOutcome.Run baselineRun() {
         UUID requestId = UUID.randomUUID();
         var request = new ReviewRequest(PR, HEAD, "BASELINE", "github", ReviewRequest.Trigger.PR_OPENED, 1, false);
         jdbc.update("""
@@ -103,18 +102,71 @@ class GeneralFeedbackIntegrationTest {
                     head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
                 VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 1, '1970-01-01', '1970-01-01')
                 """, requestId, request.key(), HEAD);
-        var run = new ReviewOutcome.Run(PR, HEAD, "github", ReviewOutcome.Stage.BASELINE,
+        return new ReviewOutcome.Run(PR, HEAD, "github", ReviewOutcome.Stage.BASELINE,
                 requestId, cycle, "github", "reviewer");
-        var evidence = observe(cycle, HEAD, 0, source(Kind.REVIEW, Feedback.NONE, "", TIME));
+    }
+
+    AssessReviewOutcome outcomes() {
         var manager = new DataSourceTransactionManager(dataSource);
-        var outcomes = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)), authorization);
-        var assessment = new ReviewOutcome.Assessment(run, current().version(),
-                new ReviewOutcome.Completion(run, "general-1", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS), evidence.id());
+        return new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager)), authorization);
+    }
+
+    ReviewOutcome.Assessment assessment(ReviewOutcome.Run run, Snapshot snapshot, String reviewId, ReviewOutcome.Conclusion conclusion) {
+        return new ReviewOutcome.Assessment(run, current().version(),
+                new ReviewOutcome.Completion(run, reviewId, ReviewOutcome.Status.COMPLETED, conclusion), snapshot.id());
+    }
+
+    @Test
+    void feedbackArrivingAfterCleanAssessmentStillBlocksItsCommit() {
+        var run = baselineRun();
+        var evidence = observe(cycle, HEAD, 0, source(Kind.REVIEW, Feedback.NONE, "", TIME));
+        var outcomes = outcomes();
+        var assessment = assessment(run, evidence, "general-1", ReviewOutcome.Conclusion.NO_FINDINGS);
         assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(assessment).verdict());
         observe(cycle, HEAD, 1, source(Kind.REVIEW, Feedback.NEEDS_HUMAN, "LGTM, but verify the failure path", TIME.plusSeconds(1)));
         assertEquals(ReviewConflict.Code.GUARD_REJECTED,
                 assertThrows(ReviewConflict.class, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR)).code());
         assertNull(current().baselineCleanSha());
+    }
+
+    @Test
+    void cleanOutcomeHonorsDismissalOfVisibleFeedbackAndBlocksAnEditUntilDismissedAgain() {
+        var run = baselineRun();
+        var outcomes = outcomes();
+        var initial = source(Kind.ISSUE_COMMENT, Feedback.NEEDS_HUMAN, "Question for the maintainer", TIME);
+        var first = observe(cycle, HEAD, 0, initial);
+        assertTrue(dispositions.dispose(PR, command(first, GeneralFeedback.Action.DISMISS, HEAD)));
+
+        var review = new Source("completed-review", Kind.REVIEW, "completed-review", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), TIME.plusSeconds(1), "COMMENTED", null, null,
+                null, null, null, Severity.UNKNOWN, Feedback.NONE);
+        var reread = observe(cycle, HEAD, 1, review, initial);
+        var clean = assessment(run, reread, review.id(), ReviewOutcome.Conclusion.NO_FINDINGS);
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(clean).verdict());
+
+        var edit = source(Kind.ISSUE_COMMENT, Feedback.NEEDS_HUMAN, "New concern for the maintainer", TIME.plusSeconds(2));
+        var edited = observe(cycle, HEAD, 2, review, edit);
+        var current = assessment(run, edited, review.id(), ReviewOutcome.Conclusion.NO_FINDINGS);
+        assertEquals(ReviewOutcome.Verdict.NEEDS_HUMAN, outcomes.assess(current).verdict());
+        assertEquals(ReviewConflict.Code.GUARD_REJECTED,
+                assertThrows(ReviewConflict.class, () -> outcomes.recordClean(current, UUID.randomUUID(), CLEAR)).code());
+        assertTrue(dispositions.dispose(PR, command(edited, GeneralFeedback.Action.DISMISS, HEAD)));
+        assertEquals(HEAD, outcomes.recordClean(current, UUID.randomUUID(), CLEAR).baselineCleanSha());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"CHANGES_REQUESTED,NO_FINDINGS", "COMMENTED,FINDINGS"})
+    void correlatedActionableCompletionTakesPrecedenceOverAmbiguousReviewBody(
+            String reviewState, ReviewOutcome.Conclusion conclusion) {
+        var run = baselineRun();
+        var review = new Source("completed-review", Kind.REVIEW, "completed-review", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), TIME, reviewState, null, null,
+                null, null, null, Severity.UNKNOWN, Feedback.NEEDS_HUMAN);
+        var evidence = observe(cycle, HEAD, 0, review);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes.assess(assessment(run, evidence, review.id(), conclusion)).verdict());
+        assertEquals(ReviewOutcome.Verdict.NEEDS_HUMAN, outcomes.assess(
+                new ReviewOutcome.Assessment(run, current().version(), null, evidence.id())).verdict());
     }
 
     @Test

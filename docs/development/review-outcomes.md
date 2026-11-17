@@ -21,7 +21,7 @@ The store checks the authoritative local aggregate's version/head, then joins th
 
 Evidence is loaded from the persisted snapshot and sources rather than supplied inline by the caller. It must belong to the exact cycle/PR/head/evidence provider and be the uniquely latest observation of that PR/evidence provider across rounds. A newer observation or legacy equal-time ambiguity makes an old reference unknown. Snapshot and completed review source must postdate the request and the most recent local head update; returning to an earlier SHA cannot revive an old review by refreshing the command version.
 
-Retained pending findings are read across rounds in the same transaction. Latest open/acknowledged inline findings block even when absent from the current snapshot; resolved/outdated flags do not clear them. General feedback uses the existing revision/head-bound audited dismissal rules, distinguishing actionable from ambiguous pending evidence. Legacy pending findings remain conservative. The classifier independently checks all current snapshot candidates too; it does not suppress general bodies or inline roots based on a disposition, so such raw snapshots may still require reconciliation even after a valid human dismissal.
+Retained pending findings are read across rounds in the same transaction. Latest open or acknowledged inline findings block even when absent from the current snapshot. Resolved and outdated flags do not clear them. For general feedback, the store applies the same audited dismissal rules to retained findings and to candidates in the current snapshot. The latest decision must dismiss the exact source, body revision and assessment at the current head. A dismissal applies to that general feedback only. The snapshot stays intact for completion correlation and provenance. Legacy pending findings still block.
 
 Callers must ingest complete, current authorized API reads. The GitHub normalizer rejects partial/error/paginated reads; no favorable-source selection, invented commit SHA or unparsed body labeled `Feedback.NONE` is permitted. These local checks cannot detect an unobserved remote edit/push or authenticate a provider completion. Live fetching and provider capability verification remain separate integrations.
 
@@ -40,7 +40,7 @@ The result retains the run, aggregate version, a verdict and stable reason code.
 | Unknown conclusion or source revision newer than the observation | `UNKNOWN` |
 | Correlated completion, exact SHA, supported final review state, structured no-findings conclusion and no pending/candidate feedback | `CLEAN_FOR_SHA` |
 
-Known retained blockers take precedence over unavailable completion after durable correlation. Generic approval cannot override general feedback. An empty snapshot is unknown: absence of a completed review is not a no-findings result. A stale follow-up cannot supply the reviewed commit or replace another stage's completion.
+After durable correlation, a completed review with `CHANGES_REQUESTED` or structured `FINDINGS` takes precedence over ambiguous general feedback. If completion is unavailable, known retained blockers still determine the outcome. Generic approval cannot override pending general feedback. An empty snapshot produces `UNKNOWN`. A stale follow-up cannot supply the reviewed commit or replace another stage's completion.
 
 ## Recording and inspecting clean evidence
 
@@ -72,4 +72,4 @@ Tests cover provider failures/pending/timeout, generic “LGTM”, stale commits
 
 Live Codex completion retrieval/authentication, provider identity verification, GitHub fetching/reconciliation, deployed behavior and production activation remain unverified. Without a supported structured completion contract, actual Codex prose stays unstructured/unknown and cannot establish clean evidence through this boundary. The default-disabled request path and its OAuth/accounting/budget prerequisites are unchanged.
 
-Local verification on 2026-11-17 (America/Costa_Rica), JDK 27 and disposable PostgreSQL: the focused command passed with 65 tests; `./gradlew clean build --offline` passed with **225 tests, 0 failures, 0 errors, 0 skipped**. `git diff --check` and relative Markdown link validation passed. These checks do not establish live provider behavior or deployment.
+Local verification on 2026-11-17 (America/Costa_Rica), JDK 27 and disposable PostgreSQL: the focused command passed with 68 tests after review fixes; `./gradlew clean build --offline` passed with **228 tests, 0 failures, 0 errors, 0 skipped**. `git diff --check` and relative Markdown link validation passed. These checks do not establish live provider behavior or deployment.

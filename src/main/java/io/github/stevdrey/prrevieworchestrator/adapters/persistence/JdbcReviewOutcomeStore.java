@@ -120,7 +120,6 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(), run.provider());
         Snapshot snapshot = loadSnapshot(assessment);
-        PendingFindings pending = pending(pr, run.headSha());
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");
         // Do not reuse a pre-request review/read or an older observation after any newer evidence.
         if (requests.size() != 1 || snapshot == null || snapshot.capturedAt().isBefore(requests.getFirst())
@@ -131,7 +130,9 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                         || changed != null && s.updatedAt().isBefore(changed.toInstant()))) {
             return classifier.classify(run, assessment.expectedVersion(), null, null, PendingFindings.UNKNOWN);
         }
-        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending);
+        var pending = pending(pr, run.headSha());
+        var dismissed = JdbcGeneralFeedbackStore.dismissedSources(jdbc, snapshot);
+        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending, dismissed);
     }
 
     private Snapshot loadSnapshot(Assessment assessment) {
