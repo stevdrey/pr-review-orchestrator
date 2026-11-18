@@ -41,3 +41,11 @@ git diff --check
 ```
 
 On 2026-11-18 the focused run passed 136 tests and the full build passed 242 tests with Java 27 and disposable PostgreSQL. Both runs had zero failures, errors or skipped tests.
+
+The follow-up regression reproduced `NO_PENDING_FINDINGS` and an incorrect clean transition on `0e1800c` using `./gradlew test --offline --tests '*FixCorrelationIntegrationTest.historicalResolutionWithDismissedOccurrenceCannotHideCurrentOpenFinding'`. The corrected guard retains the current round's open finding even when a later snapshot omits it. The historical round retains its own disposition and resolution metadata.
+
+The follow-up passed 67 focused tests and all 243 tests in `./gradlew clean build --offline` with Java 27 and disposable PostgreSQL. Both runs had zero failures, errors or skipped tests.
+
+```sh
+./gradlew test --offline --tests '*FixCorrelationIntegrationTest' --tests '*ReviewStateIntegrationTest' --tests '*ReviewEvidenceIntegrationTest' --tests '*GeneralFeedbackIntegrationTest'
+```

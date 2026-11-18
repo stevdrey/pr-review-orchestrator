@@ -97,8 +97,12 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     LEFT JOIN review_evidence_snapshots o ON o.id = f.evidence_snapshot_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD') AND f.status IN ('OPEN', 'ACKNOWLEDGED')
-                        AND NOT EXISTS (SELECT 1 FROM findings n JOIN review_evidence_snapshots newer ON newer.id = n.evidence_snapshot_id
-                            WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at))
+                        AND NOT EXISTS (
+                            SELECT 1 FROM findings n JOIN review_evidence_snapshots newer ON newer.id = n.evidence_snapshot_id
+                            WHERE n.stable_finding_id = f.stable_finding_id
+                                AND newer.captured_at > o.captured_at
+                                -- Supersession requires evidence captured at the replacing round's head.
+                                AND coalesce(newer.observed_head_sha, newer.head_sha) = newer.head_sha))
                 , count(*) > 0, coalesce(bool_or(feedback = 'ACTIONABLE'), false),
                     coalesce(bool_or(decision IS DISTINCT FROM 'CLAIMED'), false)
                 FROM pending_general

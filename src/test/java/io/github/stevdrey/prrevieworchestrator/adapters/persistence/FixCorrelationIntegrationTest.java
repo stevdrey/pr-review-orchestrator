@@ -12,6 +12,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.*;
 import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback.Disposition;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
@@ -56,11 +57,7 @@ class FixCorrelationIntegrationTest {
         jdbc.execute("TRUNCATE installations CASCADE");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
-        cycle = UUID.randomUUID();
-        jdbc.update("""
-                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider, iteration)
-                VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'github', 1)
-                """, cycle, BASE);
+        cycle = createCycle(BASE, 1);
         transactions = new DataSourceTransactionManager(dataSource);
         authorization = new RepositoryAuthorization(Set.of(PR.scope()), new JdbcInstallationAuthorization(jdbc));
         lifecycle = new ReviewLifecycle(new JdbcReviewStateStore(jdbc, transactions), authorization);
@@ -75,11 +72,7 @@ class FixCorrelationIntegrationTest {
     @Test
     void closePushesCoalesceAtTheLatestHeadAcrossWorkersAndStoreRecreation() throws Exception {
         var normalizer = new GitHubReviewNormalizer();
-        String fixture;
-        try (var input = Objects.requireNonNull(getClass().getResourceAsStream("/github/review-snapshot.json"))) {
-            fixture = new String(input.readAllBytes(), StandardCharsets.UTF_8);
-        }
-        fixture = fixture.replace("Review summary, not a clean verdict", "");
+        String fixture = inlineReviewFixture();
         var initial = normalizer.normalize(UUID.randomUUID(), cycle, PR, BASE, TIME,
                 fixture.getBytes(StandardCharsets.UTF_8));
         waitingForFix(initial);
@@ -142,6 +135,45 @@ class FixCorrelationIntegrationTest {
         assertEquals(1, candidateCount());
         assertEquals(LAST, jdbc.queryForObject("SELECT head_sha FROM fix_review_candidates", String.class));
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+    }
+
+    @Test
+    void historicalResolutionWithDismissedOccurrenceCannotHideCurrentOpenFinding() throws Exception {
+        var normalizer = new GitHubReviewNormalizer();
+        String fixture = inlineReviewFixture();
+        waitingForFix(normalizer.normalize(UUID.randomUUID(), cycle, PR, BASE, TIME, fixture.getBytes(StandardCharsets.UTF_8)));
+        jdbc.update("""
+                UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Round decision'
+                WHERE review_cycle_id = ? AND source_id = 'C1'
+                """, cycle);
+        push(FIRST);
+        settlePushes();
+
+        UUID currentRound = createCycle(FIRST, 2);
+        String currentResponse = fixture.replace("\"headRefOid\": \"" + BASE, "\"headRefOid\": \"" + FIRST);
+        assertTrue(ingestion.ingest(normalizer.normalize(UUID.randomUUID(), currentRound, PR, FIRST, TIME.plusSeconds(1),
+                currentResponse.getBytes(StandardCharsets.UTF_8))));
+        byte[] resolution = currentResponse.replace("\"isResolved\": false", "\"isResolved\": true")
+                .getBytes(StandardCharsets.UTF_8);
+        var historical = normalizer.normalizeForRound(UUID.randomUUID(), cycle, PR, BASE, FIRST, TIME.plusSeconds(2),
+                resolution, Map.of(), Set.of());
+        assertTrue(correlation.observeThread(event("pull_request_review_thread", "resolved", FIRST), historical));
+        assertEquals(Map.of("status", "DISMISSED", "thread_resolved", true, "evidence_snapshot_id", historical.id()),
+                jdbc.queryForMap("""
+                    SELECT status, thread_resolved, evidence_snapshot_id FROM findings
+                    WHERE review_cycle_id = ? AND source_id = 'C1'
+                    """, cycle));
+        assertEquals("OPEN", jdbc.queryForObject(
+                "SELECT status FROM findings WHERE review_cycle_id = ? AND source_id = 'C1'", String.class, currentRound));
+
+        var decision = assess(FIRST, changed(FIRST));
+        step(START_REVIEW, READY);
+        assertTrue(ingestion.ingest(new Snapshot(UUID.randomUUID(), currentRound, PR, "github",
+                FIRST, TIME.plusSeconds(3), List.of())));
+        assertAll(
+                () -> assertEquals(ELIGIBLE, decision.status()),
+                () -> assertEquals(ReviewConflict.Code.GUARD_REJECTED,
+                        assertThrows(ReviewConflict.class, () -> step(BASELINE_CLEAN, READY)).code()));
     }
 
     @Test
@@ -295,6 +327,21 @@ class FixCorrelationIntegrationTest {
     private CorrelateFixes newCorrelator() {
         return new CorrelateFixes(authorization, ingestion,
                 new JdbcFixCorrelationStore(jdbc, new JdbcReviewStateStore(jdbc, transactions)));
+    }
+
+    private UUID createCycle(String headSha, int iteration) {
+        var id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider, iteration)
+                VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'github', ?)
+                """, id, headSha, iteration);
+        return id;
+    }
+
+    private String inlineReviewFixture() throws IOException {
+        try (var input = Objects.requireNonNull(getClass().getResourceAsStream("/github/review-snapshot.json"))) {
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8).replace("Review summary, not a clean verdict", "");
+        }
     }
 
     private PullRequestReview current() { return lifecycle.find(PR).orElseThrow(); }
