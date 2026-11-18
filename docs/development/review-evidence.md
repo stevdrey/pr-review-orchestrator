@@ -12,6 +12,8 @@ The caller must authorize its GitHub read using the paired installation/reposito
 
 The normalizer requires `data.repository.databaseId`, `pullRequest.number` and `headRefOid` to match the requested scope/head. GraphQL errors, missing required metadata, duplicate IDs, duplicate JSON keys, trailing JSON, invalid SHAs/positions and responses over 2 MiB are rejected without retaining parser/provider diagnostics. Both outer connections and every comments connection require `pageInfo.hasNextPage = false`. The 2,000-source limit includes reviews, threads and comments. An approved reader must gather all pages, preserve every node and validate head/authorization again when assembling a multi-page read. An incomplete read is an error, never evidence of cleanliness. The adapter currently consumes assembled snapshots; it does not implement pagination or network requests.
 
+For an older review round, call `normalizeForRound` with the round's SHA and the expected head of the current read. The normalizer verifies `headRefOid` against the expected observed head. The existing cycle foreign key uses the round SHA. V11 persists the observed head and includes it in the fingerprint when it differs from the round, preserving exact retries of earlier same-head snapshots. Both heads must match the reviewed SHA for a clean outcome.
+
 Select these GraphQL fields (see [GitHub's GraphQL reference](https://docs.github.com/en/graphql/reference)):
 
 ```graphql
@@ -63,11 +65,14 @@ PR transaction locks serialize writes across cycles. Older captured snapshots re
 
 Absence from a later snapshot does not imply deletion, dismissal or a clean review. The old source revisions and candidate remain. Empty threads still retain their observed resolution/outdated state separately; they do not rewrite the missing root's historical occurrence. There is no authoritative deletion/tombstone API in this increment, and metadata-only history cannot recover text removed on GitHub. Production retention, deletion and encrypted storage policy must be established before rollout.
 
+A read taken at a different PR head can refresh thread metadata in a historical round and contribute pending evidence. The guard orders each inline occurrence by the latest read taken at its own round's head for the same source revision. That read can supersede an older occurrence of the same finding. For a revision seen only in historical reads, the first retained capture establishes when it became pending. A metadata refresh preserves this ordering and the existing disposition. A change to the source revision reopens the occurrence and requires its own evidence.
+
 Inspect provenance for a round (authorize access outside this operator query):
 
 ```sql
 SELECT f.stable_finding_id, f.review_cycle_id, f.source_id, f.thread_id,
-       f.reviewed_sha AS round_head_sha, s.reviewed_sha AS source_reviewed_sha,
+       f.reviewed_sha AS round_head_sha, coalesce(o.observed_head_sha, o.head_sha) AS observed_head_sha,
+       s.reviewed_sha AS source_reviewed_sha,
        s.original_sha, s.body_sha256, s.source_updated_at,
        s.thread_resolved, s.thread_outdated, f.severity, f.status, o.captured_at
 FROM findings f

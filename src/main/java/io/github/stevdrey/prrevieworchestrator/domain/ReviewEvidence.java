@@ -64,11 +64,17 @@ public final class ReviewEvidence {
         public boolean staleFor(String headSha) { return reviewedSha == null || !reviewedSha.equals(headSha) || Boolean.TRUE.equals(outdated); }
     }
 
+    /** headSha identifies the review round. observedHeadSha is the PR head in the authoritative read. */
     public record Snapshot(UUID id, UUID cycleId, PullRequestId pr, String provider, String headSha,
-            Instant capturedAt, List<Source> sources) {
+            String observedHeadSha, Instant capturedAt, List<Source> sources) {
+        public Snapshot(UUID id, UUID cycleId, PullRequestId pr, String provider, String headSha,
+                Instant capturedAt, List<Source> sources) {
+            this(id, cycleId, pr, provider, headSha, headSha, capturedAt, sources);
+        }
+
         public Snapshot {
             Objects.requireNonNull(id); Objects.requireNonNull(cycleId); Objects.requireNonNull(pr);
-            text(provider); CommitSha.require(headSha); Objects.requireNonNull(capturedAt);
+            text(provider); CommitSha.require(headSha); CommitSha.require(observedHeadSha); Objects.requireNonNull(capturedAt);
             // PostgreSQL timestamps have microsecond precision; canonicalize before fingerprinting.
             capturedAt = capturedAt.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
             sources = sources.stream().sorted(Comparator.comparing(Source::id)).toList();

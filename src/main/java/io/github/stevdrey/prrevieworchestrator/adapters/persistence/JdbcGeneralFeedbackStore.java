@@ -38,19 +38,27 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     private static final String LAST_HEAD = """
             WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
-                WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD')
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                    AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD'))
             """;
-    private static final String VALID_DISMISSAL = """
-            EXISTS (
-                SELECT 1 FROM general_feedback_dispositions d
+    private static final String CURRENT_DECISION = """
+                FROM general_feedback_dispositions d
                 JOIN review_evidence_sources s ON s.snapshot_id = d.snapshot_id AND s.source_id = d.source_id
                 WHERE d.id = (SELECT id FROM general_feedback_dispositions
                     WHERE stable_finding_id = f.stable_finding_id ORDER BY disposition_order DESC LIMIT 1)
-                AND d.action = 'DISMISS' AND d.head_sha = ?
+                AND d.head_sha = ?
                 AND d.head_version >= (SELECT version FROM last_head)
                 AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
-                AND s.feedback = f.feedback)
+                AND s.feedback = f.feedback
             """;
+
+    record FindingGates(boolean inlinePending, boolean generalPending, boolean generalActionable,
+            boolean generalNeedsDisposition) {
+        ReviewOutcome.PendingFindings pending() {
+            if (inlinePending || generalActionable) return ReviewOutcome.PendingFindings.ACTIONABLE;
+            return generalPending ? ReviewOutcome.PendingFindings.NEEDS_HUMAN : ReviewOutcome.PendingFindings.CLEAR;
+        }
+    }
 
     /** Called while holding the PR transaction lock. Missing/ambiguous feedback always blocks. */
     static boolean blocking(JdbcTemplate jdbc, PullRequestId pr, String head) {
@@ -59,32 +67,59 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     /** Retained inline findings, general feedback and legacy rows: the single guard for every transition path. */
     static ReviewOutcome.PendingFindings pending(JdbcTemplate jdbc, PullRequestId pr, String head) {
-        // The last head change is constant per PR: compute it once, not per finding row.
-        return ReviewOutcome.PendingFindings.valueOf(jdbc.queryForObject(LAST_HEAD + """
-                , pending AS (
-                SELECT f.feedback FROM (
+        return findingGates(jdbc, pr, head).pending();
+    }
+
+    /** Claims can justify review of this exact commit while continuing to block a clean verdict. */
+    static FindingGates findingGates(JdbcTemplate jdbc, PullRequestId pr, String head) {
+        return jdbc.queryForObject(LAST_HEAD + """
+                , general AS (
+                SELECT f.feedback,
+                    (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
+                                 WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
+                                 ELSE 'PENDING' END
+                """ + CURRENT_DECISION + """
+                    ) AS decision
+                FROM (
                 """ + LATEST + """
-                ) f WHERE NOT
-                """ + VALID_DISMISSAL + """
+                ) f
                 UNION ALL
-                    SELECT 'NEEDS_HUMAN' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
+                    SELECT 'NEEDS_HUMAN', 'PENDING' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND legacy.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND legacy.stable_finding_id IS NULL
                         AND legacy.status IN ('OPEN', 'ACKNOWLEDGED')
-                UNION ALL
-                    -- Missing candidates from a later snapshot do not remove previously retained inline findings.
-                    SELECT 'ACTIONABLE' FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
-                    LEFT JOIN review_evidence_snapshots o ON o.id = f.evidence_snapshot_id
+                ), pending_general AS (
+                    SELECT * FROM general WHERE decision IS DISTINCT FROM 'DISMISSED'
+                ), inline_findings AS (
+                    -- round_observed_at is written at ingest; the joins below are primary-key lookups.
+                    SELECT f.stable_finding_id, f.status, f.round_observed_at AS at_round,
+                        latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
+                    FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
+                    LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
+                    LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
-                        AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD') AND f.status IN ('OPEN', 'ACKNOWLEDGED')
-                        AND NOT EXISTS (SELECT 1 FROM findings n JOIN review_evidence_snapshots newer ON newer.id = n.evidence_snapshot_id
-                            WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at))
-                SELECT CASE WHEN bool_or(feedback = 'ACTIONABLE') THEN 'ACTIONABLE'
-                    WHEN count(*) > 0 THEN 'NEEDS_HUMAN' ELSE 'CLEAR' END FROM pending
-                """, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                        AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD')
+                )
+                SELECT EXISTS (
+                    -- Only a same-head observation can supersede a retained finding from another round.
+                    SELECT 1 FROM inline_findings f
+                    WHERE f.status IN ('OPEN', 'ACKNOWLEDGED')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM inline_findings n WHERE n.stable_finding_id = f.stable_finding_id
+                                AND (n.at_round > coalesce(f.at_round, f.linked_at)
+                                    -- A copy only seen in another round's read yields to a same-head
+                                    -- observation of the identical source revision.
+                                    OR (f.at_round IS NULL AND n.at_round IS NOT NULL
+                                        AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
+                                        AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at))))
+                , count(*) > 0, coalesce(bool_or(feedback = 'ACTIONABLE'), false),
+                    coalesce(bool_or(decision IS DISTINCT FROM 'CLAIMED'), false)
+                FROM pending_general
+                """, (rs, row) -> new FindingGates(rs.getBoolean(1), rs.getBoolean(2), rs.getBoolean(3), rs.getBoolean(4)),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
-                pr.scope().installationId(), pr.scope().repositoryId(), pr.number()));
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
     }
 
     /** Under the PR lock, match audited dismissals to the exact sources in this snapshot. */
@@ -101,8 +136,9 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                         AND i.source_kind = s.source_kind AND i.source_id = s.source_id
                     WHERE o.id = ? AND o.installation_id = ? AND o.repository_id = ? AND o.pr_number = ?
                         AND o.head_sha = ? AND s.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND s.feedback <> 'NONE'
-                ) f WHERE
-                """ + VALID_DISMISSAL, String.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                ) f WHERE EXISTS (SELECT 1
+                """ + CURRENT_DECISION + " AND d.action = 'DISMISS')", String.class,
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 snapshot.id(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.headSha(),
                 snapshot.headSha()));
     }

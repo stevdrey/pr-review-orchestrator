@@ -45,6 +45,17 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     State.valueOf(rs.getString("state")), false), request.key());
             // The caller authorizes duplicate reads; only a new reservation needs policy/budget approval.
             if (!existing.isEmpty()) return existing.getFirst();
+            requireCurrentVisit(request);
+            // A V13 match preserves deduplication. Only the epoch in the original key authorizes a send.
+            var reconciled = jdbc.query("""
+                    SELECT id, state FROM review_requests
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ?
+                        AND stage = ? AND provider = ? AND reconciled_head_epoch = ?
+                    """, (rs, row) -> new Reservation(rs.getObject("id", UUID.class),
+                    State.valueOf(rs.getString("state")), false), request.pr().scope().installationId(),
+                    request.pr().scope().repositoryId(), request.pr().number(), request.headSha(),
+                    request.stage(), request.provider(), request.headEpoch());
+            if (!reconciled.isEmpty()) return reconciled.getFirst();
             guards.run();
             Integer count = jdbc.queryForObject("""
                     SELECT count(*) FROM review_requests WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
@@ -53,19 +64,22 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             UUID id = UUID.randomUUID();
             jdbc.update("""
                     INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                        head_sha, stage, provider, actor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        head_sha, stage, provider, actor_id, head_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, id, request.key(), request.pr().scope().installationId(), request.pr().scope().repositoryId(),
-                    request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId);
+                    request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId,
+                    request.headEpoch());
             return new Reservation(id, State.RESERVED, true);
         });
     }
     @Override public void send(ReviewRequest request, UUID id, Runnable guards, Supplier<Receipt> effect) {
         try {
             transaction(() -> {
+                PostgresLocks.lockPr(jdbc, request.pr());
                 guards.run();
                 int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
                         id, request.key());
                 if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                requireCurrentVisit(request);
                 return null;
             });
         } catch (RuntimeException failure) {
@@ -78,10 +92,12 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         var effectReturned = new AtomicBoolean();
         try {
             transaction(() -> {
+                PostgresLocks.lockPr(jdbc, request.pr());
                 guards.run(); // Holds live installation membership locks throughout the external effect.
                 var states = jdbc.query("SELECT state FROM review_requests WHERE id = ? AND request_key = ? FOR UPDATE",
                         (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
                 if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                requireCurrentVisit(request);
                 Receipt receipt = effect.get();
                 effectReturned.set(true);
                 if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
@@ -99,6 +115,19 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             throw failure;
         }
     }
+
+    private void requireCurrentVisit(ReviewRequest request) {
+        var pr = request.pr();
+        // Standalone callers can still use epoch 0 before the lifecycle tracks the PR.
+        boolean departed = Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM pr_review_states
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha <> ?)
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), request.headSha()));
+        if (departed || request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, pr, request.headSha())) {
+            throw new ReviewRequestFailure(STALE_HEAD);
+        }
+    }
+
     /** Best effort: if this fails the row keeps its conservative RESERVED/ATTEMPTED state. */
     private void markNotSent(ReviewRequest request, UUID id, State expected) {
         try {

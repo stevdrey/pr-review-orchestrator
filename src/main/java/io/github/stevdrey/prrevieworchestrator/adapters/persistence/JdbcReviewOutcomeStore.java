@@ -84,7 +84,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         var current = jdbc.queryForList("""
                 SELECT head_sha, version, (SELECT occurred_at FROM pr_review_transitions t
                     WHERE t.installation_id = s.installation_id AND t.repository_id = s.repository_id
-                        AND t.pr_number = s.pr_number AND t.action = 'UPDATE_HEAD'
+                        AND t.pr_number = s.pr_number AND t.action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')
                     ORDER BY t.resulting_version DESC LIMIT 1) AS head_changed_at
                 FROM pr_review_states s WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
                 """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
@@ -100,9 +100,11 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     AND c.stage = r.stage AND c.review_provider = r.provider
                 WHERE r.id = ? AND c.id = ? AND r.installation_id = ? AND r.repository_id = ? AND r.pr_number = ?
                     AND r.head_sha = ? AND r.stage = ? AND r.provider = ?
+                    AND r.head_epoch = ?
                     AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
                 """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
-                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(), run.provider());
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(),
+                run.provider(), JdbcFixCorrelationStore.headEpoch(jdbc, pr, run.headSha()));
         Loaded loaded = loadSnapshot(assessment);
         Snapshot snapshot = loaded == null ? null : loaded.snapshot();
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");
@@ -135,7 +137,8 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         var run = assessment.run();
         var pr = run.pr();
         var captures = jdbc.queryForList("""
-                SELECT captured_at, ingested_at FROM review_evidence_snapshots o
+                SELECT captured_at, ingested_at, coalesce(observed_head_sha, head_sha) AS observed_head_sha
+                FROM review_evidence_snapshots o
                 WHERE o.id = ? AND o.review_cycle_id = ? AND o.installation_id = ? AND o.repository_id = ?
                     AND o.pr_number = ? AND o.head_sha = ? AND o.provider = ?
                     AND NOT EXISTS (SELECT 1 FROM review_evidence_snapshots n
@@ -158,6 +161,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         var row = captures.getFirst();
         Timestamp ingested = (Timestamp) row.get("ingested_at");
         return new Loaded(new Snapshot(assessment.snapshotId(), run.cycleId(), pr, run.evidenceProvider(), run.headSha(),
+                (String) row.get("observed_head_sha"),
                 ((Timestamp) row.get("captured_at")).toInstant(), sources), ingested == null ? null : ingested.toInstant());
     }
 }

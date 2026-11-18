@@ -56,7 +56,13 @@ Do not deploy a permissive test approval implementation.
 V8 adds `review_requests`: metadata-only UUID, canonical scoped key, actor ID,
 request SHA/provider/stage, state, timestamps and numeric comment receipt. The key
 is installation/repository/PR/SHA/stage/provider, independent of actor, event and
-review cycle. Both canonical-key and composite unique constraints enforce it.
+review cycle. V12 appends the request epoch when it is positive. A same-head
+confirmation or return after departure starts a new epoch. Both canonical-key and
+composite unique constraints enforce this identity. Each reservation counts toward
+the lifetime cap. The store checks the requested epoch and tracked SHA under the
+PR lock. Both send phases require the current epoch in the original reservation
+key. A V13 association preserves the original key and receipt and suppresses
+duplicate reservations. Its timestamps alone do not authorize a send.
 
 1. Serialize reservations per PR, check live authorization/policy and lifetime cap,
    then commit `RESERVED`. Failed preflight after this point conservatively consumes

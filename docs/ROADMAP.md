@@ -14,6 +14,8 @@ Issue #18 implements the [internal Codex user-comment request adapter](developme
 
 Issue #19 adds [internal conservative review-outcome classification](development/review-outcomes.md) and version-bound clean-stage recording. Unknown/ambiguous results cannot create clean transitions; completed structured results require exact PR/request/cycle/provider/stage/SHA correlation and no pending feedback. The live Codex completion contract, authoritative input gathering and event integration remain unverified; the request adapter stays disabled by default.
 
+Issue #20 adds [internal fix correlation](development/fix-correlation.md). After a quiet period, authoritative changes to the current head can yield one durable re-review candidate for retained findings with the required dispositions. CI reconciliation and iteration policy are tracked in issue #21.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |

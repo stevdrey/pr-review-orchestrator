@@ -76,15 +76,16 @@ class ReviewStateIntegrationTest {
     }
 
     ReviewOutcome.Assessment outcome(PullRequestReview state, ReviewOutcome.Stage stage, ReviewOutcome.Conclusion conclusion) {
-        var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED, 1, false);
+        var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED,
+                1, false, JdbcFixCorrelationStore.headEpoch(jdbc, state.pr(), state.headSha()));
         var ids = jdbc.query("SELECT id FROM review_requests WHERE request_key = ?", (rs, row) -> rs.getObject(1, UUID.class), request.key());
         UUID requestId = ids.isEmpty() ? UUID.randomUUID() : ids.getFirst();
         if (ids.isEmpty()) jdbc.update("""
                 INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'codex', 1, 'COMMENT_CREATED', 1, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z')
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at, head_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'codex', 1, 'COMMENT_CREATED', 1, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', ?)
                 """, requestId, request.key(), state.pr().scope().installationId(), state.pr().scope().repositoryId(),
-                state.pr().number(), state.headSha(), stage.name());
+                state.pr().number(), state.headSha(), stage.name(), request.headEpoch());
         UUID cycleId = UUID.randomUUID();
         int iteration = jdbc.queryForObject("SELECT count(*) + 1 FROM review_cycles", Integer.class);
         jdbc.update("""
@@ -158,6 +159,64 @@ class ReviewStateIntegrationTest {
                 UUID.randomUUID(), UUID.randomUUID(), "github", "fixture-codex");
         assertCode(STALE_HEAD, () -> outcomes.assess(new ReviewOutcome.Assessment(foreignHead, current.version(), null, null)));
         assertNull(lifecycle.find(FIRST).orElseThrow().baselineCleanSha());
+    }
+
+    @Test
+    void historicalRoundSnapshotAtDifferentObservedHeadCannotEstablishCleanEvidence() {
+        var state = reviewing(FIRST);
+        var original = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(original).verdict());
+
+        var run = original.run();
+        var source = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), Instant.EPOCH, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        Instant later = jdbc.queryForObject("SELECT captured_at FROM review_evidence_snapshots WHERE id = ?",
+                Timestamp.class, original.snapshotId()).toInstant().plusSeconds(1);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github",
+                HEAD, NEXT, later, List.of(source));
+        new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
+
+        var assessment = new ReviewOutcome.Assessment(run, state.version(), original.completion(), snapshot.id());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR));
+        assertEquals(state, lifecycle.find(FIRST).orElseThrow());
+    }
+
+    @Test
+    void confirmingSameHeadMakesPriorCompletionEvidenceStale() {
+        var state = reviewing(FIRST);
+        var original = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(original).verdict());
+        state = step(step(state, CONFIRM_HEAD), START_REVIEW);
+        var refreshed = new ReviewOutcome.Assessment(original.run(), state.version(), original.completion(), original.snapshotId());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(refreshed).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(refreshed, UUID.randomUUID(), CLEAR));
+    }
+
+    @Test
+    void freshlyObservedCompletionOfAnEarlierRequestEpochCannotEstablishCleanEvidence() {
+        var state = reviewing(FIRST);
+        var original = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes().assess(original).verdict());
+        var away = step(state, UPDATE_HEAD);
+        var returned = lifecycle.apply(FIRST, new ReviewTransition(UUID.randomUUID(), away.version(), NEXT,
+                UPDATE_HEAD, HEAD, CLEAR));
+        var current = step(returned, START_REVIEW);
+
+        var run = original.run();
+        Instant now = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), now, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        var late = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                now.plusSeconds(1), List.of(review));
+        new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(late, () -> {});
+        var assessment = new ReviewOutcome.Assessment(run, current.version(), original.completion(), late.id());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes().assess(assessment).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes().recordClean(assessment, UUID.randomUUID(), CLEAR));
     }
 
     @Test

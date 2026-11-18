@@ -31,6 +31,7 @@ public final class ReviewOutcomeClassifier {
         if (completion.status() != Status.COMPLETED) return unavailable(expected, version, pending, PROVIDER_NOT_COMPLETED);
         if (snapshot == null || !snapshot.pr().equals(expected.pr())
                 || !snapshot.cycleId().equals(expected.cycleId()) || !snapshot.headSha().equals(expected.headSha())
+                || !snapshot.observedHeadSha().equals(expected.headSha())
                 || !snapshot.provider().equals(expected.evidenceProvider())) {
             return unavailable(expected, version, pending, INCOMPLETE_EVIDENCE);
         }

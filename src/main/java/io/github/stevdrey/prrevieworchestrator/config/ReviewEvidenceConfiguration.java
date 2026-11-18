@@ -1,6 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.config;
 
 import io.github.stevdrey.prrevieworchestrator.application.*;
+import io.github.stevdrey.prrevieworchestrator.ports.FixCorrelationStore;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.ports.GeneralFeedbackStore;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
@@ -9,6 +10,12 @@ import org.springframework.context.annotation.Configuration;
 
 @Configuration(proxyBeanMethods = false)
 public class ReviewEvidenceConfiguration {
+    @Bean
+    CorrelateFixes correlateFixes(RepositoryAuthorization authorization, IngestReviewEvidence evidence,
+            FixCorrelationStore store) {
+        return new CorrelateFixes(authorization, evidence, store);
+    }
+
     @Bean
     AssessReviewOutcome assessReviewOutcome(ReviewOutcomeStore store, RepositoryAuthorization authorization) {
         return new AssessReviewOutcome(store, authorization);

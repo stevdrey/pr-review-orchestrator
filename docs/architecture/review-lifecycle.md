@@ -24,6 +24,8 @@ stateDiagram-v2
 
 PR must be open and ready (not draft), authorized for the installation, not blocked by a human hold, and at an eligible head SHA. Hold duplicate provider/stage/SHA commands, CI state, current pending findings and in-flight requests. Do not issue review requests in response to the orchestrator's own comments.
 
+For remediation, [issue #20's correlation use case](../development/fix-correlation.md) waits for close head updates to settle and checks the committed tree against the remediation base. It records at most one candidate for the eligible head. The candidate feeds the separate CI, iteration and dispatch gates.
+
 ## Iteration policy
 
 Default **proposal**: max six automatic review requests per PR across the configured review loop. Count failed/retried external requests separately from successful review cycles so retries cannot bypass quota. Stop on lack of progress, repeated identical findings, budget exhaustion, unresolved authentication, stale head or incomplete webhook interpretation. Additional runs require documented operator approval and separate budget.
