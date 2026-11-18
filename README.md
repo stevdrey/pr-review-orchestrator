@@ -67,6 +67,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [General feedback, audited dispositions and stage guards](docs/development/general-feedback.md)
 - [Codex review requests, deduplication and activation prerequisites](docs/development/codex-review-requests.md)
 - [Conservative review outcomes and completion trust contract](docs/development/review-outcomes.md)
+- [Fix correlation and durable re-review eligibility](docs/development/fix-correlation.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Codex attribution spike and test protocol](docs/spikes/issue-14-codex-attribution.md)

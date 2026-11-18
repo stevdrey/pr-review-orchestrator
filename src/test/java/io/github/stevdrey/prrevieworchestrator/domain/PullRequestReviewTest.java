@@ -74,7 +74,11 @@ class PullRequestReviewTest {
             if (source == DEEP_REVIEW && action == MARK_READY_FOR_HUMAN) state = step(state, DEEP_CLEAN);
             var request = command(state, action, action == BLOCKING_FINDINGS ? BLOCKED : CLEAR);
             var current = state;
-            if (allowed.get(source).contains(action)) {
+            if (action == CONFIRM_HEAD) {
+                var confirmed = current.transition(request);
+                assertEquals(new PullRequestReview(current.pr(), current.headSha(), current.version() + 1,
+                        current.state(), current.resumeState(), current.baselineCleanSha(), current.deepCleanSha()), confirmed);
+            } else if (allowed.get(source).contains(action)) {
                 assertEquals(current.version() + 1, current.transition(request).version(), source + "/" + action);
             } else {
                 assertEquals(ILLEGAL_TRANSITION, assertThrows(ReviewConflict.class,

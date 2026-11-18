@@ -111,6 +111,9 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
                     if (resume != State.NEW) resume = State.WAITING_FOR_REVIEW;
                 } else if (state != State.NEW) next = State.WAITING_FOR_REVIEW;
             }
+            case CONFIRM_HEAD -> {
+                // Fence delayed observations without clearing evidence or moving the push window.
+            }
         }
         return new PullRequestReview(pr, sha, Math.incrementExact(version), next, resume, baseline, deep);
     }

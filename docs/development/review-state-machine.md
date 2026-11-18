@@ -26,6 +26,7 @@ Every command carries a caller-stable UUID, expected version, expected head SHA,
 | `PAUSE` | Any except `PAUSED` | Save resume state and clean evidence; enter `PAUSED` |
 | `RESUME` | `PAUSED` | Restore saved state; restoring `WAITING_FOR_REVIEW`, `REVIEWING`, `DEEP_REVIEW` or `READY_FOR_HUMAN` requires eligibility, and `READY_FOR_HUMAN` also rechecks CI and blockers; `NEW`, `ACTION_REQUIRED` and `WAITING_FOR_FIX` permit no review work and resume ungated |
 | `UPDATE_HEAD` | Any | Require different SHA; clear both clean SHAs; `NEW` stays `NEW` (only `MARK_READY` is the gated entry); other states enter `WAITING_FOR_REVIEW`, or stay paused with that resume state (a `NEW` resume target stays `NEW`) |
+| `CONFIRM_HEAD` | Any | Advance the version on an authoritative same-head observation. Preserve state and clean evidence. |
 
 `DEEP_REVIEW` identifies the required review stage; entering it does not dispatch a provider call. Clean deep evidence can be stored while CI is pending; readiness is a separate guarded action. This increment conservatively requires both clean stages. Optional-stage policy, separate budget/failure states and automatic no-progress stops remain future integrations; operators/callers can explicitly pause the current aggregate.
 
