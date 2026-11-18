@@ -38,3 +38,6 @@ CREATE INDEX review_clean_evidence_source_idx ON review_clean_evidence (snapshot
 -- Existing snapshots keep NULL: no ingestion time is invented, so they cannot establish clean evidence.
 ALTER TABLE review_evidence_snapshots ADD COLUMN ingested_at timestamptz;
 ALTER TABLE review_evidence_snapshots ALTER COLUMN ingested_at SET DEFAULT clock_timestamp();
+
+-- The transition INSERT happens under the PR lock, potentially long after the transaction began.
+ALTER TABLE pr_review_transitions ALTER COLUMN occurred_at SET DEFAULT clock_timestamp();

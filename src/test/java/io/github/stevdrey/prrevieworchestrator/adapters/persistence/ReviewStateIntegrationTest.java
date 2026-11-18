@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import javax.sql.DataSource;
@@ -156,6 +158,104 @@ class ReviewStateIntegrationTest {
                 UUID.randomUUID(), UUID.randomUUID(), "github", "fixture-codex");
         assertCode(STALE_HEAD, () -> outcomes.assess(new ReviewOutcome.Assessment(foreignHead, current.version(), null, null)));
         assertNull(lifecycle.find(FIRST).orElseThrow().baselineCleanSha());
+    }
+
+    @Test
+    void headUpdateWaitingBehindIngestionRejectsSnapshotFromBeforeTheUpdate() throws Exception {
+        var initial = reviewing(FIRST);
+        var original = outcome(initial, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var away = step(initial, UPDATE_HEAD);
+        var back = new ReviewTransition(UUID.randomUUID(), away.version(), NEXT, UPDATE_HEAD, HEAD, CLEAR);
+        var run = original.run();
+        // A provider clock ahead of PostgreSQL must not hide the local write ordering.
+        Instant providerTime = jdbc.queryForObject("SELECT clock_timestamp() + interval '1 minute'", Timestamp.class).toInstant();
+        var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), providerTime, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        var overlapping = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                providerTime.plusSeconds(1), List.of(review));
+        var manager = new DataSourceTransactionManager(dataSource);
+        var ingestion = new JdbcReviewEvidenceStore(jdbc, manager);
+        var states = new JdbcReviewStateStore(jdbc, manager);
+        var authorization = new JdbcInstallationAuthorization(jdbc);
+        var ingestPid = new CompletableFuture<Integer>();
+        var updatePid = new CompletableFuture<Integer>();
+        PullRequestReview returned;
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            Future<Boolean> stored;
+            Future<PullRequestReview> updated;
+            try (var lock = dataSource.getConnection()) {
+                lock.setAutoCommit(false);
+                try {
+                    int cycleLockPid;
+                    try (var statement = lock.createStatement(); var rows = statement.executeQuery("SELECT pg_backend_pid()")) {
+                        assertTrue(rows.next());
+                        cycleLockPid = rows.getInt(1);
+                    }
+                    // Ingestion acquires the PR lock before it tries to lock the cycle row.
+                    try (var statement = lock.prepareStatement("SELECT id FROM review_cycles WHERE id = ? FOR UPDATE")) {
+                        statement.setObject(1, run.cycleId());
+                        try (var rows = statement.executeQuery()) { assertTrue(rows.next()); }
+                    }
+                    stored = workers.submit(() -> ingestion.ingest(overlapping, () -> {
+                        assertTrue(authorization.isActiveAndEnabled(FIRST.scope()));
+                        ingestPid.complete(jdbc.queryForObject("SELECT pg_backend_pid()", Integer.class));
+                    }));
+                    int ingestBackend = ingestPid.get(2, TimeUnit.SECONDS);
+                    awaitBlockedBy(ingestBackend, cycleLockPid);
+                    updated = workers.submit(() -> states.apply(FIRST, back, () -> {
+                        assertTrue(authorization.isActiveAndEnabled(FIRST.scope()));
+                        updatePid.complete(jdbc.queryForObject("SELECT pg_backend_pid()", Integer.class));
+                    }));
+                    awaitBlockedBy(updatePid.get(2, TimeUnit.SECONDS), ingestBackend);
+                } finally {
+                    lock.rollback();
+                }
+            }
+            assertTrue(stored.get(4, TimeUnit.SECONDS));
+            returned = updated.get(4, TimeUnit.SECONDS);
+        }
+        var state = step(returned, START_REVIEW);
+        var reassessed = new ReviewOutcome.Assessment(run, state.version(), original.completion(), overlapping.id());
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(reassessed).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(reassessed, UUID.randomUUID(), CLEAR));
+        assertNull(lifecycle.find(FIRST).orElseThrow().baselineCleanSha());
+    }
+
+    private void awaitBlockedBy(int waiter, int blocker) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        do {
+            if (Boolean.TRUE.equals(jdbc.queryForObject("SELECT ? = ANY(pg_blocking_pids(?))",
+                    Boolean.class, blocker, waiter))) return;
+            Thread.sleep(10);
+        } while (System.nanoTime() < deadline);
+        fail("PostgreSQL backend " + waiter + " did not wait for backend " + blocker);
+    }
+
+    @Test
+    void lastHeadChangeIsSelectedByVersionEvenWithOutOfOrderJournalTimes() {
+        var initial = reviewing(FIRST);
+        var away = step(initial, UPDATE_HEAD);
+        var returned = lifecycle.apply(FIRST,
+                new ReviewTransition(UUID.randomUUID(), away.version(), NEXT, UPDATE_HEAD, HEAD, CLEAR));
+        var state = step(returned, START_REVIEW);
+        // Historical transaction-start timestamps can be out of version order.
+        jdbc.update("""
+                UPDATE pr_review_transitions SET occurred_at = clock_timestamp() + interval '1 day'
+                WHERE installation_id = 101 AND repository_id = 1001 AND pr_number = 7 AND resulting_version = ?
+                """, away.version());
+        var initialAssessment = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var run = initialAssessment.run();
+        Instant now = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        var review = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), now, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github", HEAD,
+                now.plusSeconds(1), List.of(review));
+        new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
+        var assessment = new ReviewOutcome.Assessment(run, state.version(), initialAssessment.completion(), snapshot.id());
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes().assess(assessment).verdict());
     }
 
     @Test

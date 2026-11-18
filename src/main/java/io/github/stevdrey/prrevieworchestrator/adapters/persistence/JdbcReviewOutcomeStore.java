@@ -82,9 +82,10 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         Run run = assessment.run();
         var pr = run.pr();
         var current = jdbc.queryForList("""
-                SELECT head_sha, version, (SELECT max(occurred_at) FROM pr_review_transitions t
+                SELECT head_sha, version, (SELECT occurred_at FROM pr_review_transitions t
                     WHERE t.installation_id = s.installation_id AND t.repository_id = s.repository_id
-                        AND t.pr_number = s.pr_number AND t.action = 'UPDATE_HEAD') AS head_changed_at
+                        AND t.pr_number = s.pr_number AND t.action = 'UPDATE_HEAD'
+                    ORDER BY t.resulting_version DESC LIMIT 1) AS head_changed_at
                 FROM pr_review_states s WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
                 """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
         if (current.isEmpty()) throw new ReviewConflict(NOT_FOUND);
@@ -107,12 +108,11 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");
         // Known retained blockers decide the outcome even when correlation is unavailable.
         var pending = JdbcGeneralFeedbackStore.pending(jdbc, pr, run.headSha());
-        // Do not reuse a pre-request review/read or an older observation after any newer evidence. Ingestion,
-        // request and head-change times all come from the PostgreSQL clock, and the PR lock serializes ingestion
-        // after UPDATE_HEAD. The GitHub review time is an additional guard, bounded by clock skew.
+        // Ingestion and head updates timestamp their writes while holding the same PR lock.
+        // A timestamp tied with the head update cannot prove later ingestion.
         if (requests.size() != 1 || snapshot == null || loaded.ingestedAt() == null
                 || loaded.ingestedAt().isBefore(requests.getFirst())
-                || changed != null && loaded.ingestedAt().isBefore(changed.toInstant())
+                || changed != null && !loaded.ingestedAt().isAfter(changed.toInstant())
                 || snapshot.sources().stream().filter(s -> s.kind() == Kind.REVIEW
                     && assessment.completion() != null && s.id().equals(assessment.completion().reviewId()))
                     .anyMatch(s -> s.updatedAt().isBefore(requests.getFirst())
