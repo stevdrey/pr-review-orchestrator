@@ -99,10 +99,11 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     AND c.pr_number = r.pr_number AND c.head_sha = r.head_sha
                     AND c.stage = r.stage AND c.review_provider = r.provider
                 WHERE r.id = ? AND c.id = ? AND r.installation_id = ? AND r.repository_id = ? AND r.pr_number = ?
-                    AND r.head_sha = ? AND r.stage = ? AND r.provider = ?
+                    AND r.head_sha = ? AND r.stage = ? AND r.provider = ? AND r.head_epoch = ?
                     AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
                 """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
-                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(), run.provider());
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(),
+                run.provider(), JdbcFixCorrelationStore.headEpoch(jdbc, pr, run.headSha()));
         Loaded loaded = loadSnapshot(assessment);
         Snapshot snapshot = loaded == null ? null : loaded.snapshot();
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");

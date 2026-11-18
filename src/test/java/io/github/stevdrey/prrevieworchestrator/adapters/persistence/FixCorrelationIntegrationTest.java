@@ -423,26 +423,65 @@ class FixCorrelationIntegrationTest {
     }
 
     @Test
-    void returnToAnEarlierCandidateHeadRecordsANewCandidateForTheCurrentBase() {
+    void returnToAnEarlierCandidateHeadOpensANewRequestEpochForTheCurrentBase() {
         waitingForFix(inline(false));
         push(FIRST);
         settlePushes();
         var first = assess(FIRST, changed(FIRST));
         assertEquals(ELIGIBLE, first.status());
+        var requests = new JdbcReviewRequestStore(jdbc, transactions);
+        Runnable guards = () -> authorization.requireAuthorized(PR.scope());
+        var originalRequest = new ReviewRequest(PR, FIRST, "BASELINE", "github",
+                ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+        assertEquals(0, JdbcFixCorrelationStore.headEpoch(jdbc, PR, FIRST));
+        var original = requests.reserve(originalRequest, 1, 6, guards);
+        assertTrue(original.created());
+        step(START_REVIEW, READY);
         push(LAST);
         step(START_REVIEW, READY);
         step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
         step(AWAIT_FIX, READY);
-        push(FIRST);
+        var returnEvent = event("pull_request", "synchronize", FIRST);
+        assertTrue(correlation.observeSynchronize(returnEvent, current(), head(FIRST)));
+        long returnVersion = current().version();
+        var comparison = new Comparison(LAST, FIRST, true);
+        assertEquals(WAITING_FOR_PUSHES, assess(FIRST, comparison).status());
         settlePushes();
 
-        var returned = assess(FIRST, new Comparison(LAST, FIRST, true));
+        var returned = assess(FIRST, comparison);
         assertEquals(ELIGIBLE, returned.status());
         assertEquals(LAST, returned.baseSha());
         assertNotEquals(first.candidateId(), returned.candidateId());
         assertEquals(LAST, jdbc.queryForObject("SELECT base_sha FROM fix_review_candidates WHERE id = ?",
                 String.class, returned.candidateId()));
-        assertEquals(ALREADY_ELIGIBLE, assess(FIRST, new Comparison(LAST, FIRST, true)).status());
+        assertTrue(correlation.observeSynchronize(returnEvent, current(), head(FIRST)));
+        var retry = assess(FIRST, comparison);
+        assertEquals(ALREADY_ELIGIBLE, retry.status());
+        assertEquals(returned.candidateId(), retry.candidateId());
+
+        long epoch = returned.headEpoch();
+        assertEquals(returnVersion, epoch);
+        assertEquals(epoch, retry.headEpoch());
+        var stale = new ReviewRequest(PR, FIRST, "BASELINE", "codex",
+                ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+        assertEquals(ReviewRequestFailure.Code.STALE_HEAD,
+                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(stale, 1, 6, guards)).code());
+        assertEquals(original.id(), requests.reserve(originalRequest, 1, 6, guards).id());
+        assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
+                () -> requests.send(originalRequest, original.id(), guards,
+                        () -> fail("An earlier epoch must not reach the provider"))).code());
+
+        var renewed = new ReviewRequest(PR, FIRST, "BASELINE", "github",
+                ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
+        assertEquals(ReviewRequestFailure.Code.LIMIT_REACHED,
+                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(renewed, 1, 1, guards)).code());
+        var renewedReservation = requests.reserve(renewed, 1, 6, guards);
+        assertTrue(renewedReservation.created());
+        var renewedReplay = requests.reserve(renewed, 1, 6, guards);
+        assertFalse(renewedReplay.created());
+        assertEquals(renewedReservation.id(), renewedReplay.id());
+        assertEquals(ALREADY_REQUESTED, assess(FIRST, comparison).status());
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
     }
 
     @Test

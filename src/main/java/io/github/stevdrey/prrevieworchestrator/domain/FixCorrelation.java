@@ -36,8 +36,12 @@ public final class FixCorrelation {
         GENERAL_DISPOSITION_REQUIRED, NO_PENDING_FINDINGS, ALREADY_REQUESTED, ELIGIBLE, ALREADY_ELIGIBLE
     }
 
-    /** ELIGIBLE creates a durable candidate. A candidate ID is never a permit to dispatch. */
-    public record Decision(Status status, String baseSha, Instant retryAt, UUID candidateId) {
+    /** Eligibility carries the current request epoch. A candidate ID is never a permit to dispatch. */
+    public record Decision(Status status, String baseSha, Instant retryAt, UUID candidateId, long headEpoch) {
+        public Decision(Status status, String baseSha, Instant retryAt, UUID candidateId) {
+            this(status, baseSha, retryAt, candidateId, 0);
+        }
+
         public Decision(Status status) {
             this(status, null, null, null);
         }

@@ -88,9 +88,10 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
         var findings = JdbcGeneralFeedbackStore.findingGates(jdbc, pr, head.sha());
         if (findings.generalNeedsDisposition()) return new Decision(GENERAL_DISPOSITION_REQUIRED);
         if (!findings.inlinePending() && !findings.generalPending()) return new Decision(NO_PENDING_FINDINGS);
-        if (requested(pr, head.sha())) return new Decision(ALREADY_REQUESTED);
+        long epoch = headEpoch(jdbc, pr, head.sha());
+        if (requested(pr, head.sha(), epoch)) return new Decision(ALREADY_REQUESTED);
 
-        return recordCandidate(pr, timeline);
+        return recordCandidate(pr, timeline, epoch);
     }
 
     private Timeline loadTimeline(PullRequestId pr) {
@@ -120,33 +121,44 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
                 .orElseThrow(() -> new ReviewConflict(NOT_FOUND));
     }
 
-    private boolean requested(PullRequestId pr, String head) {
+    private boolean requested(PullRequestId pr, String head, long epoch) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM review_requests
                     WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND stage = 'BASELINE'
                         AND head_epoch = ?)
                 """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
-                headEpoch(jdbc, pr, head)));
+                epoch));
     }
 
-    /** Request epoch of a head: the version of its last same-head confirmation, or 0. Caller holds the PR lock. */
+    /** Epoch 0 on the first visit. A same-head confirmation or a return after departure sets a journal version. */
     static long headEpoch(JdbcTemplate jdbc, PullRequestId pr, String head) {
-        Long epoch = jdbc.queryForObject("""
-                SELECT coalesce(max(resulting_version), 0) FROM pr_review_transitions
-                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
-                    AND action = 'CONFIRM_HEAD' AND resulting_head_sha = ?
-                """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head);
-        return epoch == null ? 0 : epoch;
+        // Caller holds the PR lock. The first departure also records the initial SHA, even when no other action preceded it.
+        return jdbc.queryForObject("""
+                WITH visits AS (
+                    SELECT min(resulting_version) FILTER (
+                               WHERE action = 'UPDATE_HEAD' AND expected_head_sha = ?) AS first_departure,
+                           max(resulting_version) FILTER (
+                               WHERE action = 'UPDATE_HEAD' AND resulting_head_sha = ?) AS last_arrival,
+                           max(resulting_version) FILTER (
+                               WHERE action = 'CONFIRM_HEAD' AND resulting_head_sha = ?) AS last_confirmation
+                    FROM pr_review_transitions
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                        AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')
+                )
+                SELECT greatest(0, last_confirmation,
+                    CASE WHEN last_arrival > first_departure THEN last_arrival END)
+                FROM visits
+                """, Long.class, head, head, head, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
     }
 
-    private Decision recordCandidate(PullRequestId pr, Timeline timeline) {
+    private Decision recordCandidate(PullRequestId pr, Timeline timeline, long epoch) {
         var existing = jdbc.query("""
                 SELECT id FROM fix_review_candidates
                 WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND head_version = ?
                 """, (rs, row) -> rs.getObject(1, UUID.class),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), timeline.headSha(),
                 timeline.updateVersion());
-        if (!existing.isEmpty()) return new Decision(ALREADY_ELIGIBLE, timeline.baseSha(), null, existing.getFirst());
+        if (!existing.isEmpty()) return new Decision(ALREADY_ELIGIBLE, timeline.baseSha(), null, existing.getFirst(), epoch);
 
         UUID id = UUID.randomUUID();
         jdbc.update("""
@@ -155,6 +167,6 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, id, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 timeline.headSha(), timeline.baseSha(), timeline.updateVersion());
-        return new Decision(ELIGIBLE, timeline.baseSha(), null, id);
+        return new Decision(ELIGIBLE, timeline.baseSha(), null, id, epoch);
     }
 }

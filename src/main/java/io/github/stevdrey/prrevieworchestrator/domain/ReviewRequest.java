@@ -6,7 +6,7 @@ import java.util.Objects;
 public record ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
         Trigger trigger, long senderId, boolean bot, long headEpoch) {
     public enum Trigger { PR_OPENED, PR_READY, PR_SYNCHRONIZE, PR_REOPENED, COMMENT, REVIEW }
-    /** Epoch 0: no same-head confirmation has been journaled for this SHA. */
+    /** Epoch 0 denotes the initial visit to this SHA before any same-head confirmation. */
     public ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
             Trigger trigger, long senderId, boolean bot) {
         this(pr, headSha, stage, provider, trigger, senderId, bot, 0);

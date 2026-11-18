@@ -45,10 +45,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     State.valueOf(rs.getString("state")), false), request.key());
             // The caller authorizes duplicate reads; only a new reservation needs policy/budget approval.
             if (!existing.isEmpty()) return existing.getFirst();
-            // Under the PR lock: a confirmation of the same head opens exactly one new epoch for it.
-            if (request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, request.pr(), request.headSha())) {
-                throw new ReviewRequestFailure(STALE_HEAD);
-            }
+            requireCurrentEpoch(request);
             guards.run();
             Integer count = jdbc.queryForObject("""
                     SELECT count(*) FROM review_requests WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
@@ -67,10 +64,12 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
     @Override public void send(ReviewRequest request, UUID id, Runnable guards, Supplier<Receipt> effect) {
         try {
             transaction(() -> {
+                PostgresLocks.lockPr(jdbc, request.pr());
                 guards.run();
                 int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
                         id, request.key());
                 if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                requireCurrentEpoch(request);
                 return null;
             });
         } catch (RuntimeException failure) {
@@ -83,10 +82,12 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         var effectReturned = new AtomicBoolean();
         try {
             transaction(() -> {
+                PostgresLocks.lockPr(jdbc, request.pr());
                 guards.run(); // Holds live installation membership locks throughout the external effect.
                 var states = jdbc.query("SELECT state FROM review_requests WHERE id = ? AND request_key = ? FOR UPDATE",
                         (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
                 if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
+                requireCurrentEpoch(request);
                 Receipt receipt = effect.get();
                 effectReturned.set(true);
                 if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
@@ -104,6 +105,13 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             throw failure;
         }
     }
+
+    private void requireCurrentEpoch(ReviewRequest request) {
+        if (request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, request.pr(), request.headSha())) {
+            throw new ReviewRequestFailure(STALE_HEAD);
+        }
+    }
+
     /** Best effort: if this fails the row keeps its conservative RESERVED/ATTEMPTED state. */
     private void markNotSent(ReviewRequest request, UUID id, State expected) {
         try {
