@@ -65,7 +65,7 @@ PR transaction locks serialize writes across cycles. Older captured snapshots re
 
 Absence from a later snapshot does not imply deletion, dismissal or a clean review. The old source revisions and candidate remain. Empty threads still retain their observed resolution/outdated state separately; they do not rewrite the missing root's historical occurrence. There is no authoritative deletion/tombstone API in this increment, and metadata-only history cannot recover text removed on GitHub. Production retention, deletion and encrypted storage policy must be established before rollout.
 
-A read taken at a different PR head can refresh thread metadata in a historical round and contribute pending evidence. Only a newer observation whose observed head matches its own round can supersede a retained inline finding across rounds. A refreshed historical dismissal leaves the other round's open finding pending.
+A read taken at a different PR head can refresh thread metadata in a historical round and contribute pending evidence. The guard orders each inline occurrence by the latest read taken at its own round's head for the same source revision. That read can supersede an older occurrence of the same finding. For a revision seen only in historical reads, the first retained capture establishes when it became pending. A metadata refresh preserves this ordering and the existing disposition. A change to the source revision reopens the occurrence and requires its own evidence.
 
 Inspect provenance for a round (authorize access outside this operator query):
 

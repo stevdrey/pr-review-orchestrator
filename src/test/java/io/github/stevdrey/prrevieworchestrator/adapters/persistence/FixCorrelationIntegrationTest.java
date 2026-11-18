@@ -24,6 +24,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.*;
 import org.testcontainers.junit.jupiter.*;
@@ -174,6 +176,62 @@ class FixCorrelationIntegrationTest {
                 () -> assertEquals(ELIGIBLE, decision.status()),
                 () -> assertEquals(ReviewConflict.Code.GUARD_REJECTED,
                         assertThrows(ReviewConflict.class, () -> step(BASELINE_CLEAN, READY)).code()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void historicalResolutionPreservesValidClosureUntilTheSourceRevisionChanges(boolean firstSeenHistorically) throws Exception {
+        var normalizer = new GitHubReviewNormalizer();
+        String fixture = inlineReviewFixture();
+        String firstResponse = fixture.replace("\"headRefOid\": \"" + BASE, "\"headRefOid\": \"" + FIRST);
+        byte[] roundResponse = firstResponse.getBytes(StandardCharsets.UTF_8);
+        byte[] initialResponse = firstSeenHistorically ? roundResponse : fixture.getBytes(StandardCharsets.UTF_8);
+        waitingForFix(normalizer.normalizeForRound(UUID.randomUUID(), cycle, PR, BASE,
+                firstSeenHistorically ? FIRST : BASE, TIME, initialResponse, Map.of(), Set.of()));
+        push(FIRST);
+        UUID fixedRound = createCycle(FIRST, 2);
+        assertTrue(ingestion.ingest(normalizer.normalize(UUID.randomUUID(), fixedRound, PR, FIRST, TIME.plusSeconds(1),
+                roundResponse)));
+        jdbc.update("""
+                UPDATE findings SET status = 'VERIFIED_FIXED', evidence_sha = ?, verified_at = clock_timestamp(),
+                    disposition_actor = 'maintainer', disposition_reason = 'Verified against the new commit'
+                WHERE review_cycle_id = ? AND source_id = 'C1'
+                """, LAST, fixedRound);
+        push(LAST);
+        settlePushes();
+        assertEquals(NO_PENDING_FINDINGS, assess(LAST, changed(LAST)).status());
+
+        var resolvedEvent = event("pull_request_review_thread", "resolved", LAST);
+        String resolved = fixture.replace("\"headRefOid\": \"" + BASE, "\"headRefOid\": \"" + LAST)
+                .replace("\"isResolved\": false", "\"isResolved\": true");
+        byte[] resolution = resolved.getBytes(StandardCharsets.UTF_8);
+        var historical = normalizer.normalizeForRound(UUID.randomUUID(), fixedRound, PR, FIRST, LAST,
+                TIME.plusSeconds(2), resolution, Map.of(), Set.of());
+        assertTrue(correlation.observeThread(resolvedEvent, historical));
+        assertEquals(Map.of("status", "VERIFIED_FIXED", "evidence_sha", LAST, "thread_resolved", true,
+                        "evidence_snapshot_id", historical.id()),
+                jdbc.queryForMap("""
+                    SELECT status, evidence_sha, thread_resolved, evidence_snapshot_id FROM findings
+                    WHERE review_cycle_id = ? AND source_id = 'C1'
+                    """, fixedRound));
+        assertEquals(NO_PENDING_FINDINGS, assess(LAST, changed(LAST)).status());
+
+        // The same metadata refresh on the superseded occurrence also leaves the closure intact.
+        assertTrue(correlation.observeThread(resolvedEvent, normalizer.normalizeForRound(
+                UUID.randomUUID(), cycle, PR, BASE, LAST, TIME.plusSeconds(3), resolution, Map.of(), Set.of())));
+        assertEquals(NO_PENDING_FINDINGS, assess(LAST, changed(LAST)).status());
+        step(START_REVIEW, READY);
+        step(BASELINE_CLEAN, READY);
+        assertEquals(LAST, current().baselineCleanSha());
+
+        // An actual edit is a separate revision and still reopens the finding and revokes readiness.
+        byte[] edited = resolved.replace("export a secret", "check the edge case").getBytes(StandardCharsets.UTF_8);
+        assertTrue(correlation.observeThread(resolvedEvent, normalizer.normalizeForRound(
+                UUID.randomUUID(), fixedRound, PR, FIRST, LAST, TIME.plusSeconds(4), edited, Map.of(), Set.of())));
+        assertEquals("OPEN", jdbc.queryForObject(
+                "SELECT status FROM findings WHERE review_cycle_id = ? AND source_id = 'C1'", String.class, fixedRound));
+        assertEquals(PullRequestReview.State.ACTION_REQUIRED, current().state());
+        assertNull(current().baselineCleanSha());
     }
 
     @Test

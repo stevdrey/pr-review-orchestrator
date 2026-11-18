@@ -49,3 +49,7 @@ The follow-up passed 67 focused tests and all 243 tests in `./gradlew clean buil
 ```sh
 ./gradlew test --offline --tests '*FixCorrelationIntegrationTest' --tests '*ReviewStateIntegrationTest' --tests '*ReviewEvidenceIntegrationTest' --tests '*GeneralFeedbackIntegrationTest'
 ```
+
+The inverse regression reproduced a reopened pending finding on `14bc0d0` with `./gradlew test --offline --tests '*FixCorrelationIntegrationTest.historicalResolutionPreservesValidClosureUntilTheSourceRevisionChanges'`. The guard now recovers the matching-head observation for the same source revision from retained evidence. The regression covers historical refreshes of both occurrences, a finding first seen in a historical read, and a source edit that reopens the finding and revokes clean readiness.
+
+The same focused command passed 69 tests, and `./gradlew clean build --offline` passed all 245 tests with Java 27 and disposable PostgreSQL. Both runs had zero failures, errors or skipped tests.
