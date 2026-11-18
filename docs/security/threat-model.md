@@ -34,6 +34,8 @@ Malformed/signature mismatch; delivery replay; concurrent identical events; comm
 
 ## Data retention
 
+Issue #19's [internal review-outcome boundary](../development/review-outcomes.md) treats provider prose and approval state as insufficient clean evidence. Clean recording requires a correlated structured completion, exact reviewed SHA, explicit stage and current finding assessment. Expected aggregate version/SHA and transactional authorization/general-feedback checks protect local commits; they do not authenticate remote completion or detect unobserved GitHub changes. Approved input-gathering adapters remain required. No external endpoint, provider invocation, privileged action or budget authority is added.
+
 Prefer event metadata and references over storing full PR source. Document retention, privacy and deletion policies before launch. Never include access tokens or raw private diffs in public issue comments or log snapshots.
 
 The initial PostgreSQL schema stores metadata, hashes and optional references rather than raw event/review bodies. A reference must not contain a credential or signed access URL. Local Compose binds to `127.0.0.1` with disposable, explicitly non-production credentials; the image's bootstrap user is a database superuser for local development only. Real deployments require separately provisioned credentials, least-privilege application/migration roles, encrypted transport/storage, backups and retention policy. No production database deployment is supplied here.

@@ -91,43 +91,58 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     @Override
     public PullRequestReview apply(PullRequestId pr, ReviewTransition command, Runnable authorize) {
         java.util.Objects.requireNonNull(command);
+        return locked(pr, authorize, () -> applyLocked(pr, command, null));
+    }
+
+    /** Shared bounded, authorized, PR-serialized transaction with sanitized failures for persistence adapters. */
+    <T> T locked(PullRequestId pr, Runnable authorize, Supplier<T> operation) {
         return transaction(authorize, () -> {
             PostgresLocks.lockPr(jdbc, pr);
-            PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
-            String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
-                    ? command.newHeadSha() : command.expectedHeadSha();
-            var replays = jdbc.query("""
-                    SELECT expected_version = ? AND expected_head_sha = ? AND action = ? AND resulting_head_sha = ?
-                    FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
-                    AND pr_number = ? AND transition_id = ?
-                    """, (rs, row) -> rs.getBoolean(1), command.expectedVersion(), command.expectedHeadSha(),
-                    command.action().name(), resultingHead, pr.scope().installationId(), pr.scope().repositoryId(),
-                    pr.number(), command.id());
-            // A UUID reused for a different command must not be mistaken for an already-committed retry.
-            if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
-            PullRequestReview next = current.transition(command);
-            // After domain validation so stale/illegal commands keep their own conflict codes.
-            if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
-                    || command.action() == ReviewTransition.Action.DEEP_CLEAN
-                    || command.action() == ReviewTransition.Action.MARK_READY_FOR_HUMAN)
-                    && JdbcGeneralFeedbackStore.blocking(jdbc, pr, current.headSha())) {
-                throw new ReviewConflict(GUARD_REJECTED);
-            }
-            jdbc.update("""
-                    UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,
-                    baseline_clean_sha = ?, deep_clean_sha = ?
-                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
-                    """, next.headSha(), next.version(), next.state().name(),
-                    next.resumeState() == null ? null : next.resumeState().name(), next.baselineCleanSha(), next.deepCleanSha(),
-                    pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
-            jdbc.update("""
-                    INSERT INTO pr_review_transitions (installation_id, repository_id, pr_number, transition_id,
-                        expected_version, expected_head_sha, action, resulting_version, resulting_head_sha, resulting_state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), command.id(),
-                    command.expectedVersion(), command.expectedHeadSha(), command.action().name(),
-                    next.version(), next.headSha(), next.state().name());
-            return next;
+            return operation.get();
         });
+    }
+
+    /**
+     * Caller holds the PR lock and authorized transaction; validation runs before any write.
+     * A supplied evidence guard must prove no pending findings; it replaces the default pending-findings query.
+     */
+    PullRequestReview applyLocked(PullRequestId pr, ReviewTransition command, Runnable evidenceGuard) {
+        PullRequestReview current = load(pr, true).orElseThrow(() -> new ReviewConflict(NOT_FOUND));
+        String resultingHead = command.action() == ReviewTransition.Action.UPDATE_HEAD
+                ? command.newHeadSha() : command.expectedHeadSha();
+        var replays = jdbc.query("""
+                SELECT expected_version = ? AND expected_head_sha = ? AND action = ? AND resulting_head_sha = ?
+                FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
+                AND pr_number = ? AND transition_id = ?
+                """, (rs, row) -> rs.getBoolean(1), command.expectedVersion(), command.expectedHeadSha(),
+                command.action().name(), resultingHead, pr.scope().installationId(), pr.scope().repositoryId(),
+                pr.number(), command.id());
+        // A UUID reused for a different command must not be mistaken for an already-committed retry.
+        if (!replays.isEmpty()) throw new ReviewConflict(replays.getFirst() ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
+        PullRequestReview next = current.transition(command);
+        // After domain validation so stale/illegal commands keep their own conflict codes.
+        if (evidenceGuard != null) {
+            evidenceGuard.run();
+        } else if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
+                || command.action() == ReviewTransition.Action.DEEP_CLEAN
+                || command.action() == ReviewTransition.Action.MARK_READY_FOR_HUMAN)
+                && JdbcGeneralFeedbackStore.blocking(jdbc, pr, current.headSha())) {
+            throw new ReviewConflict(GUARD_REJECTED);
+        }
+        jdbc.update("""
+                UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,
+                baseline_clean_sha = ?, deep_clean_sha = ?
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                """, next.headSha(), next.version(), next.state().name(),
+                next.resumeState() == null ? null : next.resumeState().name(), next.baselineCleanSha(), next.deepCleanSha(),
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
+        jdbc.update("""
+                INSERT INTO pr_review_transitions (installation_id, repository_id, pr_number, transition_id,
+                    expected_version, expected_head_sha, action, resulting_version, resulting_head_sha, resulting_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), command.id(),
+                command.expectedVersion(), command.expectedHeadSha(), command.action().name(),
+                next.version(), next.headSha(), next.state().name());
+        return next;
     }
 }

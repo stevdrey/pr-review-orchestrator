@@ -24,6 +24,8 @@ Issue #18 implements the narrow internal `ReviewProvider.request(ReviewRequest)`
 
 Other proposed operations: `requestReview(ReviewRequest)`, `getReviewOutcome(ProviderReference)`, `summarizeFindings(ReviewContext)`. Providers can be async; commands must carry idempotency key, review stage, budget reservation and expected head SHA. No generic provider contract should require a human login or a fixed model name.
 
+Issue #19 supplies the [internal outcome classifier and clean-recording boundary](../development/review-outcomes.md). PostgreSQL validates request/cycle/provider/stage/SHA correlation and retained findings against persisted evidence, with atomic clean provenance. An approved caller must establish authenticated completion/reviewer identity and ingest complete current remote evidence. Structured completion is distinct from a comment receipt or GitHub approval; unsupported/unstructured results cannot advance. Live Codex completion retrieval and remote input gathering are not supplied.
+
 ## AgentEventPublisher / MCP
 
 An optional adapter may expose read-only PR status and controlled actions via MCP tools, and publish subscribed domain events to compatible platforms (including Dots/Work **only after a real capability test**). The application is event-driven regardless of MCP client availability.

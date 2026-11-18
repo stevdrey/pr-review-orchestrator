@@ -2,7 +2,7 @@
 
 > Event-driven, provider-neutral pull request review orchestration.
 
-**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; durable dispatch infrastructure now exists behind an opt-in switch requiring approved planning/command adapters. An internal persistent PR review state machine enforces versioned transitions and SHA-bound clean evidence. Internal review evidence normalization preserves source revisions and stable finding identities across rounds. General PR feedback now has conservative classification, audited internal dispositions and persisted clean-stage guards. An internal Codex user-comment adapter now provides durable request deduplication and fail-closed capability gates; live review orchestration remains disabled pending approved OAuth and accounting/budget integrations.
+**Project status:** Initial application bootstrap with PostgreSQL and opt-in GitHub App authentication/installation authorization. Opt-in signed webhook ingress now persists authorized routing metadata; durable dispatch infrastructure now exists behind an opt-in switch requiring approved planning/command adapters. An internal persistent PR review state machine enforces versioned transitions and SHA-bound clean evidence. Internal review evidence normalization preserves source revisions and stable finding identities across rounds. General PR feedback now has conservative classification, audited internal dispositions and persisted clean-stage guards. An internal Codex user-comment adapter now provides durable request deduplication and fail-closed capability gates; internal conservative review outcomes now validate persisted request/cycle/evidence correlation and record clean provider/stage/SHA provenance. Live review orchestration remains disabled pending approved completion, OAuth and accounting/budget integrations.
 
 PR Review Orchestrator is an independent open-source project to coordinate GitHub pull request reviews, CI events, remediation feedback and AI agents. The first target repositories are [Dokene](https://github.com/stevdrey/dokene) and [Monada Neuron](https://github.com/stevdrey/monada-neuron), but the architecture is repository-agnostic.
 
@@ -66,6 +66,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [Inline review evidence, stable identities and ingestion limits](docs/development/review-evidence.md)
 - [General feedback, audited dispositions and stage guards](docs/development/general-feedback.md)
 - [Codex review requests, deduplication and activation prerequisites](docs/development/codex-review-requests.md)
+- [Conservative review outcomes and completion trust contract](docs/development/review-outcomes.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Codex attribution spike and test protocol](docs/spikes/issue-14-codex-attribution.md)
