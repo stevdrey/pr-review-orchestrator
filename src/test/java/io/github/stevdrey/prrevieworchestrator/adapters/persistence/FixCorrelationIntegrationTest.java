@@ -13,6 +13,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback.Dispositio
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.State;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
@@ -22,6 +23,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,11 +31,13 @@ import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.*;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.*;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -491,6 +495,7 @@ class FixCorrelationIntegrationTest {
                 assertThrows(ReviewRequestFailure.class, () -> requests.reserve(renewed, 1, 1, guards)).code());
         var renewedReservation = requests.reserve(renewed, 1, 6, guards);
         assertTrue(renewedReservation.created());
+        requests.send(renewed, renewedReservation.id(), guards, () -> new Receipt(84, true));
         var renewedReplay = requests.reserve(renewed, 1, 6, guards);
         assertFalse(renewedReplay.created());
         assertEquals(renewedReservation.id(), renewedReplay.id());
@@ -525,9 +530,11 @@ class FixCorrelationIntegrationTest {
                 String.class, reservation.id()));
     }
 
+    enum LegacyReservationTiming { AFTER_RETURN, TIMESTAMP_TIE, BEFORE_RETURN_COMMIT }
+
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void v8ReservationForAnAlreadyJournaledReturnSurvivesUpgrade(boolean tiedTimestamp) {
+    @EnumSource(LegacyReservationTiming.class)
+    void v8ReservationForAnAlreadyJournaledReturnSurvivesUpgrade(LegacyReservationTiming timing) throws Exception {
         var rootJdbc = jdbc;
         String schema = "request_visit_upgrade";
         String url = POSTGRES.getJdbcUrl();
@@ -541,32 +548,38 @@ class FixCorrelationIntegrationTest {
             step(START_REVIEW, READY);
             step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
             step(AWAIT_FIX, READY);
-            push(BASE);
-            long epoch = current().version();
-            settlePushes();
             UUID requestId = UUID.randomUUID();
+            UUID permitId = UUID.randomUUID();
             var legacy = new ReviewRequest(PR, BASE, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
-            Timestamp reservedAt = tiedTimestamp
-                    ? jdbc.queryForObject("SELECT occurred_at FROM pr_review_transitions WHERE resulting_version = ?", Timestamp.class, epoch)
-                    : jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
-            jdbc.update("""
-                    INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                        head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
-                    VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 42, ?, clock_timestamp())
-                    """, requestId, legacy.key(), BASE, reservedAt);
+            var legacyPermit = new ReviewRequest(PR, BASE, "BASELINE", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+            if (timing == LegacyReservationTiming.BEFORE_RETURN_COMMIT) {
+                reserveWhileLegacyReturnWaits(requestId, legacy, permitId, legacyPermit);
+            } else {
+                push(BASE);
+                settlePushes();
+                Timestamp reservedAt = timing == LegacyReservationTiming.TIMESTAMP_TIE
+                        ? jdbc.queryForObject("SELECT occurred_at FROM pr_review_transitions WHERE resulting_version = ?",
+                                Timestamp.class, current().version())
+                        : jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
+                insertLegacyReservations(requestId, legacy, permitId, legacyPermit, reservedAt);
+            }
+            long epoch = current().version();
 
             Flyway.configure().dataSource(dataSource).schemas(schema).load().migrate();
             assertTrue(ingestion.ingest(snapshot(0, inline(false))));
-            assertEquals(ALREADY_REQUESTED, assess(BASE, new Comparison(FIRST, BASE, true)).status());
+            if (timing != LegacyReservationTiming.BEFORE_RETURN_COMMIT) {
+                assertEquals(ALREADY_REQUESTED, assess(BASE, new Comparison(FIRST, BASE, true)).status());
+            }
             var currentRequest = new ReviewRequest(PR, BASE, "BASELINE", "github",
                     ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
-            var duplicate = new JdbcReviewRequestStore(jdbc, transactions).reserve(currentRequest, 1, 6,
-                    () -> authorization.requireAuthorized(PR.scope()));
+            var requests = new JdbcReviewRequestStore(jdbc, transactions);
+            Runnable authorize = () -> authorization.requireAuthorized(PR.scope());
+            var duplicate = requests.reserve(currentRequest, 1, 6, authorize);
             assertFalse(duplicate.created());
             assertEquals(requestId, duplicate.id());
             assertEquals(legacy.key(), jdbc.queryForObject("SELECT request_key FROM review_requests WHERE id = ?",
                     String.class, requestId));
-            assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+            assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
 
             jdbc.update("""
                     UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Fixture'
@@ -581,11 +594,61 @@ class FixCorrelationIntegrationTest {
             var run = new ReviewOutcome.Run(PR, BASE, "github", ReviewOutcome.Stage.BASELINE, requestId, cycle, "github", "reviewer");
             var completion = new ReviewOutcome.Completion(run, "review", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS);
             var outcomes = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, new JdbcReviewStateStore(jdbc, transactions)), authorization);
-            assertEquals(tiedTimestamp ? ReviewOutcome.Verdict.UNKNOWN : ReviewOutcome.Verdict.CLEAN_FOR_SHA,
-                    outcomes.assess(new ReviewOutcome.Assessment(run, current().version(), completion, snapshot.id())).verdict());
+            var assessment = new ReviewOutcome.Assessment(run, current().version(), completion, snapshot.id());
+            assertAll(
+                    () -> assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict()),
+                    () -> assertEquals(ReviewConflict.Code.GUARD_REJECTED, assertThrows(ReviewConflict.class,
+                            () -> outcomes.recordClean(assessment, UUID.randomUUID(), READY)).code()),
+                    () -> assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
+                            () -> requests.send(legacyPermit, permitId, authorize, () -> new Receipt(43, true))).code()));
+            var currentPermit = new ReviewRequest(PR, BASE, "BASELINE", "codex",
+                    ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
+            var duplicatePermit = requests.reserve(currentPermit, 1, 6, authorize);
+            assertFalse(duplicatePermit.created());
+            assertEquals(permitId, duplicatePermit.id());
+            assertEquals(State.NOT_SENT, duplicatePermit.state());
         } finally {
             rootJdbc.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
         }
+    }
+
+    private void reserveWhileLegacyReturnWaits(UUID requestId, ReviewRequest legacy, UUID permitId,
+            ReviewRequest legacyPermit) throws Exception {
+        var state = current();
+        var returned = new ReviewTransition(UUID.randomUUID(), state.version(), state.headSha(), UPDATE_HEAD, BASE, READY);
+        var states = new JdbcReviewStateStore(jdbc, transactions);
+        var started = new CompletableFuture<Timestamp>();
+        try (var worker = Executors.newSingleThreadExecutor()) {
+            var returning = new TransactionTemplate(transactions).execute(status -> {
+                PostgresLocks.lockPr(jdbc, PR);
+                var pending = worker.submit(() -> states.locked(PR, () -> {
+                    authorization.requireAuthorized(PR.scope());
+                    started.complete(jdbc.queryForObject("SELECT now()", Timestamp.class));
+                }, () -> states.applyLocked(PR, returned, null)));
+                Timestamp transactionStart = started.orTimeout(2, TimeUnit.SECONDS).join();
+                // V8 records now() in the blocked transaction and clock_timestamp() for the reservation.
+                Timestamp reservedAt = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
+                assertTrue(reservedAt.after(transactionStart));
+                insertLegacyReservations(requestId, legacy, permitId, legacyPermit, reservedAt);
+                return pending;
+            });
+            var next = returning.get(5, TimeUnit.SECONDS);
+            assertEquals(BASE, next.headSha());
+            assertTrue(jdbc.queryForObject("""
+                    SELECT r.created_at > t.occurred_at FROM review_requests r CROSS JOIN pr_review_transitions t
+                    WHERE r.id = ? AND t.transition_id = ?
+                    """, Boolean.class, requestId, returned.id()));
+        }
+    }
+
+    private void insertLegacyReservations(UUID requestId, ReviewRequest legacy, UUID permitId, ReviewRequest legacyPermit,
+            Timestamp reservedAt) {
+        jdbc.update("""
+                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
+                VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 42, ?, clock_timestamp()),
+                       (?, ?, 101, 1001, 7, ?, 'BASELINE', 'codex', 1, 'RESERVED', NULL, ?, NULL)
+                """, requestId, legacy.key(), BASE, reservedAt, permitId, legacyPermit.key(), BASE, reservedAt);
     }
 
     @Test

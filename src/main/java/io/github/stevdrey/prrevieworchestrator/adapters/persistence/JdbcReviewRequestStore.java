@@ -16,14 +16,6 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailur
  * Never delete reservations/redrive unknown effects: an absent comment search cannot prove absence.
  */
 public final class JdbcReviewRequestStore implements ReviewRequestStore {
-    // A timestamp tie preserves the tombstone but is insufficient to prove that an old permit belongs to the new visit.
-    static final String CONFIRMED_VISIT = """
-            (r.reconciled_head_epoch IS NULL OR EXISTS (
-                SELECT 1 FROM pr_review_transitions t
-                WHERE (t.installation_id, t.repository_id, t.pr_number) = (r.installation_id, r.repository_id, r.pr_number)
-                    AND t.resulting_version = r.reconciled_head_epoch AND r.created_at > t.occurred_at))
-            """;
-
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     public JdbcReviewRequestStore(JdbcTemplate jdbc, PlatformTransactionManager manager) {
@@ -53,7 +45,8 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     State.valueOf(rs.getString("state")), false), request.key());
             // The caller authorizes duplicate reads; only a new reservation needs policy/budget approval.
             if (!existing.isEmpty()) return existing.getFirst();
-            requireCurrentVisit(request, request.headEpoch());
+            requireCurrentVisit(request);
+            // A V13 match preserves deduplication. Only the epoch in the original key authorizes a send.
             var reconciled = jdbc.query("""
                     SELECT id, state FROM review_requests
                     WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ?
@@ -86,7 +79,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
                         id, request.key());
                 if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-                requireCurrentPermit(request, id);
+                requireCurrentVisit(request);
                 return null;
             });
         } catch (RuntimeException failure) {
@@ -104,7 +97,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 var states = jdbc.query("SELECT state FROM review_requests WHERE id = ? AND request_key = ? FOR UPDATE",
                         (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
                 if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-                requireCurrentPermit(request, id);
+                requireCurrentVisit(request);
                 Receipt receipt = effect.get();
                 effectReturned.set(true);
                 if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
@@ -123,23 +116,14 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         }
     }
 
-    private void requireCurrentPermit(ReviewRequest request, UUID id) {
-        var epochs = jdbc.query("""
-                SELECT coalesce(r.reconciled_head_epoch, r.head_epoch) FROM review_requests r
-                WHERE r.id = ? AND
-                """ + CONFIRMED_VISIT, (rs, row) -> rs.getLong(1), id);
-        if (epochs.isEmpty()) throw new ReviewRequestFailure(STALE_HEAD);
-        requireCurrentVisit(request, epochs.getFirst());
-    }
-
-    private void requireCurrentVisit(ReviewRequest request, long epoch) {
+    private void requireCurrentVisit(ReviewRequest request) {
         var pr = request.pr();
         // Standalone callers can still use epoch 0 before the lifecycle tracks the PR.
         boolean departed = Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM pr_review_states
                     WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha <> ?)
                 """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), request.headSha()));
-        if (departed || epoch != JdbcFixCorrelationStore.headEpoch(jdbc, pr, request.headSha())) {
+        if (departed || request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, pr, request.headSha())) {
             throw new ReviewRequestFailure(STALE_HEAD);
         }
     }

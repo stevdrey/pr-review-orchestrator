@@ -100,11 +100,9 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     AND c.stage = r.stage AND c.review_provider = r.provider
                 WHERE r.id = ? AND c.id = ? AND r.installation_id = ? AND r.repository_id = ? AND r.pr_number = ?
                     AND r.head_sha = ? AND r.stage = ? AND r.provider = ?
-                    AND coalesce(r.reconciled_head_epoch, r.head_epoch) = ?
+                    AND r.head_epoch = ?
                     AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
-                    AND
-                """ + JdbcReviewRequestStore.CONFIRMED_VISIT,
-                (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
+                """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(),
                 run.provider(), JdbcFixCorrelationStore.headEpoch(jdbc, pr, run.headSha()));
         Loaded loaded = loadSnapshot(assessment);

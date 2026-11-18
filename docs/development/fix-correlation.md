@@ -12,7 +12,7 @@ Issue #20 adds the internal Spring bean `CorrelateFixes`. It correlates authoriz
 
 Run the assessment after reconciliation and again at the reported retry time. General dispositions and thread observations can prompt a fresh assessment without restarting the head-change timer. Closed, draft, paused or human-held PRs are ineligible. Stale local versions and head mismatches are rejected. The first visit to a SHA starts at epoch 0, preserving its existing request key. Returning after a journaled departure or confirming the same head starts a new epoch at that transition's journal version. A prior baseline reservation for the current SHA and epoch blocks a second candidate in that epoch. Pass the epoch from the eligible decision as `ReviewRequest.headEpoch`. Stale epochs are rejected before new reservations or sends and cannot establish clean evidence. The lifetime cap includes all reservations across epochs. Durable outbox command keys remain per SHA until provider dispatch is wired.
 
-When lifecycle state exists, reserving or sending requires its tracked SHA to match the request. Both send phases check the tracked SHA and the effective epoch under the PR lock. A remote return to the requested SHA leaves the previous permit blocked until the return is journaled and a current request is reserved.
+When lifecycle state exists, reserving or sending requires its tracked SHA to match the request. Both send phases check the tracked SHA and the epoch in the original request key under the PR lock. A remote return to the requested SHA leaves the previous permit blocked until the return is journaled and a current request is reserved.
 
 ## Persistence and rollout
 
@@ -20,7 +20,7 @@ V10 adds the `CONFIRM_HEAD` journal action and `fix_review_candidates`. A candid
 
 V11 adds the observed PR head to review snapshots. V12 adds `findings.round_observed_at`, the last same-head capture time of an occurrence's current source revision, backfilled from retained evidence. Ingestion writes it, so the pending-findings guard no longer reconstructs it per query. An occurrence that was only seen in another round's read yields to a same-head observation of the identical revision in another round. General findings, dispositions and closed-inline checks already match on the exact source revision. V12 also adds `review_requests.head_epoch`; epoch 0 keeps the existing request keys. V1–V10 checksums and existing evidence are preserved. The quiet period is recovered from the lifecycle journal. Keep the additive schema and audit history for application rollback. Older code assumes the observed head matches the round, so pause review outcome evaluation before rolling back after ingesting historical-round observations with different heads. An approved reconciliation worker must drive the internal use case, fetch fresh GitHub state and recover due assessments after restart. CI reconciliation and iteration policy belong to [issue #21](https://github.com/stevdrey/pr-review-orchestrator/issues/21). Live GitHub fetching, scheduler wiring and provider dispatch require their approved integrations.
 
-V13 associates existing reservations made during an already-journaled active return with that visit's epoch. It preserves the original key, epoch, UUID, receipt and lifetime slot. A request for the reconciled epoch finds the existing reservation. When a reservation and the return have identical timestamps, the reservation suppresses duplicates and awaits reconciliation for sending or clean evidence. Reservations that predate the return remain associated with their earlier visit. Use the upgraded application for these effective-epoch checks.
+V13 associates existing reservations with a plausible journaled return for deduplication. It preserves the original key, epoch, UUID, receipt and lifetime slot. A request for the reconciled epoch finds the existing reservation. Before V9, a return transition's timestamp came from transaction start, which could precede its acquisition of the PR lock. Existing rows have no durable provenance for that timestamp's ordering guarantee. An inferred V13 association therefore serves only as a deduplication record. Sending and clean evidence require the current epoch in the reservation's original key and stored epoch. Keep the original rows for audit and reconciliation.
 
 ## Verification
 
@@ -85,3 +85,15 @@ The regressions reproduced an external-effect attempt after a journaled departur
 ```
 
 On 2026-11-18 the focused suite passed 103 tests and the full build passed 254 tests with Java 27 and disposable PostgreSQL. Both runs had zero failures, errors or skips.
+
+### Transaction ordering of legacy reservations
+
+A PostgreSQL regression on V8 holds the PR lock while the return transaction starts. It commits a reservation before the return can acquire the lock. The return still records its earlier transaction-start timestamp. The test reproduced both an accepted clean verdict and a permitted send on `6e7566d`. After the fix, the original rows continue to suppress duplicates after upgrade. Both send and clean evidence use the explicitly recorded request epoch. The tests also cover tied timestamps and a new send in a valid epoch.
+
+```sh
+./gradlew test --offline --tests '*FixCorrelationIntegrationTest.v8ReservationForAnAlreadyJournaledReturnSurvivesUpgrade'
+./gradlew test --offline --tests '*FixCorrelationIntegrationTest' --tests '*ReviewRequestIntegrationTest' --tests '*ReviewStateIntegrationTest'
+./gradlew clean build --offline
+```
+
+On 2026-11-18 the focused suite passed 55 tests and the full build passed 255 tests with Java 27 and disposable PostgreSQL. Both runs had zero failures, errors or skips.
