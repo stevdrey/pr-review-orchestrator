@@ -7,7 +7,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview;
 import java.util.UUID;
 
 public interface FixCorrelationStore {
-    /** Journal a fresh synchronize observation once. True only when it actually changes the head. */
+    /** Journal a fresh synchronize observation once. True when this delivery changed the head, also on replay. */
     boolean observeHead(UUID delivery, PullRequestReview expected, Head current, Runnable authorize);
 
     /** Evaluate and record eligibility under the same authorized PR transaction. */

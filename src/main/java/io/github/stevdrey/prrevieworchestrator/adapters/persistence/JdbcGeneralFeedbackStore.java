@@ -91,29 +91,12 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 ), pending_general AS (
                     SELECT * FROM general WHERE decision IS DISTINCT FROM 'DISMISSED'
                 ), inline_findings AS (
-                    SELECT f.stable_finding_id, f.status,
-                        CASE WHEN latest.observed_head_sha IS NULL OR latest.observed_head_sha = latest.head_sha
-                            THEN latest.captured_at ELSE revision.at_round END AS at_round,
-                        coalesce(revision.first_seen, latest.captured_at) AS first_seen
+                    -- round_observed_at is written at ingest; the joins below are primary-key lookups.
+                    SELECT f.stable_finding_id, f.status, f.round_observed_at AS at_round,
+                        latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
                     FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
                     LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
-                    -- A historical refresh changes the metadata link. Recover the observation times for its source revision.
-                    LEFT JOIN LATERAL (
-                        SELECT max(prior.captured_at) FILTER (
-                                   WHERE prior.observed_head_sha IS NULL OR prior.observed_head_sha = prior.head_sha) AS at_round,
-                               min(prior.captured_at) AS first_seen
-                        FROM review_evidence_snapshots prior
-                        JOIN review_evidence_sources old_source ON old_source.snapshot_id = prior.id AND old_source.source_id = f.source_id
-                        JOIN review_evidence_sources latest_source
-                            ON latest_source.snapshot_id = latest.id AND latest_source.source_id = f.source_id
-                        WHERE latest.observed_head_sha <> latest.head_sha
-                            AND prior.review_cycle_id = f.review_cycle_id AND prior.provider = f.source_provider
-                            AND prior.captured_at <= latest.captured_at
-                            AND old_source.source_kind = f.source_kind AND old_source.reply_to_id IS NULL
-                            AND old_source.body_sha256 = latest_source.body_sha256
-                            AND old_source.source_updated_at IS NOT DISTINCT FROM latest_source.source_updated_at
-                            AND old_source.feedback = latest_source.feedback
-                    ) revision ON true
+                    LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
                         AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD')
                 )
@@ -123,7 +106,12 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     WHERE f.status IN ('OPEN', 'ACKNOWLEDGED')
                         AND NOT EXISTS (
                             SELECT 1 FROM inline_findings n WHERE n.stable_finding_id = f.stable_finding_id
-                                AND n.at_round > coalesce(f.at_round, f.first_seen)))
+                                AND (n.at_round > coalesce(f.at_round, f.linked_at)
+                                    -- A copy only seen in another round's read yields to a same-head
+                                    -- observation of the identical source revision.
+                                    OR (f.at_round IS NULL AND n.at_round IS NOT NULL
+                                        AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
+                                        AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at))))
                 , count(*) > 0, coalesce(bool_or(feedback = 'ACTIONABLE'), false),
                     coalesce(bool_or(decision IS DISTINCT FROM 'CLAIMED'), false)
                 FROM pending_general

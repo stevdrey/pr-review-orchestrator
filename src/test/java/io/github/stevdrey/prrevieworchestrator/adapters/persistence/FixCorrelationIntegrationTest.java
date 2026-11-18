@@ -81,7 +81,7 @@ class FixCorrelationIntegrationTest {
         var first = event("pull_request", "synchronize", FIRST);
         var expected = current();
         assertTrue(correlation.observeSynchronize(first, expected, head(FIRST)));
-        assertFalse(correlation.observeSynchronize(first, expected, head(FIRST)));
+        assertTrue(correlation.observeSynchronize(first, expected, head(FIRST)), "a replay still reports the head change");
         var beforeLast = assess(FIRST, null);
         assertEquals(WAITING_FOR_PUSHES, beforeLast.status());
         assertEquals(0, candidateCount());
@@ -380,6 +380,104 @@ class FixCorrelationIntegrationTest {
         var revoked = new Assessment(head(FIRST), assessment.expectedVersion(), false, changed(FIRST));
         assertThrows(AuthorizationDenied.class, () -> correlation.assess(revoked));
         assertEquals(0, candidateCount());
+    }
+
+    @Test
+    void historicalReadCannotReopenALaterRoundsClosedFindingUntilItsRevisionChanges() {
+        waitingForFix(inline(false));
+        jdbc.update("UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Round decision' WHERE review_cycle_id = ?", cycle);
+        push(FIRST);
+        settlePushes();
+        UUID currentRound = createCycle(FIRST, 2);
+        Source late = inlineSource("late", FIRST, "2");
+        assertTrue(ingestion.ingest(new Snapshot(UUID.randomUUID(), currentRound, PR, "github", FIRST,
+                TIME.plusSeconds(1), List.of(late))));
+        jdbc.update("UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Round decision' WHERE review_cycle_id = ? AND source_id = 'late'", currentRound);
+        assertEquals(NO_PENDING_FINDINGS, assess(FIRST, changed(FIRST)).status());
+
+        // An older round's read emits every PR comment, including one first posted in the later round.
+        var resolved = event("pull_request_review_thread", "resolved", FIRST);
+        assertTrue(correlation.observeThread(resolved, new Snapshot(UUID.randomUUID(), cycle, PR, "github", BASE, FIRST,
+                TIME.plusSeconds(2), List.of(inline(true), late))));
+        assertEquals(Map.of("status", "OPEN"), jdbc.queryForMap("""
+                SELECT status FROM findings WHERE review_cycle_id = ? AND source_id = 'late' AND round_observed_at IS NULL
+                """, cycle));
+        assertEquals(NO_PENDING_FINDINGS, assess(FIRST, changed(FIRST)).status());
+
+        // An edit is a new revision without a same-head closure, so it blocks again.
+        assertTrue(correlation.observeThread(resolved, new Snapshot(UUID.randomUUID(), cycle, PR, "github", BASE, FIRST,
+                TIME.plusSeconds(3), List.of(inline(true), inlineSource("late", FIRST, "3")))));
+        assertEquals(ELIGIBLE, assess(FIRST, changed(FIRST)).status());
+    }
+
+    @Test
+    void historicalReadAtAHeadTheLifecycleLeftIsRejected() {
+        waitingForFix(inline(false));
+        push(FIRST);
+        push(LAST);
+        var resolved = event("pull_request_review_thread", "resolved", FIRST);
+        assertThrows(ReviewEvidence.Conflict.class, () -> correlation.observeThread(resolved, new Snapshot(
+                UUID.randomUUID(), cycle, PR, "github", BASE, FIRST, TIME.plusSeconds(1), List.of(inline(true)))));
+        assertTrue(correlation.observeThread(resolved, new Snapshot(
+                UUID.randomUUID(), cycle, PR, "github", BASE, LAST, TIME.plusSeconds(2), List.of(inline(true)))));
+    }
+
+    @Test
+    void returnToAnEarlierCandidateHeadRecordsANewCandidateForTheCurrentBase() {
+        waitingForFix(inline(false));
+        push(FIRST);
+        settlePushes();
+        var first = assess(FIRST, changed(FIRST));
+        assertEquals(ELIGIBLE, first.status());
+        push(LAST);
+        step(START_REVIEW, READY);
+        step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
+        step(AWAIT_FIX, READY);
+        push(FIRST);
+        settlePushes();
+
+        var returned = assess(FIRST, new Comparison(LAST, FIRST, true));
+        assertEquals(ELIGIBLE, returned.status());
+        assertEquals(LAST, returned.baseSha());
+        assertNotEquals(first.candidateId(), returned.candidateId());
+        assertEquals(LAST, jdbc.queryForObject("SELECT base_sha FROM fix_review_candidates WHERE id = ?",
+                String.class, returned.candidateId()));
+        assertEquals(ALREADY_ELIGIBLE, assess(FIRST, new Comparison(LAST, FIRST, true)).status());
+    }
+
+    @Test
+    void sameHeadConfirmationOpensOneNewRequestEpoch() {
+        waitingForFix(inline(false));
+        push(FIRST);
+        settlePushes();
+        var requests = new JdbcReviewRequestStore(jdbc, transactions);
+        Runnable guards = () -> authorization.requireAuthorized(PR.scope());
+        var legacy = new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+        assertEquals(legacy.key(), new ReviewRequest(PR, FIRST, "BASELINE", "github",
+                ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, 0).key());
+        assertTrue(requests.reserve(legacy, 1, 6, guards).created());
+        step(START_REVIEW, READY);
+
+        assertFalse(correlation.observeSynchronize(event("pull_request", "synchronize", FIRST), current(), head(FIRST)));
+        settlePushes();
+        assertEquals(PullRequestReview.State.WAITING_FOR_REVIEW, current().state());
+        assertEquals(ELIGIBLE, assess(FIRST, changed(FIRST)).status());
+        long epoch = JdbcFixCorrelationStore.headEpoch(jdbc, PR, FIRST);
+        assertTrue(epoch > 0);
+        assertFalse(requests.reserve(legacy, 1, 6, guards).created());
+        assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class, () -> requests.reserve(
+                new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch + 1),
+                1, 6, guards)).code());
+        var renewed = new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
+        assertEquals(legacy.key() + "/" + epoch, renewed.key());
+        assertTrue(requests.reserve(renewed, 1, 6, guards).created());
+        assertFalse(requests.reserve(renewed, 1, 6, guards).created());
+        assertEquals(ALREADY_REQUESTED, assess(FIRST, changed(FIRST)).status());
+    }
+
+    private Source inlineSource(String id, String sha, String digit) {
+        return new Source(id, Kind.REVIEW_COMMENT, null, "thread-" + id, null, "reviewer", sha, sha,
+                digit.repeat(64), TIME, null, false, false, "Example.java", 2, 2, Severity.HIGH);
     }
 
     private CorrelateFixes newCorrelator() {

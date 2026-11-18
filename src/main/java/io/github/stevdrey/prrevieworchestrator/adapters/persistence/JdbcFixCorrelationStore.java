@@ -35,15 +35,17 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
     public boolean observeHead(UUID delivery, PullRequestReview expected, Head head, Runnable authorize) {
         var pr = head.pr();
         return states.locked(pr, authorize, () -> {
+            // Not applyLocked's replay check: a redelivery is re-read after the first commit, so its expected
+            // version no longer matches and would look like a reused ID.
             var previous = jdbc.query("""
-                    SELECT action IN ('UPDATE_HEAD', 'CONFIRM_HEAD') AND resulting_head_sha = ?
+                    SELECT action IN ('UPDATE_HEAD', 'CONFIRM_HEAD') AND resulting_head_sha = ?, action = 'UPDATE_HEAD'
                     FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
                         AND pr_number = ? AND transition_id = ?
-                    """, (rs, row) -> rs.getBoolean(1), head.sha(), pr.scope().installationId(),
+                    """, (rs, row) -> new boolean[] {rs.getBoolean(1), rs.getBoolean(2)}, head.sha(), pr.scope().installationId(),
                     pr.scope().repositoryId(), pr.number(), delivery);
             if (!previous.isEmpty()) {
-                if (!previous.getFirst()) throw new ReviewConflict(TRANSITION_ID_REUSED);
-                return false;
+                if (!previous.getFirst()[0]) throw new ReviewConflict(TRANSITION_ID_REUSED);
+                return previous.getFirst()[1];
             }
 
             boolean changed = !expected.headSha().equals(head.sha());
@@ -93,28 +95,21 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
 
     private Timeline loadTimeline(PullRequestId pr) {
         return jdbc.query("""
-                SELECT s.head_sha, s.version, s.state, fix.resulting_head_sha AS base_sha,
-                    fix.resulting_version AS base_version, head_update.resulting_version AS update_version,
-                    push.occurred_at AS last_push, clock_timestamp() AS now
+                SELECT s.head_sha, s.version, s.state, j.base_sha, j.base_version, j.update_version, j.last_push,
+                    clock_timestamp() AS now
                 FROM pr_review_states s
+                -- One pass over the journal: the last fix base, head update and head observation.
                 LEFT JOIN LATERAL (
-                    SELECT t.resulting_head_sha, t.resulting_version FROM pr_review_transitions t
+                    SELECT (array_agg(t.resulting_head_sha ORDER BY t.resulting_version DESC)
+                               FILTER (WHERE t.action IN ('BLOCKING_FINDINGS', 'AWAIT_FIX')))[1] AS base_sha,
+                           max(t.resulting_version) FILTER (WHERE t.action IN ('BLOCKING_FINDINGS', 'AWAIT_FIX')) AS base_version,
+                           max(t.resulting_version) FILTER (WHERE t.action = 'UPDATE_HEAD') AS update_version,
+                           (array_agg(t.occurred_at ORDER BY t.resulting_version DESC)
+                               FILTER (WHERE t.action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')))[1] AS last_push
+                    FROM pr_review_transitions t
                     WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
-                        AND t.action IN ('BLOCKING_FINDINGS', 'AWAIT_FIX')
-                    ORDER BY t.resulting_version DESC LIMIT 1
-                ) fix ON true
-                LEFT JOIN LATERAL (
-                    SELECT t.resulting_version FROM pr_review_transitions t
-                    WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
-                        AND t.action = 'UPDATE_HEAD'
-                    ORDER BY t.resulting_version DESC LIMIT 1
-                ) head_update ON true
-                LEFT JOIN LATERAL (
-                    SELECT t.occurred_at FROM pr_review_transitions t
-                    WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
-                        AND t.action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')
-                    ORDER BY t.resulting_version DESC LIMIT 1
-                ) push ON true
+                        AND t.action IN ('BLOCKING_FINDINGS', 'AWAIT_FIX', 'UPDATE_HEAD', 'CONFIRM_HEAD')
+                ) j ON true
                 WHERE s.installation_id = ? AND s.repository_id = ? AND s.pr_number = ?
                 """, (rs, row) -> {
             Timestamp lastPush = rs.getTimestamp("last_push");
@@ -128,16 +123,29 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
     private boolean requested(PullRequestId pr, String head) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM review_requests
-                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND stage = 'BASELINE')
-                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head));
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND stage = 'BASELINE'
+                        AND head_epoch = ?)
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
+                headEpoch(jdbc, pr, head)));
+    }
+
+    /** Request epoch of a head: the version of its last same-head confirmation, or 0. Caller holds the PR lock. */
+    static long headEpoch(JdbcTemplate jdbc, PullRequestId pr, String head) {
+        Long epoch = jdbc.queryForObject("""
+                SELECT coalesce(max(resulting_version), 0) FROM pr_review_transitions
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                    AND action = 'CONFIRM_HEAD' AND resulting_head_sha = ?
+                """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head);
+        return epoch == null ? 0 : epoch;
     }
 
     private Decision recordCandidate(PullRequestId pr, Timeline timeline) {
         var existing = jdbc.query("""
                 SELECT id FROM fix_review_candidates
-                WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ?
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND head_version = ?
                 """, (rs, row) -> rs.getObject(1, UUID.class),
-                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), timeline.headSha());
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), timeline.headSha(),
+                timeline.updateVersion());
         if (!existing.isEmpty()) return new Decision(ALREADY_ELIGIBLE, timeline.baseSha(), null, existing.getFirst());
 
         UUID id = UUID.randomUUID();

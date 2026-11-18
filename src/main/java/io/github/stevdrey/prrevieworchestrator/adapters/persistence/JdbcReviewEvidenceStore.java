@@ -37,6 +37,10 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                     verified_at = CASE WHEN %1$s THEN findings.verified_at END,
                     disposition_actor = CASE WHEN %1$s THEN findings.disposition_actor END,
                     disposition_reason = CASE WHEN %1$s THEN findings.disposition_reason END,
+                    -- Keep the last same-head time of an unchanged revision; a cross-head read adds none.
+                    round_observed_at = CASE WHEN %1$s
+                        THEN coalesce(excluded.round_observed_at, findings.round_observed_at)
+                        ELSE excluded.round_observed_at END,
                     evidence_snapshot_id = excluded.evidence_snapshot_id
                 WHERE findings.evidence_snapshot_id IS NULL OR
                     (SELECT captured_at FROM review_evidence_snapshots WHERE id = findings.evidence_snapshot_id) <
@@ -77,6 +81,16 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                 """, (rs, row) -> rs.getObject(1, UUID.class), snapshot.cycleId(), pr.scope().installationId(),
                 pr.scope().repositoryId(), pr.number(), snapshot.headSha());
         if (cycles.isEmpty()) throw new Conflict();
+        // A read at another PR head is outdated once the lifecycle has journaled a move away from that head.
+        // A head not yet journaled may still lead its pending synchronize and is accepted.
+        if (!snapshot.headSha().equals(snapshot.observedHeadSha()) && Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM pr_review_states s WHERE s.installation_id = ? AND s.repository_id = ?
+                    AND s.pr_number = ? AND s.head_sha <> ?
+                    AND EXISTS (SELECT 1 FROM pr_review_transitions t
+                        WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
+                            AND ? IN (t.expected_head_sha, t.resulting_head_sha)))
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                snapshot.observedHeadSha(), snapshot.observedHeadSha()))) throw new Conflict();
         var existing = jdbc.queryForList("SELECT fingerprint, fingerprint_version FROM review_evidence_snapshots WHERE id = ?", snapshot.id());
         if (!existing.isEmpty()) {
             var previous = existing.getFirst();
@@ -124,6 +138,8 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     private void projectFindings(Snapshot snapshot, List<Source> candidates) {
         var pr = snapshot.pr();
+        Timestamp roundObservedAt = snapshot.headSha().equals(snapshot.observedHeadSha())
+                ? Timestamp.from(snapshot.capturedAt()) : null;
         // DO NOTHING avoids rewriting (and locking) unchanged identity rows on every observation.
         jdbc.batchUpdate("""
                 INSERT INTO finding_identities (id, installation_id, repository_id, pr_number, provider, source_kind, source_id)
@@ -145,12 +161,13 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         jdbc.batchUpdate("""
                 INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha,
                     source_provider, source_kind, source_id, thread_id, body_ref, severity, thread_resolved,
-                    stable_finding_id, evidence_snapshot_id, pr_number)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stable_finding_id, evidence_snapshot_id, pr_number, round_observed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """ + UPDATE_FINDING, candidates.stream().map(source -> new Object[] {UUID.randomUUID(),
                 snapshot.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(), snapshot.headSha(),
                 snapshot.provider(), source.kind().name(), source.id(), source.threadId(), "github-node:" + source.id(),
-                source.severity().name(), source.resolved(), identities.get(source.id()), snapshot.id(), pr.number()}).toList());
+                source.severity().name(), source.resolved(), identities.get(source.id()), snapshot.id(), pr.number(),
+                roundObservedAt}).toList());
     }
 
     /** A delayed first candidate must also track newer blank revisions already retained in other reads/rounds. */
@@ -164,15 +181,17 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         jdbc.update("""
                 INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha,
                     source_provider, source_kind, source_id, thread_id, body_ref, severity, thread_resolved,
-                    stable_finding_id, evidence_snapshot_id, pr_number)
+                    stable_finding_id, evidence_snapshot_id, pr_number, round_observed_at)
                 SELECT gen_random_uuid(), latest.review_cycle_id, latest.installation_id, latest.repository_id,
                     latest.head_sha, latest.provider, latest.source_kind, latest.source_id, NULL,
                     'github-node:' || latest.source_id, latest.severity, NULL, latest.stable_finding_id,
-                    latest.snapshot_id, latest.pr_number
+                    latest.snapshot_id, latest.pr_number, latest.round_observed_at
                 FROM (
                     SELECT DISTINCT ON (o.review_cycle_id, s.source_kind, s.source_id)
                         o.review_cycle_id, o.installation_id, o.repository_id, o.pr_number, o.head_sha, o.provider,
-                        s.source_kind, s.source_id, s.severity, s.snapshot_id, i.id AS stable_finding_id
+                        s.source_kind, s.source_id, s.severity, s.snapshot_id, i.id AS stable_finding_id,
+                        CASE WHEN o.observed_head_sha IS NULL OR o.observed_head_sha = o.head_sha
+                            THEN o.captured_at END AS round_observed_at
                     FROM review_evidence_sources s
                     JOIN review_evidence_snapshots o ON o.id = s.snapshot_id
                     JOIN finding_identities i ON i.installation_id = o.installation_id

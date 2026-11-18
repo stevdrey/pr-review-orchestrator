@@ -45,6 +45,10 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     State.valueOf(rs.getString("state")), false), request.key());
             // The caller authorizes duplicate reads; only a new reservation needs policy/budget approval.
             if (!existing.isEmpty()) return existing.getFirst();
+            // Under the PR lock: a confirmation of the same head opens exactly one new epoch for it.
+            if (request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, request.pr(), request.headSha())) {
+                throw new ReviewRequestFailure(STALE_HEAD);
+            }
             guards.run();
             Integer count = jdbc.queryForObject("""
                     SELECT count(*) FROM review_requests WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
@@ -53,9 +57,10 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             UUID id = UUID.randomUUID();
             jdbc.update("""
                     INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                        head_sha, stage, provider, actor_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        head_sha, stage, provider, actor_id, head_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, id, request.key(), request.pr().scope().installationId(), request.pr().scope().repositoryId(),
-                    request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId);
+                    request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId,
+                    request.headEpoch());
             return new Reservation(id, State.RESERVED, true);
         });
     }

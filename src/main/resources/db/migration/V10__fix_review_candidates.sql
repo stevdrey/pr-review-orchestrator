@@ -14,7 +14,8 @@ CREATE TABLE fix_review_candidates (
     base_sha text NOT NULL CHECK (base_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$' AND base_sha <> head_sha),
     head_version bigint NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    UNIQUE (installation_id, repository_id, pr_number, head_sha),
+    -- head_version fixes the base: a later fix transition at the same head yields no candidate.
+    UNIQUE (installation_id, repository_id, pr_number, head_sha, head_version),
     FOREIGN KEY (installation_id, repository_id, pr_number, head_version)
         REFERENCES pr_review_transitions (installation_id, repository_id, pr_number, resulting_version)
 );
