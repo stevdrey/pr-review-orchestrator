@@ -28,7 +28,7 @@ For remediation, [issue #20's correlation use case](../development/fix-correlati
 
 ## Iteration policy
 
-Default **proposal**: max six automatic review requests per PR across the configured review loop. Count failed/retried external requests separately from successful review cycles so retries cannot bypass quota. Stop on lack of progress, repeated identical findings, budget exhaustion, unresolved authentication, stale head or incomplete webhook interpretation. Additional runs require documented operator approval and separate budget.
+[The internal iteration policy](../development/ci-and-iteration-policy.md) starts with six automatic request slots per PR across providers and stages. Persisted reservations count even when a send fails or its outcome is uncertain. Exhaustion and identical findings in consecutive authenticated rounds pause the PR for human triage. Financial approval and budget enforcement remain separate.
 
 ## Verdict contract
 

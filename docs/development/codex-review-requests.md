@@ -64,6 +64,10 @@ PR lock. Both send phases require the current epoch in the original reservation
 key. A V13 association preserves the original key and receipt and suppresses
 duplicate reservations. Its timestamps alone do not authorize a send.
 
+V14 assigns every reservation a durable iteration slot. Before a re-review reservation
+and at the send boundary, the store checks [reconciled CI on the current head](ci-and-iteration-policy.md).
+An exhausted limit persists a pause so the operator can see why the request stopped.
+
 1. Serialize reservations per PR, check live authorization/policy and lifetime cap,
    then commit `RESERVED`. Failed preflight after this point conservatively consumes
    a slot; repeated delivery cannot create a second reservation or budget charge.
@@ -117,6 +121,8 @@ there is no user-facing action endpoint yet.
 | `CAPABILITY_UNVERIFIED` | Verify account connection, supported user trigger, consent, entitlement and individual accounting. An account-connection reply is failure evidence, not a retry instruction. |
 | `ACTOR_DENIED` | Reauthorize the intended App user; verify stable actor, installation/repository binding and expiry. |
 | `PR_NOT_READY` / `STALE_HEAD` | Fetch authoritative PR state; never reuse old SHA evidence. Existing reservation remains a tombstone. |
+| `CI_NOT_PASSED` | Reconcile the required runs for the current head. A prior reservation still consumes its slot. |
+| `HUMAN_INTERVENTION_REQUIRED` | Inspect the persisted intervention reason and address it before an authorized resume. |
 | `LIMIT_REACHED` / `POLICY_DENIED` | Human intervention and approved budget/policy work; do not reset the counter or change identity to evade the limit. |
 | `REMOTE_UNAVAILABLE` | Inspect connectivity/permissions safely. The existing key remains reserved even if preflight failed. |
 | `PENDING` / `NOT_SENT` | No remote write happened from this row (a `RESERVED` row older than the send transaction bounds is a crashed reservation). The key stays consumed; never delete or reset it. |
@@ -124,18 +130,17 @@ there is no user-facing action endpoint yet.
 
 A provider connection/setup reply, missing reaction or missing review does not prove
 zero usage. Do not retry the same key. A successful GitHub POST also does not prove
-Codex accepted the trigger; outcome ingestion and authenticated human reconciliation
-remain separate work. No alternate-provider invocation, notification, automatic
-merge or review-state transition occurs here.
+Codex accepted the trigger. Outcome ingestion and authenticated human reconciliation
+remain separate work.
 
 Operator query (metadata only):
 
 ```sql
-SELECT request_key, actor_id, state, comment_id, created_at, completed_at
+SELECT iteration, request_key, actor_id, state, comment_id, created_at, completed_at
 FROM review_requests
 WHERE installation_id = :installation_id AND repository_id = :repository_id
   AND pr_number = :pr_number
-ORDER BY created_at;
+ORDER BY iteration;
 ```
 
 ## Verification and rollout

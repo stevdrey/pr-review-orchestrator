@@ -5,6 +5,8 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Reaso
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Verdict.*;
 
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 import java.util.Objects;
 import java.util.Set;
 
@@ -29,19 +31,13 @@ public final class ReviewOutcomeClassifier {
         if (completion == null) return unavailable(expected, version, pending, MISSING_COMPLETION);
         if (!expected.equals(completion.run())) return unavailable(expected, version, pending, UNCORRELATED_COMPLETION);
         if (completion.status() != Status.COMPLETED) return unavailable(expected, version, pending, PROVIDER_NOT_COMPLETED);
-        if (snapshot == null || !snapshot.pr().equals(expected.pr())
-                || !snapshot.cycleId().equals(expected.cycleId()) || !snapshot.headSha().equals(expected.headSha())
-                || !snapshot.observedHeadSha().equals(expected.headSha())
-                || !snapshot.provider().equals(expected.evidenceProvider())) {
+        if (!matchesSnapshot(expected, snapshot)) {
             return unavailable(expected, version, pending, INCOMPLETE_EVIDENCE);
         }
-        var review = snapshot.sources().stream()
-                .filter(s -> s.kind() == Kind.REVIEW && s.id().equals(completion.reviewId())).findFirst();
+        var review = review(completion, snapshot);
         if (review.isEmpty()) return unavailable(expected, version, pending, MISSING_REVIEW);
         Source source = review.orElseThrow();
-        if (!expected.reviewer().equals(source.author()) || source.staleFor(expected.headSha())
-                || !("APPROVED".equals(source.reviewState()) || "COMMENTED".equals(source.reviewState())
-                    || "CHANGES_REQUESTED".equals(source.reviewState()))) {
+        if (!verifiedReview(expected, source)) {
             return unavailable(expected, version, pending, UNVERIFIED_REVIEW);
         }
         // Inline candidates clear only through their retained finding status, never through general dismissals.
@@ -62,10 +58,53 @@ public final class ReviewOutcomeClassifier {
         }
         if (completion.conclusion() != Conclusion.NO_FINDINGS) return result(expected, version, UNKNOWN, UNKNOWN_CONCLUSION);
         // Future/contradictory source revisions cannot prove completion at this observation.
-        if (snapshot.sources().stream().anyMatch(s -> s.updatedAt() != null && s.updatedAt().isAfter(snapshot.capturedAt()))) {
+        if (futureRevision(snapshot)) {
             return result(expected, version, UNKNOWN, CONTRADICTORY_EVIDENCE);
         }
         return result(expected, version, CLEAN_FOR_SHA, CORRELATED_NO_FINDINGS);
+    }
+
+    /** Fingerprint only the authenticated review's current actionable findings. Ignore IDs and shifted lines. */
+    public Optional<String> findingFingerprint(Run expected, Completion completion, Snapshot snapshot,
+            Set<String> dismissedGeneralSources, Set<String> closedInlineSources) {
+        if (completion == null || !expected.equals(completion.run()) || completion.status() != Status.COMPLETED
+                || completion.conclusion() != Conclusion.FINDINGS || !matchesSnapshot(expected, snapshot)
+                || futureRevision(snapshot)
+                || review(completion, snapshot).filter(source -> verifiedReview(expected, source)).isEmpty()) {
+            return Optional.empty();
+        }
+        var findings = snapshot.sources().stream().filter(Source::candidate)
+                .filter(source -> completion.reviewId().equals(source.reviewId())
+                        && expected.reviewer().equals(source.author()) && !source.staleFor(expected.headSha()))
+                .filter(source -> source.general()
+                        ? source.feedback() == Feedback.ACTIONABLE && !dismissedGeneralSources.contains(source.id())
+                        : !closedInlineSources.contains(source.id()))
+                .map(source -> source.kind().name() + "/" + source.bodySha256() + "/"
+                        + Sha256.hex(Objects.toString(source.path(), "").getBytes(StandardCharsets.UTF_8)))
+                .sorted().toList();
+        return findings.isEmpty() ? Optional.empty()
+                : Optional.of(Sha256.hex(String.join("\n", findings).getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private boolean matchesSnapshot(Run expected, Snapshot snapshot) {
+        return snapshot != null && snapshot.pr().equals(expected.pr()) && snapshot.cycleId().equals(expected.cycleId())
+                && snapshot.headSha().equals(expected.headSha()) && snapshot.observedHeadSha().equals(expected.headSha())
+                && snapshot.provider().equals(expected.evidenceProvider());
+    }
+
+    private Optional<Source> review(Completion completion, Snapshot snapshot) {
+        return snapshot.sources().stream()
+                .filter(source -> source.kind() == Kind.REVIEW && source.id().equals(completion.reviewId())).findFirst();
+    }
+
+    private boolean verifiedReview(Run expected, Source source) {
+        return expected.reviewer().equals(source.author()) && !source.staleFor(expected.headSha())
+                && ("APPROVED".equals(source.reviewState()) || "COMMENTED".equals(source.reviewState())
+                    || "CHANGES_REQUESTED".equals(source.reviewState()));
+    }
+
+    private boolean futureRevision(Snapshot snapshot) {
+        return snapshot.sources().stream().anyMatch(s -> s.updatedAt() != null && s.updatedAt().isAfter(snapshot.capturedAt()));
     }
 
     private ReviewOutcome unavailable(Run expected, long version, PendingFindings pending, Reason reason) {

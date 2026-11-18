@@ -4,6 +4,7 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewConflict.Code
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 
 import io.github.stevdrey.prrevieworchestrator.domain.*;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.Intervention;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
 import java.sql.Timestamp;
@@ -30,7 +31,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
 
     @Override
     public ReviewOutcome assess(Assessment assessment, Runnable authorize) {
-        return states.locked(assessment.run().pr(), authorize, () -> classify(assessment));
+        return states.locked(assessment.run().pr(), authorize, () -> classify(assessment, true));
     }
 
     @Override
@@ -42,7 +43,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     run.stage().cleanAction(), null, gates);
             // CLEAN_FOR_SHA already requires no pending inline/general findings, so it replaces the default guard.
             var state = states.applyLocked(run.pr(), transition, () -> {
-                if (classify(assessment).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
+                if (classify(assessment, false).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
             });
             jdbc.update("""
                     INSERT INTO review_clean_evidence (installation_id, repository_id, pr_number, transition_id,
@@ -78,7 +79,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         throw new ReviewConflict(exact ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
     }
 
-    private ReviewOutcome classify(Assessment assessment) {
+    private ReviewOutcome classify(Assessment assessment, boolean recordProgress) {
         Run run = assessment.run();
         var pr = run.pr();
         var current = jdbc.queryForList("""
@@ -128,8 +129,37 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 SELECT source_id FROM findings WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT'
                     AND status IN ('DISMISSED', 'VERIFIED_FIXED')
                 """, String.class, snapshot.id()));
-        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
+        var outcome = classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
                 dismissed, closedInline);
+        if (!recordProgress || outcome.verdict() != Verdict.ACTION_REQUIRED) return outcome;
+        return classifier.findingFingerprint(run, assessment.completion(), snapshot, dismissed, closedInline)
+                .map(fingerprint -> recordProgress(assessment, outcome, fingerprint)).orElse(outcome);
+    }
+
+    private ReviewOutcome recordProgress(Assessment assessment, ReviewOutcome outcome, String fingerprint) {
+        Run run = assessment.run();
+        String reviewId = assessment.completion().reviewId();
+        int inserted = jdbc.update("""
+                INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256)
+                VALUES (?, ?, ?, ?) ON CONFLICT (request_id) DO NOTHING
+                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint);
+        if (inserted == 0) {
+            var current = states.load(run.pr(), false).orElseThrow();
+            return current.intervention() == Intervention.NO_PROGRESS ? outcome.noProgress(current.version()) : outcome;
+        }
+        // Unverified, failed and clean rounds carry no fingerprint. Do not compare across a gap.
+        var previous = jdbc.query("""
+                SELECT progress.finding_sha256 = ? AND progress.review_source_id <> ?
+                FROM review_requests current JOIN review_requests prior
+                    USING (installation_id, repository_id, pr_number, stage, provider)
+                LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
+                WHERE current.id = ? AND prior.iteration < current.iteration
+                ORDER BY prior.iteration DESC LIMIT 1
+                """, (rs, row) -> rs.getBoolean(1), fingerprint, reviewId, run.requestId());
+        if (previous.isEmpty() || !previous.getFirst()) return outcome;
+        var current = states.load(run.pr(), false).orElseThrow();
+        var stopped = states.stopLocked(current, Intervention.NO_PROGRESS);
+        return outcome.noProgress(stopped.version());
     }
 
     private Loaded loadSnapshot(Assessment assessment) {

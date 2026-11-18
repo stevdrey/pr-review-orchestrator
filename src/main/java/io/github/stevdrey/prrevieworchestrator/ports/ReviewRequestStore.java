@@ -11,7 +11,7 @@ public interface ReviewRequestStore {
     /** A validated comment receipt; headConfirmed is false when the post-write read did not confirm the SHA. */
     record Receipt(long commentId, boolean headConfirmed) {}
     /** Commit a permanent tombstone before any effect; serialize per PR and enforce a lifetime cap. */
-    Reservation reserve(ReviewRequest request, long actorId, int limit, Runnable authorizeAndApprove);
+    Reservation reserve(ReviewRequest request, long actorId, int limit, Runnable authorize, Runnable approve);
     /**
      * Durably consume the send permit before the effect; retain ATTEMPTED on failure/uncertain commit.
      * The effect must throw ReviewRequestFailure(OUTCOME_UNKNOWN) once a remote write may have happened;

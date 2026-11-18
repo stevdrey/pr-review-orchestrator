@@ -22,13 +22,13 @@ Every command carries a caller-stable UUID, expected version, expected head SHA,
 | `AWAIT_FIX` | `ACTION_REQUIRED` | `WAITING_FOR_FIX` |
 | `BASELINE_CLEAN` | `REVIEWING` | `DEEP_REVIEW`; eligible, no blocking findings; record baseline clean SHA |
 | `DEEP_CLEAN` | `DEEP_REVIEW` | Keep state, record deep clean SHA once; eligible, no blocking findings |
-| `MARK_READY_FOR_HUMAN` | `DEEP_REVIEW` | `READY_FOR_HUMAN`; both reviews clean for current SHA, eligible, no blockers, CI explicitly `PASSED` |
+| `MARK_READY_FOR_HUMAN` | `DEEP_REVIEW` | `READY_FOR_HUMAN`; both reviews clean for current SHA, eligible, no blockers, reconciled CI explicitly `PASSED` |
 | `PAUSE` | Any except `PAUSED` | Save resume state and clean evidence; enter `PAUSED` |
 | `RESUME` | `PAUSED` | Restore saved state; restoring `WAITING_FOR_REVIEW`, `REVIEWING`, `DEEP_REVIEW` or `READY_FOR_HUMAN` requires eligibility, and `READY_FOR_HUMAN` also rechecks CI and blockers; `NEW`, `ACTION_REQUIRED` and `WAITING_FOR_FIX` permit no review work and resume ungated |
 | `UPDATE_HEAD` | Any | Require different SHA; clear both clean SHAs; `NEW` stays `NEW` (only `MARK_READY` is the gated entry); other states enter `WAITING_FOR_REVIEW`, or stay paused with that resume state (a `NEW` resume target stays `NEW`) |
 | `CONFIRM_HEAD` | Any | Advance the version and clear clean evidence on a new authoritative same-head synchronize observation. Review-active states return to `WAITING_FOR_REVIEW`, including as a resume target while paused. Preserve `NEW`, `ACTION_REQUIRED` and `WAITING_FOR_FIX`. |
 
-`DEEP_REVIEW` identifies the required review stage; entering it does not dispatch a provider call. Clean deep evidence can be stored while CI is pending; readiness is a separate guarded action. This increment conservatively requires both clean stages. Optional-stage policy, separate budget/failure states and automatic no-progress stops remain future integrations; operators/callers can explicitly pause the current aggregate.
+`DEEP_REVIEW` identifies the required review stage. Clean deep evidence can be stored while CI is pending. Readiness still requires both clean stages and [reconciled CI for the current SHA](ci-and-iteration-policy.md). The CI and automatic stop transitions are journaled through their dedicated guarded paths.
 
 After every head change, including force-push and a return to a previously reviewed SHA, both clean fields are null. No resume, thread-resolution flag or old provider result can restore them. `UPDATE_HEAD` changes local observed state, not GitHub. Starting another review still requires eligibility and policy permission. A new SHA is required to leave `WAITING_FOR_FIX` automatically; same-head finding dispositions and re-review scheduling remain separate work.
 

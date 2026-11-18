@@ -99,8 +99,8 @@ class GeneralFeedbackIntegrationTest {
         var request = new ReviewRequest(PR, HEAD, "BASELINE", "github", ReviewRequest.Trigger.PR_OPENED, 1, false);
         jdbc.update("""
                 INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
-                VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 1, '1970-01-01', '1970-01-01')
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at, iteration)
+                VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 1, '1970-01-01', '1970-01-01', 1)
                 """, requestId, request.key(), HEAD);
         return new ReviewOutcome.Run(PR, HEAD, "github", ReviewOutcome.Stage.BASELINE,
                 requestId, cycle, "github", "reviewer");
@@ -385,7 +385,7 @@ class GeneralFeedbackIntegrationTest {
                         baseline_clean_sha, deep_clean_sha) VALUES (101, 1001, 8, ?, 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD);
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(7, migration.migrate().migrationsExecuted);
+            assertEquals(8, migration.migrate().migrationsExecuted);
             assertEquals("NEEDS_HUMAN", scoped.queryForObject("SELECT feedback FROM review_evidence_sources", String.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM findings WHERE source_kind = 'REVIEW' AND thread_id IS NULL", Integer.class));
             assertEquals("ACTION_REQUIRED", scoped.queryForObject("SELECT state FROM pr_review_states WHERE pr_number = 7", String.class));
@@ -449,7 +449,7 @@ class GeneralFeedbackIntegrationTest {
                         """, observation.id(), HEAD, revision.bodySha256(), java.sql.Timestamp.from(revision.updatedAt()));
             }
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(7, migration.migrate().migrationsExecuted);
+            assertEquals(8, migration.migrate().migrationsExecuted);
             assertEquals(observations.size(), scoped.queryForObject("SELECT count(*) FROM review_evidence_sources", Integer.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
             assertEquals(2, scoped.queryForObject("SELECT count(*) FROM findings", Integer.class));

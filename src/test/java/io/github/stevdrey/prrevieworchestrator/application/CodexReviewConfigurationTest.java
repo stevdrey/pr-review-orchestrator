@@ -6,6 +6,7 @@ import static org.mockito.Mockito.*;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import io.github.stevdrey.prrevieworchestrator.config.CodexReviewConfiguration;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials;
@@ -27,6 +28,7 @@ class CodexReviewConfigurationTest {
         context.withPropertyValues("orchestrator.codex.enabled=true", "orchestrator.codex.actor-id=42")
                 .withBean(JdbcTemplate.class, () -> mock(JdbcTemplate.class))
                 .withBean(PlatformTransactionManager.class, () -> mock(PlatformTransactionManager.class))
+                .withBean(JdbcReviewStateStore.class, () -> mock(JdbcReviewStateStore.class))
                 .withBean(RepositoryAuthorization.class, () -> mock(RepositoryAuthorization.class))
                 .run(app -> {
                     assertThat(app).hasFailed();

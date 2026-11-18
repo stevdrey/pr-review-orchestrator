@@ -8,9 +8,11 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailur
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.CAPABILITY_UNVERIFIED;
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.LIMIT_REACHED;
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.STALE_HEAD;
+import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.CI_NOT_PASSED;
 
 import io.github.stevdrey.prrevieworchestrator.adapters.github.*;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
+import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
 import java.util.*;
@@ -60,6 +62,22 @@ class ReviewRequestIntegrationTest {
     }
     JdbcReviewRequestStore store() { return new JdbcReviewRequestStore(jdbc, new DataSourceTransactionManager(dataSource)); }
     CodexReviewAdapter adapter() { return new CodexReviewAdapter(authorization, store(), approval, comments, 42, 6); }
+    ReviewLifecycle lifecycle() {
+        return new ReviewLifecycle(new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource)), authorization);
+    }
+    void advanceTo(String sha) {
+        var lifecycle = lifecycle();
+        var current = lifecycle.find(PR).orElse(null);
+        var state = current == null ? lifecycle.create(PR, sha) : lifecycle.apply(PR, new ReviewTransition(
+                UUID.randomUUID(), current.version(), current.headSha(), ReviewTransition.Action.UPDATE_HEAD, sha,
+                new ReviewTransition.Gates(true, false, false, true, false, ReviewTransition.Ci.UNKNOWN)));
+        reconcileCi(state, ReviewTransition.Ci.PASSED);
+    }
+    void reconcileCi(PullRequestReview state, ReviewTransition.Ci status) {
+        var check = new CiEvidence.Check(2, "build");
+        lifecycle().reconcileCi(state.version(), new CiEvidence(UUID.randomUUID(), PR, state.headSha(),
+                Set.of(check), List.of(new CiEvidence.Run(check, state.headSha(), status)), true));
+    }
     int rows() { return jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class); }
     void code(ReviewRequestFailure.Code code, Runnable action) {
         var failure = assertThrows(ReviewRequestFailure.class, action::run);
@@ -105,14 +123,15 @@ class ReviewRequestIntegrationTest {
         assertEquals(1, effects.get());
         assertEquals("ATTEMPTED", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
         var crash = request("b".repeat(40));
-        store().reserve(crash, 42, 6, () -> authorization.requireAuthorized(SCOPE));
+        advanceTo(crash.headSha());
+        store().reserve(crash, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
         assertEquals(PENDING, adapter().request(crash));
         assertEquals(1, effects.get());
     }
 
     @Test void permitItselfCannotBeReusedEvenAfterRollbackOfEffectTransaction() {
         var r = request(HEAD);
-        var reservation = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE));
+        var reservation = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
         code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), () -> {
             effects.incrementAndGet();
             throw new ReviewRequestFailure(ReviewRequestFailure.Code.OUTCOME_UNKNOWN);
@@ -157,7 +176,7 @@ class ReviewRequestIntegrationTest {
 
     @Test void revocationAfterReservationStillPreventsWrite() {
         var r = request(HEAD);
-        var reserved = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE));
+        var reserved = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
         jdbc.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101");
         assertThrows(AuthorizationDenied.class, () -> store().send(r, reserved.id(),
                 () -> authorization.requireAuthorized(SCOPE), () -> { effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1, true); }));
@@ -205,10 +224,69 @@ class ReviewRequestIntegrationTest {
     }
 
     @Test void lifetimeCapCountsUnknownsAndAllHeadShasAndCannotBeResetByRestart() {
-        store().reserve(request(String.format("%040x", 1)), 42, 6, () -> authorization.requireAuthorized(SCOPE));
-        for (int i = 2; i <= 6; i++) assertEquals(COMMENT_CREATED, adapter().request(request(String.format("%040x", i))));
+        store().reserve(request(String.format("%040x", 1)), 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
+        for (int i = 2; i <= 6; i++) {
+            String sha = String.format("%040x", i);
+            advanceTo(sha);
+            assertEquals(COMMENT_CREATED, adapter().request(request(sha)));
+        }
+        advanceTo(HEAD);
         code(LIMIT_REACHED, () -> adapter().request(request(HEAD)));
+        var stopped = lifecycle().find(PR).orElseThrow();
+        assertEquals(PullRequestReview.State.PAUSED, stopped.state());
+        assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, stopped.intervention());
+        code(LIMIT_REACHED, () -> adapter().request(request(HEAD)));
+        assertEquals(stopped, lifecycle().find(PR).orElseThrow());
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L, 6L),
+                jdbc.queryForList("SELECT iteration FROM review_requests ORDER BY iteration", Long.class));
         assertEquals(6, rows());
         assertEquals(5, effects.get());
+    }
+
+    @Test void reReviewRequiresCurrentCiBeforeReservationAndAgainBeforeSend() {
+        assertEquals(COMMENT_CREATED, adapter().request(request(HEAD)));
+        String next = "b".repeat(40);
+        var state = lifecycle().create(PR, next);
+        code(CI_NOT_PASSED, () -> adapter().request(request(next)));
+        assertEquals(1, rows());
+        reconcileCi(state, ReviewTransition.Ci.PASSED);
+        var request = request(next);
+        var reserved = store().reserve(request, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
+        reconcileCi(lifecycle().find(PR).orElseThrow(), ReviewTransition.Ci.PENDING);
+        code(CI_NOT_PASSED, () -> store().send(request, reserved.id(), () -> authorization.requireAuthorized(SCOPE),
+                () -> fail("A rerun invalidated CI before the effect")));
+        assertEquals(NOT_SENT, adapter().request(request));
+        assertEquals(1, effects.get());
+        assertEquals(2, rows());
+    }
+
+    @Test void distinctConcurrentRequestsCompeteForOneLifetimeSlot() throws Exception {
+        advanceTo(HEAD);
+        Runnable authorize = () -> authorization.requireAuthorized(SCOPE);
+        for (int i = 0; i < 5; i++) {
+            var request = new ReviewRequest(PR, HEAD, "DEEP", "provider-" + i,
+                    ReviewRequest.Trigger.PR_READY, 123, false);
+            assertTrue(store().reserve(request, 42, 6, authorize, () -> {}).created());
+        }
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            List<Future<Boolean>> attempts = new ArrayList<>();
+            for (String provider : List.of("final-a", "final-b")) {
+                var request = new ReviewRequest(PR, HEAD, "DEEP", provider, ReviewRequest.Trigger.PR_READY, 123, false);
+                attempts.add(executor.submit(() -> {
+                    start.await();
+                    try {
+                        return store().reserve(request, 42, 6, authorize, () -> {}).created();
+                    } catch (ReviewRequestFailure failure) {
+                        assertEquals(LIMIT_REACHED, failure.code());
+                        return false;
+                    }
+                }));
+            }
+            start.countDown();
+            assertNotEquals(attempts.get(0).get(10, TimeUnit.SECONDS), attempts.get(1).get(10, TimeUnit.SECONDS));
+        }
+        assertEquals(6, rows());
+        assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, lifecycle().find(PR).orElseThrow().intervention());
     }
 }

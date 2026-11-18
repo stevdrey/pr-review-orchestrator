@@ -89,6 +89,13 @@ class FixCorrelationIntegrationTest {
         step(START_REVIEW, READY);
     }
 
+    private void passCi() {
+        var state = current();
+        var check = new CiEvidence.Check(2, "build");
+        lifecycle.reconcileCi(state.version(), new CiEvidence(UUID.randomUUID(), PR, state.headSha(),
+                Set.of(check), List.of(new CiEvidence.Run(check, state.headSha(), Ci.PASSED)), true));
+    }
+
     @Test
     void closePushesCoalesceAtTheLatestHeadAcrossWorkersAndStoreRecreation() throws Exception {
         var normalizer = new GitHubReviewNormalizer();
@@ -321,6 +328,7 @@ class FixCorrelationIntegrationTest {
     void confirmedReturnToCurrentHeadInvalidatesExistingReadiness() {
         step(BASELINE_CLEAN, READY);
         step(DEEP_CLEAN, READY);
+        passCi();
         step(MARK_READY_FOR_HUMAN, READY);
         assertFalse(correlation.observeSynchronize(
                 event("pull_request", "synchronize", FIRST), current(), head(BASE)));
@@ -390,9 +398,10 @@ class FixCorrelationIntegrationTest {
         assertEquals(NOT_REVIEWABLE, assess(FIRST, changed(FIRST)).status());
         step(RESUME, READY);
 
+        passCi();
         var manual = new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
         new JdbcReviewRequestStore(jdbc, transactions).reserve(manual, 1, 6,
-                () -> authorization.requireAuthorized(PR.scope()));
+                () -> authorization.requireAuthorized(PR.scope()), () -> {});
         assertEquals(ALREADY_REQUESTED, assess(FIRST, changed(FIRST)).status());
         jdbc.update("UPDATE installation_repositories SET enabled = false");
         var revoked = new Assessment(head(FIRST), assessment.expectedVersion(), false, changed(FIRST));
@@ -452,7 +461,8 @@ class FixCorrelationIntegrationTest {
         var originalRequest = new ReviewRequest(PR, FIRST, "BASELINE", "github",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
         assertEquals(0, JdbcFixCorrelationStore.headEpoch(jdbc, PR, FIRST));
-        var original = requests.reserve(originalRequest, 1, 6, guards);
+        passCi();
+        var original = requests.reserve(originalRequest, 1, 6, guards, () -> {});
         assertTrue(original.created());
         step(START_REVIEW, READY);
         push(LAST);
@@ -483,8 +493,8 @@ class FixCorrelationIntegrationTest {
         var stale = new ReviewRequest(PR, FIRST, "BASELINE", "codex",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
         assertEquals(ReviewRequestFailure.Code.STALE_HEAD,
-                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(stale, 1, 6, guards)).code());
-        assertEquals(original.id(), requests.reserve(originalRequest, 1, 6, guards).id());
+                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(stale, 1, 6, guards, () -> {})).code());
+        assertEquals(original.id(), requests.reserve(originalRequest, 1, 6, guards, () -> {}).id());
         assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
                 () -> requests.send(originalRequest, original.id(), guards,
                         () -> fail("An earlier epoch must not reach the provider"))).code());
@@ -492,11 +502,14 @@ class FixCorrelationIntegrationTest {
         var renewed = new ReviewRequest(PR, FIRST, "BASELINE", "github",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
         assertEquals(ReviewRequestFailure.Code.LIMIT_REACHED,
-                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(renewed, 1, 1, guards)).code());
-        var renewedReservation = requests.reserve(renewed, 1, 6, guards);
+                assertThrows(ReviewRequestFailure.class, () -> requests.reserve(renewed, 1, 1, guards, () -> {})).code());
+        assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, current().intervention());
+        step(RESUME, READY);
+        passCi();
+        var renewedReservation = requests.reserve(renewed, 1, 6, guards, () -> {});
         assertTrue(renewedReservation.created());
         requests.send(renewed, renewedReservation.id(), guards, () -> new Receipt(84, true));
-        var renewedReplay = requests.reserve(renewed, 1, 6, guards);
+        var renewedReplay = requests.reserve(renewed, 1, 6, guards, () -> {});
         assertFalse(renewedReplay.created());
         assertEquals(renewedReservation.id(), renewedReplay.id());
         assertEquals(ALREADY_REQUESTED, assess(FIRST, comparison).status());
@@ -510,7 +523,7 @@ class FixCorrelationIntegrationTest {
         Runnable guards = () -> authorization.requireAuthorized(PR.scope());
         var request = new ReviewRequest(PR, BASE, "BASELINE", "github",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
-        var reservation = requests.reserve(request, 1, 6, guards);
+        var reservation = requests.reserve(request, 1, 6, guards, () -> {});
         var scheduled = new AtomicBoolean();
         Runnable sendGuards = () -> {
             guards.run();
@@ -543,27 +556,32 @@ class FixCorrelationIntegrationTest {
         try {
             Flyway.configure().dataSource(dataSource).schemas(schema).target("8").load().migrate();
             configure(dataSource);
-            createReviewingPr();
-            push(FIRST);
-            step(START_REVIEW, READY);
-            step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
-            step(AWAIT_FIX, READY);
+            jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
+            jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+            cycle = createCycle(BASE, 1);
+            var state = lifecycle.create(PR, BASE);
+            state = applyLegacy(state, MARK_READY, null);
+            state = applyLegacy(state, START_REVIEW, null);
+            state = applyLegacy(state, UPDATE_HEAD, FIRST);
+            state = applyLegacy(state, START_REVIEW, null);
+            state = applyLegacy(state, BLOCKING_FINDINGS, null);
+            state = applyLegacy(state, AWAIT_FIX, null);
             UUID requestId = UUID.randomUUID();
             UUID permitId = UUID.randomUUID();
             var legacy = new ReviewRequest(PR, BASE, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
             var legacyPermit = new ReviewRequest(PR, BASE, "BASELINE", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
             if (timing == LegacyReservationTiming.BEFORE_RETURN_COMMIT) {
-                reserveWhileLegacyReturnWaits(requestId, legacy, permitId, legacyPermit);
+                state = reserveWhileLegacyReturnWaits(state, requestId, legacy, permitId, legacyPermit);
             } else {
-                push(BASE);
+                state = applyLegacy(state, UPDATE_HEAD, BASE);
                 settlePushes();
                 Timestamp reservedAt = timing == LegacyReservationTiming.TIMESTAMP_TIE
                         ? jdbc.queryForObject("SELECT occurred_at FROM pr_review_transitions WHERE resulting_version = ?",
-                                Timestamp.class, current().version())
+                                Timestamp.class, state.version())
                         : jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
                 insertLegacyReservations(requestId, legacy, permitId, legacyPermit, reservedAt);
             }
-            long epoch = current().version();
+            long epoch = state.version();
 
             Flyway.configure().dataSource(dataSource).schemas(schema).load().migrate();
             assertTrue(ingestion.ingest(snapshot(0, inline(false))));
@@ -574,12 +592,13 @@ class FixCorrelationIntegrationTest {
                     ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
             var requests = new JdbcReviewRequestStore(jdbc, transactions);
             Runnable authorize = () -> authorization.requireAuthorized(PR.scope());
-            var duplicate = requests.reserve(currentRequest, 1, 6, authorize);
+            var duplicate = requests.reserve(currentRequest, 1, 6, authorize, () -> {});
             assertFalse(duplicate.created());
             assertEquals(requestId, duplicate.id());
             assertEquals(legacy.key(), jdbc.queryForObject("SELECT request_key FROM review_requests WHERE id = ?",
                     String.class, requestId));
             assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+            assertEquals(List.of(1L, 2L), jdbc.queryForList("SELECT iteration FROM review_requests ORDER BY iteration", Long.class));
 
             jdbc.update("""
                     UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Fixture'
@@ -603,7 +622,7 @@ class FixCorrelationIntegrationTest {
                             () -> requests.send(legacyPermit, permitId, authorize, () -> new Receipt(43, true))).code()));
             var currentPermit = new ReviewRequest(PR, BASE, "BASELINE", "codex",
                     ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
-            var duplicatePermit = requests.reserve(currentPermit, 1, 6, authorize);
+            var duplicatePermit = requests.reserve(currentPermit, 1, 6, authorize, () -> {});
             assertFalse(duplicatePermit.created());
             assertEquals(permitId, duplicatePermit.id());
             assertEquals(State.NOT_SENT, duplicatePermit.state());
@@ -612,10 +631,8 @@ class FixCorrelationIntegrationTest {
         }
     }
 
-    private void reserveWhileLegacyReturnWaits(UUID requestId, ReviewRequest legacy, UUID permitId,
+    private PullRequestReview reserveWhileLegacyReturnWaits(PullRequestReview state, UUID requestId, ReviewRequest legacy, UUID permitId,
             ReviewRequest legacyPermit) throws Exception {
-        var state = current();
-        var returned = new ReviewTransition(UUID.randomUUID(), state.version(), state.headSha(), UPDATE_HEAD, BASE, READY);
         var states = new JdbcReviewStateStore(jdbc, transactions);
         var started = new CompletableFuture<Timestamp>();
         try (var worker = Executors.newSingleThreadExecutor()) {
@@ -624,7 +641,7 @@ class FixCorrelationIntegrationTest {
                 var pending = worker.submit(() -> states.locked(PR, () -> {
                     authorization.requireAuthorized(PR.scope());
                     started.complete(jdbc.queryForObject("SELECT now()", Timestamp.class));
-                }, () -> states.applyLocked(PR, returned, null)));
+                }, () -> applyLegacy(state, UPDATE_HEAD, BASE)));
                 Timestamp transactionStart = started.orTimeout(2, TimeUnit.SECONDS).join();
                 // V8 records now() in the blocked transaction and clock_timestamp() for the reservation.
                 Timestamp reservedAt = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
@@ -636,9 +653,24 @@ class FixCorrelationIntegrationTest {
             assertEquals(BASE, next.headSha());
             assertTrue(jdbc.queryForObject("""
                     SELECT r.created_at > t.occurred_at FROM review_requests r CROSS JOIN pr_review_transitions t
-                    WHERE r.id = ? AND t.transition_id = ?
-                    """, Boolean.class, requestId, returned.id()));
+                    WHERE r.id = ? AND t.resulting_version = ?
+                    """, Boolean.class, requestId, next.version()));
+            return next;
         }
+    }
+
+    /** V8 fixture uses the historical schema and keeps the old transaction-start journal timestamp. */
+    private PullRequestReview applyLegacy(PullRequestReview state, ReviewTransition.Action action, String newHead) {
+        var gates = new Gates(true, false, false, true, action == BLOCKING_FINDINGS, Ci.UNKNOWN);
+        var command = new ReviewTransition(UUID.randomUUID(), state.version(), state.headSha(), action, newHead, gates);
+        var next = state.transition(command);
+        jdbc.update("UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?", next.headSha(), next.version(), next.state().name());
+        jdbc.update("""
+                INSERT INTO pr_review_transitions (installation_id, repository_id, pr_number, transition_id,
+                    expected_version, expected_head_sha, action, resulting_version, resulting_head_sha, resulting_state)
+                VALUES (101, 1001, 7, ?, ?, ?, ?, ?, ?, ?)
+                """, command.id(), state.version(), state.headSha(), action.name(), next.version(), next.headSha(), next.state().name());
+        return next;
     }
 
     private void insertLegacyReservations(UUID requestId, ReviewRequest legacy, UUID permitId, ReviewRequest legacyPermit,
@@ -661,7 +693,8 @@ class FixCorrelationIntegrationTest {
         var legacy = new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
         assertEquals(legacy.key(), new ReviewRequest(PR, FIRST, "BASELINE", "github",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, 0).key());
-        assertTrue(requests.reserve(legacy, 1, 6, guards).created());
+        passCi();
+        assertTrue(requests.reserve(legacy, 1, 6, guards, () -> {}).created());
         step(START_REVIEW, READY);
 
         assertFalse(correlation.observeSynchronize(event("pull_request", "synchronize", FIRST), current(), head(FIRST)));
@@ -670,14 +703,15 @@ class FixCorrelationIntegrationTest {
         assertEquals(ELIGIBLE, assess(FIRST, changed(FIRST)).status());
         long epoch = JdbcFixCorrelationStore.headEpoch(jdbc, PR, FIRST);
         assertTrue(epoch > 0);
-        assertFalse(requests.reserve(legacy, 1, 6, guards).created());
+        assertFalse(requests.reserve(legacy, 1, 6, guards, () -> {}).created());
         assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class, () -> requests.reserve(
                 new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch + 1),
-                1, 6, guards)).code());
+                1, 6, guards, () -> {})).code());
         var renewed = new ReviewRequest(PR, FIRST, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
         assertEquals(legacy.key() + "/" + epoch, renewed.key());
-        assertTrue(requests.reserve(renewed, 1, 6, guards).created());
-        assertFalse(requests.reserve(renewed, 1, 6, guards).created());
+        passCi();
+        assertTrue(requests.reserve(renewed, 1, 6, guards, () -> {}).created());
+        assertFalse(requests.reserve(renewed, 1, 6, guards, () -> {}).created());
         assertEquals(ALREADY_REQUESTED, assess(FIRST, changed(FIRST)).status());
     }
 
