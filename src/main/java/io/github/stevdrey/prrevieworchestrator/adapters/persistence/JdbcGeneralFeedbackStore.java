@@ -38,7 +38,8 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     private static final String LAST_HEAD = """
             WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
-                WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'UPDATE_HEAD')
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                    AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD'))
             """;
     private static final String CURRENT_DECISION = """
                 FROM general_feedback_dispositions d

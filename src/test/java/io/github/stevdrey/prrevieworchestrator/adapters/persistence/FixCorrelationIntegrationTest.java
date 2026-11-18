@@ -4,6 +4,7 @@ import static io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Stat
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Action.*;
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNormalizer;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
@@ -11,8 +12,10 @@ import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.*;
 import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback.Disposition;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -71,7 +74,15 @@ class FixCorrelationIntegrationTest {
 
     @Test
     void closePushesCoalesceAtTheLatestHeadAcrossWorkersAndStoreRecreation() throws Exception {
-        waitingForFix(inline(false));
+        var normalizer = new GitHubReviewNormalizer();
+        String fixture;
+        try (var input = Objects.requireNonNull(getClass().getResourceAsStream("/github/review-snapshot.json"))) {
+            fixture = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        fixture = fixture.replace("Review summary, not a clean verdict", "");
+        var initial = normalizer.normalize(UUID.randomUUID(), cycle, PR, BASE, TIME,
+                fixture.getBytes(StandardCharsets.UTF_8));
+        waitingForFix(initial);
         var first = event("pull_request", "synchronize", FIRST);
         var expected = current();
         assertTrue(correlation.observeSynchronize(first, expected, head(FIRST)));
@@ -79,8 +90,27 @@ class FixCorrelationIntegrationTest {
         var beforeLast = assess(FIRST, null);
         assertEquals(WAITING_FOR_PUSHES, beforeLast.status());
         assertEquals(0, candidateCount());
-        assertTrue(correlation.observeThread(event("pull_request_review_thread", "resolved", FIRST),
-                snapshot(1, inline(true))));
+        byte[] response = fixture.replace("\"headRefOid\": \"" + BASE, "\"headRefOid\": \"" + FIRST)
+                .replace("\"isResolved\": false", "\"isResolved\": true").getBytes(StandardCharsets.UTF_8);
+        var threadEvent = event("pull_request_review_thread", "resolved", FIRST);
+        var snapshotId = UUID.randomUUID();
+        assertThrows(IllegalArgumentException.class, () -> normalizer.normalizeForRound(
+                snapshotId, cycle, PR, BASE, LAST, TIME.plusSeconds(1), response, Map.of(), Set.of()));
+        var resolved = normalizer.normalizeForRound(
+                snapshotId, cycle, PR, BASE, FIRST, TIME.plusSeconds(1), response, Map.of(), Set.of());
+        assertTrue(correlation.observeThread(threadEvent, resolved));
+        assertFalse(correlation.observeThread(threadEvent, resolved));
+        assertEquals(Map.of("head_sha", BASE, "observed_head_sha", FIRST), jdbc.queryForMap("""
+                SELECT head_sha, observed_head_sha FROM review_evidence_snapshots WHERE id = ?
+                """, snapshotId));
+        assertEquals(Map.of("reviewed_sha", BASE, "original_sha", LAST, "thread_resolved", true),
+                jdbc.queryForMap("""
+                    SELECT reviewed_sha, original_sha, thread_resolved FROM review_evidence_sources
+                    WHERE snapshot_id = ? AND source_id = 'C1'
+                    """, snapshotId));
+        assertEquals("OPEN", jdbc.queryForObject("SELECT status FROM findings", String.class));
+        var conflicting = new Snapshot(snapshotId, cycle, PR, "github", BASE, LAST, resolved.capturedAt(), resolved.sources());
+        assertThrows(ReviewEvidence.Conflict.class, () -> correlation.observeThread(threadEvent, conflicting));
         assertEquals(beforeLast.retryAt(), assess(FIRST, null).retryAt());
 
         // Separate the observations by five seconds while staying within the same quiet period.
@@ -112,6 +142,32 @@ class FixCorrelationIntegrationTest {
         assertEquals(1, candidateCount());
         assertEquals(LAST, jdbc.queryForObject("SELECT head_sha FROM fix_review_candidates", String.class));
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+    }
+
+    @Test
+    void freshReturnToSettledHeadRestartsQuietPeriodButDeliveryReplayDoesNot() {
+        waitingForFix(inline(false));
+        push(FIRST);
+        settlePushes();
+        assertEquals(COMPARISON_REQUIRED, assess(FIRST, null).status());
+
+        var skipped = event("pull_request", "synchronize", LAST);
+        var returned = event("pull_request", "synchronize", FIRST);
+        assertFalse(correlation.observeSynchronize(skipped, current(), head(FIRST)));
+        assertFalse(correlation.observeSynchronize(returned, current(), head(FIRST)));
+        var waiting = assess(FIRST, changed(FIRST));
+        assertEquals(WAITING_FOR_PUSHES, waiting.status());
+        assertEquals(0, candidateCount());
+        assertFalse(correlation.observeSynchronize(returned, current(), head(FIRST)));
+        assertEquals(waiting.retryAt(), assess(FIRST, changed(FIRST)).retryAt());
+
+        String finalHead = "d".repeat(40);
+        push(finalHead);
+        assertEquals(WAITING_FOR_PUSHES, assess(finalHead, changed(finalHead)).status());
+        settlePushes();
+        assertEquals(ELIGIBLE, assess(finalHead, changed(finalHead)).status());
+        assertEquals(1, candidateCount());
+        assertEquals(finalHead, jdbc.queryForObject("SELECT head_sha FROM fix_review_candidates", String.class));
     }
 
     @Test
@@ -154,6 +210,25 @@ class FixCorrelationIntegrationTest {
     }
 
     @Test
+    void confirmedReturnToCurrentHeadInvalidatesExistingReadiness() {
+        step(BASELINE_CLEAN, READY);
+        step(DEEP_CLEAN, READY);
+        step(MARK_READY_FOR_HUMAN, READY);
+        assertFalse(correlation.observeSynchronize(
+                event("pull_request", "synchronize", FIRST), current(), head(BASE)));
+        var returned = event("pull_request", "synchronize", BASE);
+        assertFalse(correlation.observeSynchronize(returned, current(), head(BASE)));
+
+        var state = current();
+        assertEquals(BASE, state.headSha());
+        assertEquals(PullRequestReview.State.WAITING_FOR_REVIEW, state.state());
+        assertNull(state.baselineCleanSha());
+        assertNull(state.deepCleanSha());
+        assertFalse(correlation.observeSynchronize(returned, state, head(BASE)));
+        assertEquals(state, current());
+    }
+
+    @Test
     void generalOnlyFeedbackNeedsCurrentExplicitEvidenceAndStillBlocksClean() {
         var original = waitingForFix(general("1"));
         push(FIRST);
@@ -185,6 +260,10 @@ class FixCorrelationIntegrationTest {
         settlePushes();
         dispose(original, GeneralFeedback.Action.DISMISS, null);
         assertEquals(NO_PENDING_FINDINGS, assess(FIRST, changed(FIRST)).status());
+        assertFalse(correlation.observeSynchronize(event("pull_request", "synchronize", FIRST), current(), head(FIRST)));
+        settlePushes();
+        assertEquals(GENERAL_DISPOSITION_REQUIRED, assess(FIRST, changed(FIRST)).status());
+        dispose(original, GeneralFeedback.Action.DISMISS, null);
         push(LAST);
         settlePushes();
         assertEquals(GENERAL_DISPOSITION_REQUIRED, assess(LAST, changed(LAST)).status());
@@ -226,7 +305,10 @@ class FixCorrelationIntegrationTest {
     }
 
     private Snapshot waitingForFix(Source source) {
-        var snapshot = snapshot(0, source);
+        return waitingForFix(snapshot(0, source));
+    }
+
+    private Snapshot waitingForFix(Snapshot snapshot) {
         assertTrue(ingestion.ingest(snapshot));
         step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
         step(AWAIT_FIX, READY);
@@ -271,7 +353,10 @@ class FixCorrelationIntegrationTest {
     }
 
     private void settlePushes() {
-        jdbc.update("UPDATE pr_review_transitions SET occurred_at = clock_timestamp() - interval '1 minute' WHERE action = 'UPDATE_HEAD'");
+        jdbc.update("""
+                UPDATE pr_review_transitions SET occurred_at = clock_timestamp() - interval '1 minute'
+                WHERE action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')
+                """);
     }
 
     private int candidateCount() {

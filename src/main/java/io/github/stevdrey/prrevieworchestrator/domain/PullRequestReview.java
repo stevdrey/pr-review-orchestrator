@@ -101,18 +101,20 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
                 next = resume;
                 resume = null;
             }
-            case UPDATE_HEAD -> {
-                guard(!headSha.equals(command.newHeadSha()));
-                sha = command.newHeadSha();
+            case UPDATE_HEAD, CONFIRM_HEAD -> {
+                boolean changed = command.action() == ReviewTransition.Action.UPDATE_HEAD;
+                if (changed) {
+                    guard(!headSha.equals(command.newHeadSha()));
+                    sha = command.newHeadSha();
+                }
+                // A new synchronize at the same SHA can be a return from a head we never observed.
                 baseline = null;
                 deep = null;
-                // NEW stays NEW: only the eligibility-gated MARK_READY enters WAITING_FOR_REVIEW.
-                if (state == State.PAUSED) {
-                    if (resume != State.NEW) resume = State.WAITING_FOR_REVIEW;
-                } else if (state != State.NEW) next = State.WAITING_FOR_REVIEW;
-            }
-            case CONFIRM_HEAD -> {
-                // Fence delayed observations without clearing evidence or moving the push window.
+                State effective = state == State.PAUSED ? resume : state;
+                if (changed ? effective != State.NEW : reviewActive(effective)) {
+                    if (state == State.PAUSED) resume = State.WAITING_FOR_REVIEW;
+                    else next = State.WAITING_FOR_REVIEW;
+                }
             }
         }
         return new PullRequestReview(pr, sha, Math.incrementExact(version), next, resume, baseline, deep);

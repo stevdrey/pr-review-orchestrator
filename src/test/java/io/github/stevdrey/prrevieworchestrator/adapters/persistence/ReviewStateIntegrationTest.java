@@ -161,6 +161,41 @@ class ReviewStateIntegrationTest {
     }
 
     @Test
+    void historicalRoundSnapshotAtDifferentObservedHeadCannotEstablishCleanEvidence() {
+        var state = reviewing(FIRST);
+        var original = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(original).verdict());
+
+        var run = original.run();
+        var source = new ReviewEvidence.Source("R1", ReviewEvidence.Kind.REVIEW, "R1", null, null,
+                run.reviewer(), HEAD, null, "0".repeat(64), Instant.EPOCH, "COMMENTED", null, null,
+                null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.NONE);
+        Instant later = jdbc.queryForObject("SELECT captured_at FROM review_evidence_snapshots WHERE id = ?",
+                Timestamp.class, original.snapshotId()).toInstant().plusSeconds(1);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), FIRST, "github",
+                HEAD, NEXT, later, List.of(source));
+        new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
+
+        var assessment = new ReviewOutcome.Assessment(run, state.version(), original.completion(), snapshot.id());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(assessment).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(assessment, UUID.randomUUID(), CLEAR));
+        assertEquals(state, lifecycle.find(FIRST).orElseThrow());
+    }
+
+    @Test
+    void confirmingSameHeadMakesPriorCompletionEvidenceStale() {
+        var state = reviewing(FIRST);
+        var original = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        var outcomes = outcomes();
+        assertEquals(ReviewOutcome.Verdict.CLEAN_FOR_SHA, outcomes.assess(original).verdict());
+        state = step(step(state, CONFIRM_HEAD), START_REVIEW);
+        var refreshed = new ReviewOutcome.Assessment(original.run(), state.version(), original.completion(), original.snapshotId());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, outcomes.assess(refreshed).verdict());
+        assertCode(GUARD_REJECTED, () -> outcomes.recordClean(refreshed, UUID.randomUUID(), CLEAR));
+    }
+
+    @Test
     void headUpdateWaitingBehindIngestionRejectsSnapshotFromBeforeTheUpdate() throws Exception {
         var initial = reviewing(FIRST);
         var original = outcome(initial, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);

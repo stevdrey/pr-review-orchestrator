@@ -30,6 +30,14 @@ public final class GitHubReviewNormalizer {
     /** Explicit actionable IDs are advisory; every other nonblank general body requires human disposition. */
     public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
             Instant capturedAt, byte[] response, Map<String, Severity> severities, Set<String> actionableIds) {
+        return normalizeForRound(observationId, cycleId, pr, expectedHead, expectedHead, capturedAt,
+                response, severities, actionableIds);
+    }
+
+    /** Reconcile a historical round against the PR head verified by the current authorized read. */
+    public Snapshot normalizeForRound(UUID observationId, UUID cycleId, PullRequestId pr, String roundHeadSha,
+            String expectedObservedHeadSha, Instant capturedAt, byte[] response, Map<String, Severity> severities,
+            Set<String> actionableIds) {
         try {
             require(response.length <= 2 * 1024 * 1024);
             JsonNode root = JSON.readTree(response);
@@ -41,7 +49,7 @@ public final class GitHubReviewNormalizer {
             JsonNode pull = repository.path("pullRequest");
             require(pull.path("number").isIntegralNumber() && pull.path("number").canConvertToInt()
                     && pull.path("number").intValue() == pr.number());
-            require(expectedHead.equals(string(pull, "headRefOid")));
+            require(expectedObservedHeadSha.equals(string(pull, "headRefOid")));
             var sources = new ArrayList<Source>();
             for (JsonNode review : nodes(pull.path("reviews"))) {
                 String id = string(review, "id");
@@ -76,7 +84,7 @@ public final class GitHubReviewNormalizer {
                             severities.getOrDefault(id, Severity.UNKNOWN)));
                 }
             }
-            return new Snapshot(observationId, cycleId, pr, "github", expectedHead, capturedAt, sources);
+            return new Snapshot(observationId, cycleId, pr, "github", roundHeadSha, expectedObservedHeadSha, capturedAt, sources);
         } catch (RuntimeException ignored) {
             // No provider text, response bodies, URLs or parser diagnostics in failure paths.
             throw new IllegalArgumentException("Incomplete or invalid GitHub review snapshot");

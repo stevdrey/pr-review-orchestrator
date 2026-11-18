@@ -94,7 +94,7 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
     private Timeline loadTimeline(PullRequestId pr) {
         return jdbc.query("""
                 SELECT s.head_sha, s.version, s.state, fix.resulting_head_sha AS base_sha,
-                    fix.resulting_version AS base_version, push.resulting_version AS update_version,
+                    fix.resulting_version AS base_version, head_update.resulting_version AS update_version,
                     push.occurred_at AS last_push, clock_timestamp() AS now
                 FROM pr_review_states s
                 LEFT JOIN LATERAL (
@@ -104,9 +104,15 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
                     ORDER BY t.resulting_version DESC LIMIT 1
                 ) fix ON true
                 LEFT JOIN LATERAL (
-                    SELECT t.resulting_version, t.occurred_at FROM pr_review_transitions t
+                    SELECT t.resulting_version FROM pr_review_transitions t
                     WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
                         AND t.action = 'UPDATE_HEAD'
+                    ORDER BY t.resulting_version DESC LIMIT 1
+                ) head_update ON true
+                LEFT JOIN LATERAL (
+                    SELECT t.occurred_at FROM pr_review_transitions t
+                    WHERE (t.installation_id, t.repository_id, t.pr_number) = (s.installation_id, s.repository_id, s.pr_number)
+                        AND t.action IN ('UPDATE_HEAD', 'CONFIRM_HEAD')
                     ORDER BY t.resulting_version DESC LIMIT 1
                 ) push ON true
                 WHERE s.installation_id = ? AND s.repository_id = ? AND s.pr_number = ?

@@ -96,9 +96,11 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
         }
         jdbc.update("""
                 INSERT INTO review_evidence_snapshots (id, review_cycle_id, installation_id, repository_id,
-                    pr_number, head_sha, provider, captured_at, fingerprint, fingerprint_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+                    pr_number, head_sha, observed_head_sha, provider, captured_at, fingerprint, fingerprint_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
                 """, snapshot.id(), snapshot.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(),
-                pr.number(), snapshot.headSha(), snapshot.provider(), Timestamp.from(snapshot.capturedAt()), fingerprint);
+                pr.number(), snapshot.headSha(), snapshot.observedHeadSha(), snapshot.provider(),
+                Timestamp.from(snapshot.capturedAt()), fingerprint);
         // Batched: a fixed number of round trips regardless of source count keeps large PRs within the deadline.
         jdbc.batchUpdate("""
                 INSERT INTO review_evidence_sources (snapshot_id, source_id, source_kind, review_id, thread_id,
@@ -210,6 +212,8 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
                         s.resolved(), s.outdated(), s.path(), s.line(), s.originalLine(), s.severity());
                 if (includeFeedback) fields(out, s.feedback());
             }
+            // Preserve exact retries of historical same-head snapshots and bind a distinct observed head.
+            if (!snapshot.headSha().equals(snapshot.observedHeadSha())) fields(out, snapshot.observedHeadSha());
             return Sha256.hex(bytes.toByteArray());
         } catch (IOException ignored) { throw new Unavailable(false); }
     }

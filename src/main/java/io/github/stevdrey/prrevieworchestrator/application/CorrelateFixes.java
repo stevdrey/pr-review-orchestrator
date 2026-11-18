@@ -33,7 +33,7 @@ public final class CorrelateFixes {
         return store.observeHead(event.lease().id(), expected, current, authorize);
     }
 
-    /** A complete authoritative re-read updates normalized evidence in its existing review round. */
+    /** A complete authoritative re-read can update an older round at a different current PR head. */
     public boolean observeThread(Event event, Snapshot snapshot) {
         requireScope(event, snapshot.pr());
         if (!"pull_request_review_thread".equals(event.eventType())
