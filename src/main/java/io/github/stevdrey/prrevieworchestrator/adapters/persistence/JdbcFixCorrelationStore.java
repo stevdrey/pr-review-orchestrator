@@ -125,7 +125,7 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM review_requests
                     WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND head_sha = ? AND stage = 'BASELINE'
-                        AND head_epoch = ?)
+                        AND coalesce(reconciled_head_epoch, head_epoch) = ?)
                 """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), head,
                 epoch));
     }

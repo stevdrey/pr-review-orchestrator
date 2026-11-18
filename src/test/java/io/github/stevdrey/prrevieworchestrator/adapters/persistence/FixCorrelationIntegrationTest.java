@@ -12,8 +12,10 @@ import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.*;
 import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback.Disposition;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -22,12 +24,16 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.*;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.testcontainers.junit.jupiter.*;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -55,17 +61,25 @@ class FixCorrelationIntegrationTest {
     void setup() {
         var dataSource = new DriverManagerDataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
         Flyway.configure().dataSource(dataSource).load().migrate();
-        jdbc = new JdbcTemplate(dataSource);
+        configure(dataSource);
         jdbc.execute("TRUNCATE installations CASCADE");
-        jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
-        jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
-        cycle = createCycle(BASE, 1);
+        createReviewingPr();
+    }
+
+    private void configure(DataSource dataSource) {
+        jdbc = new JdbcTemplate(dataSource);
         transactions = new DataSourceTransactionManager(dataSource);
         authorization = new RepositoryAuthorization(Set.of(PR.scope()), new JdbcInstallationAuthorization(jdbc));
         lifecycle = new ReviewLifecycle(new JdbcReviewStateStore(jdbc, transactions), authorization);
         ingestion = new IngestReviewEvidence(authorization, new JdbcReviewEvidenceStore(jdbc, transactions));
         dispositions = new DisposeGeneralFeedback(authorization, new JdbcGeneralFeedbackStore(jdbc, transactions));
         correlation = newCorrelator();
+    }
+
+    private void createReviewingPr() {
+        jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
+        jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+        cycle = createCycle(BASE, 1);
         lifecycle.create(PR, BASE);
         step(MARK_READY, READY);
         step(START_REVIEW, READY);
@@ -482,6 +496,96 @@ class FixCorrelationIntegrationTest {
         assertEquals(renewedReservation.id(), renewedReplay.id());
         assertEquals(ALREADY_REQUESTED, assess(FIRST, comparison).status());
         assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sendRejectsEarlierHeadBeforeTheRemoteReturnIsJournaled(boolean departBetweenSendPhases) {
+        var requests = new JdbcReviewRequestStore(jdbc, transactions);
+        Runnable guards = () -> authorization.requireAuthorized(PR.scope());
+        var request = new ReviewRequest(PR, BASE, "BASELINE", "github",
+                ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+        var reservation = requests.reserve(request, 1, 6, guards);
+        var scheduled = new AtomicBoolean();
+        Runnable sendGuards = () -> {
+            guards.run();
+            if (departBetweenSendPhases && scheduled.compareAndSet(false, true)) {
+                TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                    @Override public void afterCommit() { push(FIRST); }
+                });
+            }
+        };
+        if (!departBetweenSendPhases) push(FIRST);
+        // A remote return to BASE during this gap would satisfy a remote SHA check.
+        assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
+                () -> requests.send(request, reservation.id(), sendGuards,
+                        () -> new Receipt(42, true))).code());
+        assertEquals(FIRST, current().headSha());
+        assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests WHERE id = ?",
+                String.class, reservation.id()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void v8ReservationForAnAlreadyJournaledReturnSurvivesUpgrade(boolean tiedTimestamp) {
+        var rootJdbc = jdbc;
+        String schema = "request_visit_upgrade";
+        String url = POSTGRES.getJdbcUrl();
+        var dataSource = new DriverManagerDataSource(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema,
+                POSTGRES.getUsername(), POSTGRES.getPassword());
+        try {
+            Flyway.configure().dataSource(dataSource).schemas(schema).target("8").load().migrate();
+            configure(dataSource);
+            createReviewingPr();
+            push(FIRST);
+            step(START_REVIEW, READY);
+            step(BLOCKING_FINDINGS, new Gates(true, false, false, false, true, Ci.UNKNOWN));
+            step(AWAIT_FIX, READY);
+            push(BASE);
+            long epoch = current().version();
+            settlePushes();
+            UUID requestId = UUID.randomUUID();
+            var legacy = new ReviewRequest(PR, BASE, "BASELINE", "github", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+            Timestamp reservedAt = tiedTimestamp
+                    ? jdbc.queryForObject("SELECT occurred_at FROM pr_review_transitions WHERE resulting_version = ?", Timestamp.class, epoch)
+                    : jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class);
+            jdbc.update("""
+                    INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                        head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at)
+                    VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'github', 1, 'COMMENT_CREATED', 42, ?, clock_timestamp())
+                    """, requestId, legacy.key(), BASE, reservedAt);
+
+            Flyway.configure().dataSource(dataSource).schemas(schema).load().migrate();
+            assertTrue(ingestion.ingest(snapshot(0, inline(false))));
+            assertEquals(ALREADY_REQUESTED, assess(BASE, new Comparison(FIRST, BASE, true)).status());
+            var currentRequest = new ReviewRequest(PR, BASE, "BASELINE", "github",
+                    ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
+            var duplicate = new JdbcReviewRequestStore(jdbc, transactions).reserve(currentRequest, 1, 6,
+                    () -> authorization.requireAuthorized(PR.scope()));
+            assertFalse(duplicate.created());
+            assertEquals(requestId, duplicate.id());
+            assertEquals(legacy.key(), jdbc.queryForObject("SELECT request_key FROM review_requests WHERE id = ?",
+                    String.class, requestId));
+            assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+
+            jdbc.update("""
+                    UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer', disposition_reason = 'Fixture'
+                    WHERE review_cycle_id = ?
+                    """, cycle);
+            step(START_REVIEW, READY);
+            Instant observed = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+            var review = new Source("review", Kind.REVIEW, "review", null, null, "reviewer", BASE, null,
+                    "1".repeat(64), observed, "COMMENTED", null, null, null, null, null, Severity.UNKNOWN, Feedback.NONE);
+            var snapshot = new Snapshot(UUID.randomUUID(), cycle, PR, "github", BASE, observed.plusSeconds(1), List.of(review));
+            assertTrue(ingestion.ingest(snapshot));
+            var run = new ReviewOutcome.Run(PR, BASE, "github", ReviewOutcome.Stage.BASELINE, requestId, cycle, "github", "reviewer");
+            var completion = new ReviewOutcome.Completion(run, "review", ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.NO_FINDINGS);
+            var outcomes = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, new JdbcReviewStateStore(jdbc, transactions)), authorization);
+            assertEquals(tiedTimestamp ? ReviewOutcome.Verdict.UNKNOWN : ReviewOutcome.Verdict.CLEAN_FOR_SHA,
+                    outcomes.assess(new ReviewOutcome.Assessment(run, current().version(), completion, snapshot.id())).verdict());
+        } finally {
+            rootJdbc.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
+        }
     }
 
     @Test
