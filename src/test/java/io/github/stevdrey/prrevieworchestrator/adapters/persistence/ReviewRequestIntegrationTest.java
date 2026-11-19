@@ -243,6 +243,37 @@ class ReviewRequestIntegrationTest {
         assertEquals(5, effects.get());
     }
 
+    @Test void limitForAnUntrackedPrDeniesWithoutCreatingLifecycleState() {
+        Runnable authorize = () -> authorization.requireAuthorized(SCOPE);
+        assertTrue(store().reserve(request(HEAD), 42, 1, authorize, () -> {}).created());
+        var next = request("b".repeat(40));
+        code(LIMIT_REACHED, () -> store().reserve(next, 42, 1, authorize, () -> fail("No approval at the limit")));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pr_review_states", Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pr_review_transitions", Integer.class));
+        assertEquals(1, rows());
+    }
+
+    @Test void limitKeepsAnExistingPauseReasonAndVersion() {
+        advanceTo(HEAD);
+        Runnable authorize = () -> authorization.requireAuthorized(SCOPE);
+        assertTrue(store().reserve(request(HEAD), 42, 1, authorize, () -> {}).created());
+        var states = new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource));
+        var paused = states.locked(PR, authorize, () -> states.stopLocked(
+                states.load(PR, false).orElseThrow(), PullRequestReview.Intervention.NO_PROGRESS));
+        assertEquals(PullRequestReview.Intervention.NO_PROGRESS, paused.intervention());
+        var other = new ReviewRequest(PR, HEAD, "DEEP", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE, 123, false);
+        code(LIMIT_REACHED, () -> store().reserve(other, 42, 1, authorize, () -> fail("No approval at the limit")));
+        assertEquals(paused, lifecycle().find(PR).orElseThrow());
+        var human = states.locked(PR, authorize, () -> states.stopLocked(paused,
+                PullRequestReview.Intervention.ITERATION_LIMIT));
+        assertEquals(paused, human);
+    }
+
+    @Test void nullTransitionFailsBeforeAuthorizationOrLocking() {
+        var states = new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource));
+        assertThrows(NullPointerException.class, () -> states.apply(PR, null, () -> fail("Authorized a null command")));
+    }
+
     @Test void reReviewRequiresCurrentCiBeforeReservationAndAgainBeforeSend() {
         assertEquals(COMMENT_CREATED, adapter().request(request(HEAD)));
         String next = "b".repeat(40);

@@ -152,7 +152,8 @@ public record PullRequestReview(PullRequestId pr, String headSha, long version, 
     }
 
     private boolean ready(Gates gates) {
-        return ci == Ci.PASSED && gates.eligible() && !gates.blockingFindings() && gates.ci() == Ci.PASSED;
+        // The journaled CI reconciliation is the only CI authority; Gates.ci only carries RECONCILE_CI evidence.
+        return ci == Ci.PASSED && gates.eligible() && !gates.blockingFindings();
     }
 
     private static void guard(boolean condition) {

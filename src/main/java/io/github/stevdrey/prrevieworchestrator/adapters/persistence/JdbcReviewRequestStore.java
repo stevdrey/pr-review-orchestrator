@@ -71,7 +71,8 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
                     """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
             if (used >= limit) {
-                if (current == null) current = states.createLocked(pr, request.headSha());
+                // An untracked PR has no aggregate to pause; never create one from an unverified request head.
+                if (current == null) throw new ReviewRequestFailure(LIMIT_REACHED);
                 states.stopLocked(current, Intervention.ITERATION_LIMIT);
                 return null; // Commit the pause before exposing the denial.
             }
@@ -97,7 +98,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 int claimed = jdbc.update("UPDATE review_requests SET state = 'ATTEMPTED' WHERE id = ? AND request_key = ? AND state = 'RESERVED'",
                         id, request.key());
                 if (claimed != 1) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
-                requireSendPolicy(request, id);
+                // Policy is enforced once, under the lock held across the effect; a denial there is still NOT_SENT.
                 return null;
             });
         } catch (RuntimeException failure) {

@@ -96,6 +96,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
 
     @Override
     public PullRequestReview apply(PullRequestId pr, ReviewTransition command, Runnable authorize) {
+        java.util.Objects.requireNonNull(command);
         return locked(pr, authorize, () -> switch (command.action()) {
             case RECONCILE_CI, STOP_ITERATION_LIMIT, STOP_NO_PROGRESS -> throw new ReviewConflict(GUARD_REJECTED);
             default -> applyLocked(pr, command, null);
@@ -110,7 +111,8 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     }
 
     PullRequestReview stopLocked(PullRequestReview current, Intervention intervention) {
-        if (current.intervention() == intervention) return current;
+        // An existing hold (human or automatic) keeps its reason and version until a human resumes it.
+        if (current.state() == State.PAUSED) return current;
         var action = intervention == Intervention.ITERATION_LIMIT ? Action.STOP_ITERATION_LIMIT : Action.STOP_NO_PROGRESS;
         return applyLocked(current.pr(), new ReviewTransition(UUID.randomUUID(), current.version(), current.headSha(),
                 action, null, observationGates(Ci.UNKNOWN)), null);

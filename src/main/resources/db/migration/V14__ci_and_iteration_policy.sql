@@ -39,11 +39,13 @@ ALTER TABLE review_requests
     ADD CHECK (iteration > 0),
     ADD UNIQUE (installation_id, repository_id, pr_number, iteration);
 
--- One immutable fingerprint per authenticated completion. Historical requests keep their slots.
+-- The latest fingerprint per request and whether that request caused a no-progress pause (set at most once).
+-- Historical requests keep their slots.
 CREATE TABLE review_round_progress (
     request_id uuid PRIMARY KEY REFERENCES review_requests (id),
     snapshot_id uuid NOT NULL,
     review_source_id text NOT NULL,
     finding_sha256 text NOT NULL CHECK (finding_sha256 ~ '^[0-9a-f]{64}$'),
+    no_progress boolean NOT NULL DEFAULT false,
     FOREIGN KEY (snapshot_id, review_source_id) REFERENCES review_evidence_sources (snapshot_id, source_id)
 );

@@ -139,22 +139,36 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
     private ReviewOutcome recordProgress(Assessment assessment, ReviewOutcome outcome, String fingerprint) {
         Run run = assessment.run();
         String reviewId = assessment.completion().reviewId();
-        int inserted = jdbc.update("""
-                INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256)
-                VALUES (?, ?, ?, ?) ON CONFLICT (request_id) DO NOTHING
-                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint);
-        if (inserted == 0) {
-            var current = states.load(run.pr(), false).orElseThrow();
-            return current.intervention() == Intervention.NO_PROGRESS ? outcome.noProgress(current.version()) : outcome;
-        }
-        if (!repeatsPriorRound(run, reviewId, fingerprint)) return outcome;
+        // The caller holds the PR lock and classify only accepts the uniquely latest snapshot for the current head,
+        // so a different stored snapshot is older evidence for this same request.
+        var stored = jdbc.query("""
+                SELECT snapshot_id, no_progress FROM review_round_progress WHERE request_id = ?
+                """, (rs, row) -> new StoredProgress(rs.getObject(1, UUID.class), rs.getBoolean(2)), run.requestId());
         var current = states.load(run.pr(), false).orElseThrow();
+        if (!stored.isEmpty() && stored.getFirst().snapshotId().equals(assessment.snapshotId())) {
+            // A replay reports only the pause this request itself caused, and only while it still holds.
+            return stored.getFirst().noProgress() && current.intervention() == Intervention.NO_PROGRESS
+                    ? outcome.noProgress(current.version()) : outcome;
+        }
+        boolean previouslyStopped = !stored.isEmpty() && stored.getFirst().noProgress();
+        boolean repeats = repeatsPriorRound(run, reviewId, fingerprint);
+        jdbc.update("""
+                INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256, no_progress)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT (request_id) DO UPDATE SET snapshot_id = EXCLUDED.snapshot_id,
+                    review_source_id = EXCLUDED.review_source_id, finding_sha256 = EXCLUDED.finding_sha256,
+                    no_progress = review_round_progress.no_progress OR EXCLUDED.no_progress
+                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint, repeats);
+        // Pause once per request: newer evidence never re-pauses after a human resume nor resumes automatically.
+        if (!repeats || previouslyStopped) return outcome;
         var stopped = states.stopLocked(current, Intervention.NO_PROGRESS);
         return outcome.noProgress(stopped.version());
     }
 
+    private record StoredProgress(UUID snapshotId, boolean noProgress) {}
+
     private boolean repeatsPriorRound(Run run, String reviewId, String fingerprint) {
-        // Select the immediately preceding request even when it has no fingerprint.
+        // Select the immediately preceding request that may have reached the provider, even when it has no
+        // fingerprint. RESERVED and NOT_SENT requests provably made no remote write, so they are not rounds.
         // Use the effective closure across cycles for the same stable finding and exact prior revision.
         var pr = run.pr();
         return Boolean.TRUE.equals(jdbc.queryForObject("""
@@ -164,6 +178,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                         USING (installation_id, repository_id, pr_number, stage, provider)
                     LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
                     WHERE current.id = ? AND prior.iteration < current.iteration
+                        AND prior.state NOT IN ('RESERVED', 'NOT_SENT')
                     ORDER BY prior.iteration DESC LIMIT 1
                 ),
                 """ + JdbcGeneralFeedbackStore.EFFECTIVE_INLINE_FINDING_CTES + """

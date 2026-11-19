@@ -49,7 +49,7 @@ Flyway applies V1 through V14 on application startup. V2 adds optional event act
 | `finding_identities` | Stable scoped inline comment identities across review rounds |
 | `findings` | Separate actionable findings with comment/review/thread provenance, per-source ordinal key, reviewed SHA and disposition evidence |
 | `general_feedback_dispositions` | Scoped, revision/head-bound human decisions and proposed fix evidence |
-| `review_round_progress` | Per-request finding fingerprints and the evidence source for no-progress decisions |
+| `review_round_progress` | Latest per-request finding fingerprint, its evidence source and whether the request caused a no-progress pause |
 | `review_clean_evidence` | Exact request/cycle/snapshot/source/provider/stage/SHA provenance of accepted clean transitions |
 | `review_requests` | Permanent scoped request keys and iteration slots, one-shot send state (including terminal `NOT_SENT` and head-unconfirmed receipts), authorized actor ID and optional numeric comment receipt |
 | `fix_review_candidates` | One remediation eligibility record per installation/repository/PR/head SHA, linked to the head-change transition |

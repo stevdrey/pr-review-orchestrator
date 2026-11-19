@@ -195,6 +195,58 @@ class ReviewStateIntegrationTest {
         assertNull(step(paused, RESUME).intervention());
     }
 
+    @Test
+    void anUnsentRequestBetweenIdenticalRoundsDoesNotHideMissingProgress() {
+        var state = reviewing(FIRST);
+        String finding = "1".repeat(64);
+        var first = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.FINDINGS, "review-first", finding);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(first).verdict());
+        // A request denied before any send (e.g. CI_NOT_PASSED) still consumes a slot but is not a review round.
+        var unsent = new ReviewRequest(FIRST, "d".repeat(40), "BASELINE", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+        jdbc.update("""
+                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number, head_sha,
+                    stage, provider, actor_id, state, completed_at, head_epoch, iteration)
+                VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'codex', 1, 'NOT_SENT', clock_timestamp(), 0,
+                    (SELECT count(*) + 1 FROM review_requests))
+                """, UUID.randomUUID(), unsent.key(), unsent.headSha());
+        state = step(step(state, UPDATE_HEAD), START_REVIEW);
+        var second = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.FINDINGS, "review-second", finding);
+        var decision = outcomes().assess(second);
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, decision.reason());
+        assertEquals(PullRequestReview.Intervention.NO_PROGRESS, newLifecycle().find(FIRST).orElseThrow().intervention());
+    }
+
+    @Test
+    void progressKeepsTheLatestFingerprintAndPausesEachRequestAtMostOnce() {
+        var state = reviewing(FIRST);
+        String finding = "1".repeat(64);
+        var first = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.FINDINGS, "review-first", finding);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(first).verdict());
+        state = step(step(state, UPDATE_HEAD), START_REVIEW);
+        var second = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.FINDINGS, "review-second", finding);
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(second).reason());
+        var resumed = step(newLifecycle().find(FIRST).orElseThrow(), RESUME);
+        assertNull(resumed.intervention());
+
+        // A replay after the human resume reports the plain outcome and does not pause again.
+        var replay = new ReviewOutcome.Assessment(second.run(), resumed.version(), second.completion(), second.snapshotId());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(replay).verdict());
+        assertEquals(resumed, newLifecycle().find(FIRST).orElseThrow());
+
+        // Newer evidence for the same request replaces its fingerprint but never re-pauses it.
+        String revised = "2".repeat(64);
+        var newer = outcome(resumed, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.FINDINGS, "review-second", revised);
+        assertEquals(second.run().requestId(), newer.run().requestId());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(newer).verdict());
+        assertEquals(resumed, newLifecycle().find(FIRST).orElseThrow());
+        var stored = jdbc.queryForMap("SELECT snapshot_id, finding_sha256, no_progress FROM review_round_progress WHERE request_id = ?",
+                newer.run().requestId());
+        assertEquals(newer.snapshotId(), stored.get("snapshot_id"));
+        assertNotEquals(jdbc.queryForObject("SELECT finding_sha256 FROM review_round_progress WHERE request_id = ?",
+                String.class, first.run().requestId()), stored.get("finding_sha256"));
+        assertEquals(true, stored.get("no_progress"));
+    }
+
     @ParameterizedTest
     @CsvSource({
             "150, true,  ACTION_REQUIRED",
@@ -333,7 +385,7 @@ class ReviewStateIntegrationTest {
         var deep = outcome(state, ReviewOutcome.Stage.DEEP, ReviewOutcome.Conclusion.NO_FINDINGS);
         state = outcomes.recordClean(deep, UUID.randomUUID(), CLEAR);
         assertEquals(HEAD, newLifecycle().find(FIRST).orElseThrow().deepCleanSha());
-        // Readiness still requires independent CI/eligibility gates.
+        // Readiness still requires reconciled CI on the aggregate; caller gates cannot substitute for it.
         var pending = new Gates(true, false, false, true, false, Ci.UNKNOWN);
         var ready = new ReviewTransition(UUID.randomUUID(), state.version(), HEAD, MARK_READY_FOR_HUMAN, null, pending);
         assertCode(GUARD_REJECTED, () -> lifecycle.apply(FIRST, ready));

@@ -176,9 +176,9 @@ class PullRequestReviewTest {
         rejected(at(REVIEWING), BLOCKING_FINDINGS, CLEAR);
         rejected(at(DEEP_REVIEW), MARK_READY_FOR_HUMAN, CLEAR);
         for (Ci ci : List.of(Ci.UNKNOWN, Ci.PENDING, Ci.FAILED)) {
-            var gates = new Gates(true, false, false, true, false, ci);
-            rejected(step(at(DEEP_REVIEW), DEEP_CLEAN), MARK_READY_FOR_HUMAN, gates);
-            rejected(step(at(READY_FOR_HUMAN), PAUSE), RESUME, gates);
+            // Only the reconciled CI on the aggregate counts; a caller-supplied passing gate cannot substitute.
+            var unreconciled = new PullRequestReview(PR, HEAD, 3, DEEP_REVIEW, null, HEAD, HEAD, ci, null);
+            rejected(unreconciled, MARK_READY_FOR_HUMAN, CLEAR);
         }
         rejected(step(at(DEEP_REVIEW), DEEP_CLEAN), MARK_READY_FOR_HUMAN, BLOCKED);
     }
