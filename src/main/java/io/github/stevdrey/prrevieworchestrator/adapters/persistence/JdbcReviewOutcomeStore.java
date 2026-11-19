@@ -147,15 +147,16 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
             var current = states.load(run.pr(), false).orElseThrow();
             return current.intervention() == Intervention.NO_PROGRESS ? outcome.noProgress(current.version()) : outcome;
         }
-        if (!repeatsPriorRound(run.requestId(), reviewId, fingerprint)) return outcome;
+        if (!repeatsPriorRound(run, reviewId, fingerprint)) return outcome;
         var current = states.load(run.pr(), false).orElseThrow();
         var stopped = states.stopLocked(current, Intervention.NO_PROGRESS);
         return outcome.noProgress(stopped.version());
     }
 
-    private boolean repeatsPriorRound(UUID requestId, String reviewId, String fingerprint) {
+    private boolean repeatsPriorRound(Run run, String reviewId, String fingerprint) {
         // Select the immediately preceding request even when it has no fingerprint.
-        // A verified fix after its snapshot establishes progress for the exact prior source revision.
+        // Use the effective closure across cycles for the same stable finding and exact prior revision.
+        var pr = run.pr();
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 WITH previous AS (
                     SELECT progress.snapshot_id, progress.review_source_id, progress.finding_sha256
@@ -164,7 +165,8 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
                     WHERE current.id = ? AND prior.iteration < current.iteration
                     ORDER BY prior.iteration DESC LIMIT 1
-                )
+                ),
+                """ + JdbcGeneralFeedbackStore.EFFECTIVE_INLINE_FINDING_CTES + """
                 SELECT EXISTS (
                     SELECT 1 FROM previous p
                     WHERE p.finding_sha256 = ? AND p.review_source_id <> ?
@@ -174,19 +176,21 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                             AND review.source_id = p.review_source_id
                         JOIN review_evidence_sources source ON source.snapshot_id = o.id
                             AND source.review_id = review.source_id AND source.author_login = review.author_login
-                        JOIN findings f ON f.review_cycle_id = o.review_cycle_id AND f.source_provider = o.provider
-                            AND f.source_kind = source.source_kind AND f.source_id = source.source_id
-                        JOIN review_evidence_sources retained ON retained.snapshot_id = f.evidence_snapshot_id
-                            AND retained.source_id = f.source_id
+                        JOIN finding_identities i ON i.installation_id = o.installation_id
+                            AND i.repository_id = o.repository_id AND i.pr_number = o.pr_number AND i.provider = o.provider
+                            AND i.source_kind = source.source_kind AND i.source_id = source.source_id
+                        JOIN effective_inline_findings f ON f.stable_finding_id = i.id
                         WHERE o.id = p.snapshot_id AND source.reviewed_sha = o.head_sha
                             AND source.source_kind = 'REVIEW_COMMENT' AND source.reply_to_id IS NULL
                             AND source.thread_outdated = false AND f.status = 'VERIFIED_FIXED'
                             AND f.verified_at >= o.ingested_at
-                            AND retained.body_sha256 = source.body_sha256
-                            AND retained.source_updated_at = source.source_updated_at
+                            AND f.body_sha256 = source.body_sha256 AND f.feedback = source.feedback
+                            AND f.source_updated_at = source.source_updated_at
+                            AND NOT EXISTS (SELECT 1 FROM pending_inline_findings n WHERE n.stable_finding_id = i.id)
                     )
                 )
-                """, Boolean.class, requestId, fingerprint, reviewId));
+                """, Boolean.class, run.requestId(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                fingerprint, reviewId));
     }
 
     private Loaded loadSnapshot(Assessment assessment) {

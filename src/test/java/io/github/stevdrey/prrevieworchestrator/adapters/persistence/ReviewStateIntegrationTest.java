@@ -235,6 +235,76 @@ class ReviewStateIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "false, false, ACTION_REQUIRED",
+            "true,  false, NEEDS_HUMAN",
+            "false, true,  NEEDS_HUMAN"
+    })
+    void inlineProgressUsesTheEffectiveVerifiedFixAcrossCycles(boolean revised, boolean reopened,
+            ReviewOutcome.Verdict expected) {
+        String finalHead = "c".repeat(40);
+        String sameComment = "1".repeat(64);
+        var stage = ReviewOutcome.Stage.BASELINE;
+        var findings = ReviewOutcome.Conclusion.FINDINGS;
+        var firstState = reviewing(FIRST);
+        var first = outcome(firstState, stage, findings, "review-first", sameComment, 10);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(first).verdict());
+        var middle = step(step(step(firstState, BLOCKING_FINDINGS), AWAIT_FIX), UPDATE_HEAD);
+
+        Instant originalRevision = jdbc.queryForObject("""
+                SELECT source_updated_at FROM review_evidence_sources
+                WHERE snapshot_id = ? AND source_id = 'review-first-inline'
+                """, Timestamp.class, first.snapshotId()).toInstant();
+        var oldReview = new Source("review-first", Kind.REVIEW, "review-first", null, null,
+                first.run().reviewer(), HEAD, null, "0".repeat(64), originalRevision, "COMMENTED",
+                null, null, null, null, null, Severity.UNKNOWN, Feedback.NONE);
+        var retained = new Source("review-first-inline", Kind.REVIEW_COMMENT, "review-first", "review-first-thread",
+                null, first.run().reviewer(), HEAD, HEAD, sameComment,
+                revised ? originalRevision.plusNanos(1_000) : originalRevision, null, true, true,
+                "src/Example.java", 10, 10, Severity.MEDIUM, Feedback.NONE);
+        UUID middleCycle = observeInlineOccurrence(2, oldReview, retained);
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(DISTINCT stable_finding_id) FROM findings WHERE source_id = 'review-first-inline'
+                """, Integer.class));
+        assertEquals(1, jdbc.update("""
+                UPDATE findings SET status = 'VERIFIED_FIXED', disposition_actor = 'maintainer',
+                    disposition_reason = 'Original problem verified fixed at the new commit',
+                    evidence_sha = ?, verified_at = clock_timestamp()
+                WHERE review_cycle_id = ? AND source_id = 'review-first-inline'
+                """, finalHead, middleCycle));
+        if (reopened) observeInlineOccurrence(3, oldReview, retained);
+
+        var finalState = lifecycle.apply(FIRST, new ReviewTransition(UUID.randomUUID(), middle.version(), NEXT,
+                UPDATE_HEAD, finalHead, CLEAR));
+        assertEquals(reopened ? ReviewOutcome.PendingFindings.ACTIONABLE : ReviewOutcome.PendingFindings.CLEAR,
+                JdbcGeneralFeedbackStore.pending(jdbc, FIRST, finalHead));
+        var reReviewing = step(passCi(finalState), START_REVIEW);
+        var second = outcome(reReviewing, stage, findings, "review-second", sameComment, 10);
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+        assertEquals(expected, outcomes().assess(second).verdict());
+        var current = lifecycle.find(FIRST).orElseThrow();
+        if (expected == ReviewOutcome.Verdict.ACTION_REQUIRED) {
+            assertEquals(reReviewing, current);
+        } else {
+            assertEquals(PAUSED, current.state());
+            assertEquals(PullRequestReview.Intervention.NO_PROGRESS, current.intervention());
+        }
+    }
+
+    private UUID observeInlineOccurrence(int iteration, Source review, Source finding) {
+        UUID cycle = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha,
+                    stage, review_provider, iteration)
+                VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'codex', ?)
+                """, cycle, NEXT, iteration);
+        var captured = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        var snapshot = new Snapshot(UUID.randomUUID(), cycle, FIRST, "github", NEXT, captured, List.of(review, finding));
+        assertTrue(new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {}));
+        return cycle;
+    }
+
     @Test
     void correlatedCleanStagesPersistButAmbiguousAndUnknownOutcomesCannotAdvance() {
         var state = reviewing(FIRST);
