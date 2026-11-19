@@ -111,10 +111,14 @@ public class JdbcReviewStateStore implements ReviewStateStore {
     }
 
     PullRequestReview stopLocked(PullRequestReview current, Intervention intervention) {
+        return stopLocked(current, intervention, UUID.randomUUID());
+    }
+
+    PullRequestReview stopLocked(PullRequestReview current, Intervention intervention, UUID transitionId) {
         // An existing hold (human or automatic) keeps its reason and version until a human resumes it.
         if (current.state() == State.PAUSED) return current;
         var action = intervention == Intervention.ITERATION_LIMIT ? Action.STOP_ITERATION_LIMIT : Action.STOP_NO_PROGRESS;
-        return applyLocked(current.pr(), new ReviewTransition(UUID.randomUUID(), current.version(), current.headSha(),
+        return applyLocked(current.pr(), new ReviewTransition(transitionId, current.version(), current.headSha(),
                 action, null, observationGates(Ci.UNKNOWN)), null);
     }
 

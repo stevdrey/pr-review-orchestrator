@@ -19,6 +19,8 @@ CI is journaled and reset to `UNKNOWN` at a head update or same-head confirmatio
 
 Read the active reason from `ReviewLifecycle.find(pr).intervention()` and its history from `pr_review_transitions`. An explicit, authorized `RESUME` clears the current hold after human triage. The stored attempts and progress evidence are retained. The author notification channel is tracked in [issue #22](https://github.com/stevdrey/pr-review-orchestrator/issues/22).
 
+A late completion during an existing pause updates the request's fingerprint and returns its actionable outcome. The journal identifies the request that caused each no-progress pause. A replay reports that pause only while it is the active hold. An earlier hold with unlinked journal evidence remains in place and its replay reports the actionable outcome.
+
 ## Rollout and verification
 
 V14 preserves request IDs, keys, states and receipts. It assigns iteration slots to retained requests and initializes CI to unknown, withdrawing unsupported legacy readiness while retaining clean verdicts and history. Keep the schema and audit evidence during rollback. Disable review dispatch and readiness writes if rolling back to an older binary, which cannot enforce the new gates.
@@ -36,3 +38,9 @@ The focused run (`./gradlew --offline test --tests '*.ReviewStateIntegrationTest
 With the follow-up regression applied to `6e46e43`, `./gradlew --offline test --tests '*.ReviewStateIntegrationTest.inlineProgressUsesTheEffectiveVerifiedFixAcrossCycles'` reproduced the false pause when a later cycle held the verified fix. The regression also covers a verified fix for a different source revision and a newer open occurrence that supersedes the verified fix.
 
 The follow-up focused run (`./gradlew --offline test --tests '*.ReviewStateIntegrationTest' --tests '*.FixCorrelationIntegrationTest' --tests '*.GeneralFeedbackIntegrationTest'`) passed 80 tests. The final `./gradlew --offline clean build` passed all 269 tests, with zero failures or skips.
+
+### PR #65 pause attribution regression
+
+The four new PostgreSQL test cases reproduced incorrect attribution on `828ce3a`. They cover a late repeated review and its replay during no-progress, iteration-limit and human holds, plus an earlier pause owner replayed during a later hold. The focused run (`./gradlew --offline test --tests '*.ReviewStateIntegrationTest' --tests '*.ReviewRequestIntegrationTest'`) passed all 56 tests after the fix.
+
+`./gradlew --offline clean build` passed all 278 tests, with zero failures or skips.

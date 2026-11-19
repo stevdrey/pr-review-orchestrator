@@ -5,8 +5,10 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.Intervention;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
@@ -145,26 +147,41 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 SELECT snapshot_id, no_progress FROM review_round_progress WHERE request_id = ?
                 """, (rs, row) -> new StoredProgress(rs.getObject(1, UUID.class), rs.getBoolean(2)), run.requestId());
         var current = states.load(run.pr(), false).orElseThrow();
+        boolean previouslyStopped = !stored.isEmpty() && stored.getFirst().noProgress();
+        // The journal key binds the hold to this request across snapshot changes and human resumes.
+        UUID stopId = UUID.nameUUIDFromBytes(("review-no-progress/" + run.requestId()).getBytes(StandardCharsets.UTF_8));
         if (!stored.isEmpty() && stored.getFirst().snapshotId().equals(assessment.snapshotId())) {
-            // A replay reports only the pause this request itself caused, and only while it still holds.
-            return stored.getFirst().noProgress() && current.intervention() == Intervention.NO_PROGRESS
+            return previouslyStopped && ownsActivePause(current, stopId)
                     ? outcome.noProgress(current.version()) : outcome;
         }
-        boolean previouslyStopped = !stored.isEmpty() && stored.getFirst().noProgress();
-        boolean repeats = repeatsPriorRound(run, reviewId, fingerprint);
+        var updated = current;
+        if (!previouslyStopped && current.state() != State.PAUSED && repeatsPriorRound(run, reviewId, fingerprint)) {
+            updated = states.stopLocked(current, Intervention.NO_PROGRESS, stopId);
+        }
+        boolean causedPause = updated.version() != current.version();
         jdbc.update("""
                 INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256, no_progress)
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (request_id) DO UPDATE SET snapshot_id = EXCLUDED.snapshot_id,
                     review_source_id = EXCLUDED.review_source_id, finding_sha256 = EXCLUDED.finding_sha256,
                     no_progress = review_round_progress.no_progress OR EXCLUDED.no_progress
-                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint, repeats);
-        // Pause once per request: newer evidence never re-pauses after a human resume nor resumes automatically.
-        if (!repeats || previouslyStopped) return outcome;
-        var stopped = states.stopLocked(current, Intervention.NO_PROGRESS);
-        return outcome.noProgress(stopped.version());
+                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint, causedPause);
+        return causedPause || previouslyStopped && ownsActivePause(updated, stopId)
+                ? outcome.noProgress(updated.version()) : outcome;
     }
 
     private record StoredProgress(UUID snapshotId, boolean noProgress) {}
+
+    private boolean ownsActivePause(PullRequestReview state, UUID stopId) {
+        if (state.intervention() != Intervention.NO_PROGRESS) return false;
+        var pr = state.pr();
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT (
+                    SELECT transition_id FROM pr_review_transitions
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'STOP_NO_PROGRESS'
+                    ORDER BY resulting_version DESC LIMIT 1
+                ) = ?
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), stopId));
+    }
 
     private boolean repeatsPriorRound(Run run, String reviewId, String fingerprint) {
         // Select the immediately preceding request that may have reached the provider, even when it has no

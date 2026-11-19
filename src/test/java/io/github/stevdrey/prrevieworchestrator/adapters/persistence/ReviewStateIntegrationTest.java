@@ -89,16 +89,7 @@ class ReviewStateIntegrationTest {
 
     private ReviewOutcome.Assessment outcome(PullRequestReview state, ReviewOutcome.Stage stage,
             ReviewOutcome.Conclusion conclusion, String reviewId, String findingHash, Integer inlineLine) {
-        var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED,
-                1, false, JdbcFixCorrelationStore.headEpoch(jdbc, state.pr(), state.headSha()));
-        var ids = jdbc.query("SELECT id FROM review_requests WHERE request_key = ?", (rs, row) -> rs.getObject(1, UUID.class), request.key());
-        UUID requestId = ids.isEmpty() ? UUID.randomUUID() : ids.getFirst();
-        if (ids.isEmpty()) jdbc.update("""
-                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at, head_epoch, iteration)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'codex', 1, 'COMMENT_CREATED', 1, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', ?, (SELECT count(*) + 1 FROM review_requests))
-                """, requestId, request.key(), state.pr().scope().installationId(), state.pr().scope().repositoryId(),
-                state.pr().number(), state.headSha(), stage.name(), request.headEpoch());
+        UUID requestId = recordReceipt(state, stage);
         UUID cycleId = UUID.randomUUID();
         int iteration = jdbc.queryForObject("SELECT count(*) + 1 FROM review_cycles", Integer.class);
         jdbc.update("""
@@ -122,6 +113,20 @@ class ReviewStateIntegrationTest {
         new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
         return new ReviewOutcome.Assessment(run, state.version(),
                 new ReviewOutcome.Completion(run, reviewId, ReviewOutcome.Status.COMPLETED, conclusion), snapshot.id());
+    }
+
+    private UUID recordReceipt(PullRequestReview state, ReviewOutcome.Stage stage) {
+        var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED,
+                1, false, JdbcFixCorrelationStore.headEpoch(jdbc, state.pr(), state.headSha()));
+        var ids = jdbc.query("SELECT id FROM review_requests WHERE request_key = ?", (rs, row) -> rs.getObject(1, UUID.class), request.key());
+        UUID requestId = ids.isEmpty() ? UUID.randomUUID() : ids.getFirst();
+        if (ids.isEmpty()) jdbc.update("""
+                INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                    head_sha, stage, provider, actor_id, state, comment_id, created_at, completed_at, head_epoch, iteration)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'codex', 1, 'COMMENT_CREATED', 1, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', ?, (SELECT count(*) + 1 FROM review_requests))
+                """, requestId, request.key(), state.pr().scope().installationId(), state.pr().scope().repositoryId(),
+                state.pr().number(), state.headSha(), stage.name(), request.headEpoch());
+        return requestId;
     }
 
     CiEvidence ci(PullRequestReview state, Ci status) {
@@ -245,6 +250,80 @@ class ReviewStateIntegrationTest {
         assertNotEquals(jdbc.queryForObject("SELECT finding_sha256 FROM review_round_progress WHERE request_id = ?",
                 String.class, first.run().requestId()), stored.get("finding_sha256"));
         assertEquals(true, stored.get("no_progress"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"NO_PROGRESS", "ITERATION_LIMIT", "HUMAN"})
+    void lateRepeatedReviewAndReplayKeepTheExistingPause(String hold) {
+        var state = reviewing(FIRST);
+        String finding = "1".repeat(64);
+        var conclusion = ReviewOutcome.Conclusion.FINDINGS;
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED,
+                outcomes().assess(outcome(state, ReviewOutcome.Stage.BASELINE, conclusion, "baseline-first", finding)).verdict());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED,
+                outcomes().assess(outcome(state, ReviewOutcome.Stage.DEEP, conclusion, "deep-first", finding)).verdict());
+        var reviewing = step(passCi(step(state, UPDATE_HEAD)), START_REVIEW);
+        // The later completion had already been dispatched when the other stage or a human paused the PR.
+        UUID inFlight = recordReceipt(reviewing, ReviewOutcome.Stage.DEEP);
+        PullRequestReview.Intervention expectedHold = switch (hold) {
+            case "NO_PROGRESS" -> {
+                var trigger = outcome(reviewing, ReviewOutcome.Stage.BASELINE, conclusion, "baseline-second", finding);
+                assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(trigger).reason());
+                yield PullRequestReview.Intervention.NO_PROGRESS;
+            }
+            case "ITERATION_LIMIT" -> {
+                var requests = new JdbcReviewRequestStore(jdbc, new DataSourceTransactionManager(dataSource));
+                var denied = new ReviewRequest(FIRST, NEXT, "BASELINE", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false);
+                assertEquals(ReviewRequestFailure.Code.LIMIT_REACHED, assertThrows(ReviewRequestFailure.class,
+                        () -> requests.reserve(denied, 1, 3, () -> {}, () -> fail("Limit must precede approval"))).code());
+                yield PullRequestReview.Intervention.ITERATION_LIMIT;
+            }
+            case "HUMAN" -> {
+                step(reviewing, PAUSE);
+                yield null;
+            }
+            default -> throw new AssertionError("Unknown hold: " + hold);
+        };
+        var paused = lifecycle.find(FIRST).orElseThrow();
+        assertEquals(PAUSED, paused.state());
+        assertEquals(expectedHold, paused.intervention());
+        var late = outcome(paused, ReviewOutcome.Stage.DEEP, conclusion, "deep-second", finding);
+        assertEquals(inFlight, late.run().requestId());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(late).verdict());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(late).verdict());
+        assertEquals(Map.of("snapshot_id", late.snapshotId(), "no_progress", false), jdbc.queryForMap("""
+                SELECT snapshot_id, no_progress FROM review_round_progress WHERE request_id = ?
+                """, inFlight));
+        assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
+    }
+
+    @Test
+    void aReviewThatCausedAnEarlierPauseDoesNotOwnALaterPause() {
+        var state = reviewing(FIRST);
+        var baseline = ReviewOutcome.Stage.BASELINE;
+        var deep = ReviewOutcome.Stage.DEEP;
+        var conclusion = ReviewOutcome.Conclusion.FINDINGS;
+        String finding = "1".repeat(64);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED,
+                outcomes().assess(outcome(state, baseline, conclusion, "baseline-first", finding)).verdict());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED,
+                outcomes().assess(outcome(state, deep, conclusion, "deep-first", finding)).verdict());
+        var reviewing = step(passCi(step(state, UPDATE_HEAD)), START_REVIEW);
+        var firstStop = outcome(reviewing, baseline, conclusion, "baseline-second", finding);
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(firstStop).reason());
+        var resumed = step(lifecycle.find(FIRST).orElseThrow(), RESUME);
+
+        var secondStop = outcome(resumed, deep, conclusion, "deep-second", finding);
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(secondStop).reason());
+        var paused = lifecycle.find(FIRST).orElseThrow();
+        var refreshed = outcome(paused, baseline, conclusion, "baseline-second", finding);
+        assertEquals(firstStop.run().requestId(), refreshed.run().requestId());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(refreshed).verdict());
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(refreshed).verdict());
+        assertEquals(true, jdbc.queryForObject("""
+                SELECT no_progress FROM review_round_progress WHERE request_id = ?
+                """, Boolean.class, firstStop.run().requestId()));
+        assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
     }
 
     @ParameterizedTest
