@@ -1,21 +1,36 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
 import io.github.stevdrey.prrevieworchestrator.domain.AuthorNotice.*;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationUnavailable;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticeStore;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.ToLongFunction;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 
 public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
+    private static final Duration SEND_DEADLINE = Duration.ofSeconds(8);
+    // Allow the 3-second HTTP deadline plus time to store the receipt and commit.
+    private static final Duration MIN_POST_BUDGET = Duration.ofSeconds(4);
     private final JdbcTemplate jdbc;
     private final JdbcReviewStateStore states;
+    private final TransactionTemplate sends;
 
-    public JdbcAuthorNoticeStore(JdbcTemplate jdbc, JdbcReviewStateStore states) {
+    public JdbcAuthorNoticeStore(JdbcTemplate jdbc, JdbcReviewStateStore states, PlatformTransactionManager manager) {
         this.jdbc = jdbc;
         this.states = states;
+        sends = new TransactionTemplate(manager);
+        sends.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        sends.setTimeout(Math.toIntExact(SEND_DEADLINE.toSeconds()));
     }
 
     @Override
@@ -37,13 +52,43 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
     }
 
     @Override
-    public Optional<Evidence> reserve(Job job, long recipientId, Runnable authorize) {
+    public boolean deliver(Job job, long recipientId, Runnable authorize, ToLongFunction<Evidence> post) {
+        if (!reserve(job, recipientId, authorize)) return false;
+
+        // A rollback or lost response here leaves the independently committed permit in place.
+        try {
+            return Boolean.TRUE.equals(sends.execute(status -> {
+                try {
+                    long start = System.nanoTime();
+                    PostgresDeadlines.apply(jdbc, SEND_DEADLINE);
+                    // JdbcInstallationAuthorization holds FOR SHARE locks until this transaction ends.
+                    authorize.run();
+                    PostgresLocks.lockPr(jdbc, job.pr());
+                    var current = currentTransition(job);
+                    if (current.isEmpty()) return false;
+                    Evidence evidence = evidence(job, current.get());
+                    if (System.nanoTime() - start >= SEND_DEADLINE.minus(MIN_POST_BUDGET).toNanos()) {
+                        throw new IllegalStateException("Author notification send deadline exhausted");
+                    }
+                    long commentId = post.applyAsLong(evidence);
+                    jdbc.update("""
+                            UPDATE author_notifications SET status = 'SENT', comment_id = ?
+                            WHERE id = ? AND status = 'ATTEMPTED' AND attempts = ?
+                            """, commentId, job.id(), job.attempt());
+                    return true;
+                } catch (RuntimeException failure) {
+                    throw sanitized(failure);
+                }
+            }));
+        } catch (RuntimeException failure) {
+            throw sanitized(failure);
+        }
+    }
+
+    private boolean reserve(Job job, long recipientId, Runnable authorize) {
         var pr = job.pr();
         return states.locked(pr, authorize, () -> {
-            var current = states.load(pr, true).orElseThrow();
-            if (!current.headSha().equals(job.headSha()) || current.state() != job.state() || superseded(job)) {
-                return Optional.empty();
-            }
+            if (currentTransition(job).isEmpty()) return false;
             // Installations may change, but two installations must never publish the same effect.
             jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> {},
                     "author-notice:" + pr.scope().repositoryId() + ":" + pr.number());
@@ -57,12 +102,19 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
                                 AND prior.state = n.state AND prior.head_sha = n.head_sha AND prior.recipient_id = ?
                         )
                     """, recipientId, job.id(), job.attempt(), recipientId);
-            if (reserved == 0) return Optional.empty();
-            var providers = job.state() == State.READY_FOR_HUMAN ? cleanProviders(job) : Map.<String, ProviderEvidence>of();
-            return Optional.of(new Evidence(current.ci(),
-                    providers.getOrDefault("BASELINE", ProviderEvidence.UNAVAILABLE),
-                    providers.getOrDefault("DEEP", ProviderEvidence.UNAVAILABLE)));
+            return reserved == 1;
         });
+    }
+
+    private Optional<PullRequestReview> currentTransition(Job job) {
+        return states.load(job.pr(), true).filter(current ->
+                current.headSha().equals(job.headSha()) && current.state() == job.state() && !superseded(job));
+    }
+
+    private Evidence evidence(Job job, PullRequestReview current) {
+        var providers = job.state() == State.READY_FOR_HUMAN ? cleanProviders(job) : Map.<String, ProviderEvidence>of();
+        return new Evidence(current.ci(), providers.getOrDefault("BASELINE", ProviderEvidence.UNAVAILABLE),
+                providers.getOrDefault("DEEP", ProviderEvidence.UNAVAILABLE));
     }
 
     private boolean superseded(Job job) {
@@ -113,11 +165,9 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
                 """, job.id(), job.attempt());
     }
 
-    @Override
-    public void sent(Job job, long commentId) {
-        jdbc.update("""
-                UPDATE author_notifications SET status = 'SENT', comment_id = ?
-                WHERE id = ? AND status = 'ATTEMPTED' AND attempts = ?
-                """, commentId, job.id(), job.attempt());
+    private RuntimeException sanitized(RuntimeException failure) {
+        if (failure instanceof AuthorizationDenied) return new AuthorizationDenied();
+        if (failure instanceof AuthorizationUnavailable) return new AuthorizationUnavailable();
+        return new IllegalStateException("Author notification send unavailable");
     }
 }

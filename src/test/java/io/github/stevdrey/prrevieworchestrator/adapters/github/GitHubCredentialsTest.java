@@ -29,7 +29,6 @@ import java.time.ZoneOffset;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -233,12 +232,13 @@ class GitHubCredentialsTest {
         }
     }
 
-    @Test
-    void authorNoticeUsesScopedAppTokenAndPostsOnlySafeMetadata() {
+    @ParameterizedTest
+    @ValueSource(strings = {"fixture-author", "mona-cat_octo"})
+    void authorNoticeUsesScopedAppTokenAndPostsOnlySafeMetadata(String login) {
         var notice = notices();
         var posted = new AtomicReference<String>();
         server.createContext("/repos/owner/repository/pulls/7",
-                exchange -> respond(exchange, 200, pull("a".repeat(40), "fixture-author")));
+                exchange -> respond(exchange, 200, pull("a".repeat(40), login)));
         server.createContext("/repos/owner/repository/issues/7/comments", exchange -> {
             var payload = json.readTree(exchange.getRequestBody().readAllBytes());
             posted.set(payload.path("body").asString());
@@ -250,17 +250,17 @@ class GitHubCredentialsTest {
             respond(exchange, 201, json.writeValueAsString(Map.of("id", 90, "body", posted.get(),
                     "user", Map.of("login", "fixture-app[bot]", "type", "Bot"))));
         });
-        var receipt = notice.publish(noticeJob(State.READY_FOR_HUMAN), author -> {
+        assertTrue(notice.publish(noticeJob(State.READY_FOR_HUMAN), (author, post) -> {
             assertEquals(123, author);
             assertNull(posted.get());
-            return Optional.of(new Evidence(Ci.PASSED, ProviderEvidence.CODEX, ProviderEvidence.RECORDED));
-        });
-        assertEquals(90, receipt.orElseThrow());
+            assertEquals(90L, post.applyAsLong(new Evidence(Ci.PASSED, ProviderEvidence.CODEX, ProviderEvidence.RECORDED)));
+            return true;
+        }));
         var tokenRequest = json.readTree(requestBody);
         assertEquals(json.valueToTree(List.of(1001)), tokenRequest.path("repository_ids"));
         assertEquals(json.valueToTree(Map.of("metadata", "read", "pull_requests", "write")),
                 tokenRequest.path("permissions"));
-        assertTrue(posted.get().contains("@fixture-author **Ready for human review**"));
+        assertTrue(posted.get().contains("@" + login + " **Ready for human review**"));
         assertTrue(posted.get().contains("github.com/owner/repository/pull/7"));
         assertTrue(posted.get().contains("a".repeat(40)));
         assertTrue(posted.get().contains("CI at dispatch: PASSED"));
@@ -281,10 +281,10 @@ class GitHubCredentialsTest {
         if (condition.equals("closed")) pr = pr.replace("open", "closed");
         String response = pr;
         server.createContext("/repos/owner/repository/pulls/7", exchange -> respond(exchange, 200, response));
-        assertTrue(notice.publish(noticeJob(State.ACTION_REQUIRED), recipient -> {
+        assertFalse(notice.publish(noticeJob(State.ACTION_REQUIRED), (recipient, post) -> {
             assertEquals("denied-permit", condition);
-            return Optional.empty();
-        }).isEmpty());
+            return false;
+        }));
         assertEquals(1, requests.get()); // an unexpected comment POST would hit the catch-all handler
     }
 
@@ -301,7 +301,8 @@ class GitHubCredentialsTest {
             respond(exchange, 500, "{\"body\":\"PRIVATE_SOURCE\"}");
         });
         assertSanitized(assertThrows(IllegalStateException.class, () -> notice.publish(noticeJob(State.ACTION_REQUIRED),
-                recipient -> Optional.of(new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)))));
+                (recipient, post) -> post.applyAsLong(
+                        new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)) > 0)));
         assertEquals(1, posts.get());
         assertTrue(posted.get().contains("@fixture-author **Action required**"));
         assertTrue(posted.get().contains("CI at dispatch: FAILED"));

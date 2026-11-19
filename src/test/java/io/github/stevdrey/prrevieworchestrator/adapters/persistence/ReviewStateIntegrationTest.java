@@ -9,6 +9,7 @@ import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
@@ -19,10 +20,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -143,7 +147,8 @@ class ReviewStateIntegrationTest {
     }
 
     private JdbcAuthorNoticeStore notices() {
-        return new JdbcAuthorNoticeStore(jdbc, new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource)));
+        var manager = new DataSourceTransactionManager(dataSource);
+        return new JdbcAuthorNoticeStore(jdbc, new JdbcReviewStateStore(jdbc, manager), manager);
     }
 
     @Test
@@ -157,18 +162,19 @@ class ReviewStateIntegrationTest {
         var previous = notices().claim().orElseThrow();
 
         state = lifecycle.reconcileCi(state.version(), ci(state, Ci.PENDING));
-        assertTrue(notices().reserve(previous, 52, () -> {}).isEmpty());
+        assertFalse(notices().deliver(previous, 52, () -> {}, evidence -> fail("Stale notice reached the POST")));
         state = step(passCi(state), MARK_READY_FOR_HUMAN);
         var current = notices().claim().orElseThrow();
         assertEquals(state.version(), current.version());
-        var evidence = notices().reserve(current, 52, () -> {}).orElseThrow();
-        assertEquals(new AuthorNotice.Evidence(Ci.PASSED, AuthorNotice.ProviderEvidence.CODEX,
-                AuthorNotice.ProviderEvidence.CODEX), evidence);
-        notices().sent(current, 17);
+        assertTrue(notices().deliver(current, 52, () -> {}, evidence -> {
+            assertEquals(new AuthorNotice.Evidence(Ci.PASSED, AuthorNotice.ProviderEvidence.CODEX,
+                    AuthorNotice.ProviderEvidence.CODEX), evidence);
+            return 17;
+        }));
         assertEquals(17L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
 
         step(step(state, PAUSE), RESUME);
-        assertTrue(notices().reserve(notices().claim().orElseThrow(), 52, () -> {}).isEmpty());
+        assertFalse(notices().deliver(notices().claim().orElseThrow(), 52, () -> {}, evidence -> fail("Duplicate POST")));
     }
 
     @Test
@@ -178,11 +184,10 @@ class ReviewStateIntegrationTest {
         var notices = notices();
         var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
         var attempts = new java.util.concurrent.atomic.AtomicInteger();
-        var worker = new NotifyAuthor(notices, (job, reserve) -> {
-            if (reserve.apply(52).isEmpty()) return OptionalLong.empty();
+        var worker = new NotifyAuthor(notices, (job, delivery) -> delivery.send(52, evidence -> {
             attempts.incrementAndGet();
             throw new IllegalStateException("Synthetic lost response");
-        }, authorization);
+        }), authorization);
         assertThrows(IllegalStateException.class, worker::processNext);
         assertEquals(1, attempts.get());
         state = step(step(state, PAUSE), RESUME);
@@ -196,7 +201,7 @@ class ReviewStateIntegrationTest {
         var job = notices.claim().orElseThrow();
         assertEquals(ACTION_REQUIRED, job.state());
         assertEquals(state.headSha(), job.headSha());
-        assertTrue(notices.reserve(job, 52, () -> {}).isPresent());
+        assertTrue(notices.deliver(job, 52, () -> {}, evidence -> 18));
     }
 
     @Test
@@ -208,10 +213,10 @@ class ReviewStateIntegrationTest {
         jdbc.update("UPDATE author_notifications SET available_at = now() - interval '1 minute'");
         var secondClaim = notices.claim().orElseThrow();
         assertEquals(firstClaim.id(), secondClaim.id());
-        assertTrue(notices.reserve(firstClaim, 52, () -> {}).isEmpty());
+        assertFalse(notices.deliver(firstClaim, 52, () -> {}, evidence -> fail("Stale claim reached the POST")));
         notices.skip(firstClaim);
         step(state, UPDATE_HEAD);
-        assertTrue(notices.reserve(secondClaim, 52, () -> {}).isEmpty());
+        assertFalse(notices.deliver(secondClaim, 52, () -> {}, evidence -> fail("Stale head reached the POST")));
     }
 
     @Test
@@ -225,11 +230,66 @@ class ReviewStateIntegrationTest {
         var left = notices().claim().orElseThrow();
         var right = notices().claim().orElseThrow();
         try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
-            var first = workers.submit(() -> notices().reserve(left, 52, () -> {}));
-            var second = workers.submit(() -> notices().reserve(right, 52, () -> {}));
-            assertNotEquals(first.get(5, TimeUnit.SECONDS).isPresent(), second.get(5, TimeUnit.SECONDS).isPresent());
+            var first = workers.submit(() -> notices().deliver(left, 52, () -> {}, evidence -> 17));
+            var second = workers.submit(() -> notices().deliver(right, 52, () -> {}, evidence -> 18));
+            assertNotEquals(first.get(5, TimeUnit.SECONDS), second.get(5, TimeUnit.SECONDS));
         }
         assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE recipient_id = 52", Integer.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void notificationDoesNotPostIfAuthorizationIsRevokedAfterPermitCommit(boolean suspendInstallation) {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var observer = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+        var membership = new JdbcInstallationAuthorization(jdbc);
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), scope -> {
+            if (Boolean.TRUE.equals(observer.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM author_notifications WHERE status = 'ATTEMPTED')
+                    """, Boolean.class))) {
+                revokeNoticeAuthorization(observer, suspendInstallation);
+            }
+            return membership.isActiveAndEnabled(scope);
+        });
+        var worker = new NotifyAuthor(notices(), (job, delivery) -> delivery.send(52, evidence ->
+                fail("Authorization was revoked before the POST")), authorization);
+
+        worker.processNext();
+
+        assertFalse(membership.isActiveAndEnabled(FIRST.scope()));
+        assertEquals("ATTEMPTED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        assertTrue(notices().claim().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void notificationHoldsAuthorizationLocksThroughThePost(boolean suspendInstallation) {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var notices = notices();
+        var job = notices.claim().orElseThrow();
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var revocation = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        revocation.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        assertTrue(notices.deliver(job, 52, () -> authorization.requireAuthorized(FIRST.scope()), evidence -> {
+            var blocked = assertThrows(DataAccessException.class, () -> revocation.executeWithoutResult(status -> {
+                jdbc.execute("SET LOCAL lock_timeout = '100ms'");
+                revokeNoticeAuthorization(jdbc, suspendInstallation);
+            }));
+            assertEquals("55P03", assertInstanceOf(SQLException.class, blocked.getMostSpecificCause()).getSQLState());
+            return 17;
+        }));
+        assertEquals(17L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+        revokeNoticeAuthorization(jdbc, suspendInstallation);
+        assertThrows(AuthorizationDenied.class, () -> authorization.requireAuthorized(FIRST.scope()));
+    }
+
+    private void revokeNoticeAuthorization(JdbcTemplate connection, boolean suspendInstallation) {
+        if (suspendInstallation) {
+            connection.update("UPDATE installations SET status = 'SUSPENDED' WHERE installation_id = 101");
+        } else {
+            connection.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101 AND repository_id = 1001");
+        }
     }
 
     @Test

@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.transaction.PlatformTransactionManager;
 
 @Configuration(proxyBeanMethods = false)
 public class AuthorNoticeConfiguration {
@@ -28,11 +29,12 @@ public class AuthorNoticeConfiguration {
     static class Delivery {
         @Bean
         Ticks authorNotificationTicks(JdbcTemplate jdbc, JdbcReviewStateStore states, GitHubInstallationTokens tokens,
-                RepositoryAuthorization authorization, @Value("${orchestrator.notifications.bot-login:}") String botLogin) {
+                RepositoryAuthorization authorization, PlatformTransactionManager manager,
+                @Value("${orchestrator.notifications.bot-login:}") String botLogin) {
             if (!botLogin.matches("[a-zA-Z0-9-]{1,100}\\[bot\\]")) {
                 throw new IllegalArgumentException("A GitHub App bot login is required for author notifications");
             }
-            return new Ticks(new NotifyAuthor(new JdbcAuthorNoticeStore(jdbc, states),
+            return new Ticks(new NotifyAuthor(new JdbcAuthorNoticeStore(jdbc, states, manager),
                     new GitHubAuthorNotices(tokens, Clock.systemUTC(), botLogin), authorization));
         }
     }

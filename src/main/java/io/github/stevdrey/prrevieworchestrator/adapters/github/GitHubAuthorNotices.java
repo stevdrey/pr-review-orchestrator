@@ -11,10 +11,7 @@ import java.net.http.HttpResponse;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Map;
-import java.util.Optional;
-import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
-import java.util.function.LongFunction;
 import java.util.regex.Pattern;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
@@ -23,7 +20,9 @@ import tools.jackson.databind.json.JsonMapper;
 
 public final class GitHubAuthorNotices implements AuthorNoticePublisher {
     static final String MARKER = "<!-- pr-review-orchestrator:author-notice:v1 -->\n";
-    private static final Pattern USER_LOGIN = Pattern.compile("[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?");
+    // GitHub.com appends an underscore and an alphanumeric shortcode for managed users.
+    private static final Pattern USER_LOGIN =
+            Pattern.compile("[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?(?:_[a-zA-Z0-9]{3,8})?");
     private static final Duration DEADLINE = Duration.ofSeconds(3);
     private final GitHubInstallationTokens tokens;
     private final Clock clock;
@@ -47,7 +46,7 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
     }
 
     @Override
-    public OptionalLong publish(Job job, LongFunction<Optional<Evidence>> reserve) {
+    public boolean publish(Job job, Delivery delivery) {
         try {
             var token = tokens.issueForAuthorNotification(job.pr().scope());
             String repository = "repos/" + token.repository();
@@ -61,32 +60,20 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
             }
             if (!"open".equals(pr.path("state").asString()) || pr.path("draft").asBoolean()
                     || !job.headSha().equals(head.asString())) {
-                return OptionalLong.empty();
+                return false;
             }
             JsonNode author = pr.path("user");
             String login = author.path("login").asString();
             long recipient = id(author.path("id"));
             if (!"User".equals(author.path("type").asString()) || !author.path("login").isString()
-                    || !USER_LOGIN.matcher(login).matches()
+                    || login.length() > 39 || !USER_LOGIN.matcher(login).matches()
                     || "ghost".equalsIgnoreCase(login) || recipient <= 0) {
-                return OptionalLong.empty();
+                return false;
             }
             if (!token.expiresAt().isAfter(clock.instant().plusSeconds(10))) throw unavailable();
-            var evidence = reserve.apply(recipient);
-            if (evidence.isEmpty()) return OptionalLong.empty();
-
             String link = "https://github.com/" + token.repository() + "/pull/" + number;
-            String body = message(job, evidence.get(), login, link);
-            // GitHub has no conditional comment creation or idempotency key. The committed permit
-            // prevents any later retry of this POST, including when we cannot prove the outcome.
-            var comment = exchange(token, repository + "/issues/" + number + "/comments", body);
-            long commentId = id(comment.path("id"));
-            if (commentId <= 0 || !body.equals(comment.path("body").asString())
-                    || !botLogin.equalsIgnoreCase(comment.path("user").path("login").asString())
-                    || !"Bot".equals(comment.path("user").path("type").asString())) {
-                throw unavailable();
-            }
-            return OptionalLong.of(commentId);
+            return delivery.send(recipient, evidence ->
+                    post(token, repository + "/issues/" + number + "/comments", message(job, evidence, login, link)));
         } catch (AuthorizationDenied denied) {
             throw new AuthorizationDenied();
         } catch (InterruptedException interrupted) {
@@ -95,6 +82,24 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
         } catch (Exception ignored) {
             throw unavailable();
         }
+    }
+
+    private long post(InstallationToken token, String path, String body) {
+        if (!token.expiresAt().isAfter(clock.instant().plus(DEADLINE))) throw unavailable();
+        try {
+            var comment = exchange(token, path, body);
+            long commentId = id(comment.path("id"));
+            if (commentId > 0 && body.equals(comment.path("body").asString())
+                    && botLogin.equalsIgnoreCase(comment.path("user").path("login").asString())
+                    && "Bot".equals(comment.path("user").path("type").asString())) {
+                return commentId;
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ignored) {
+            // The committed permit survives failures with an uncertain GitHub outcome.
+        }
+        throw unavailable();
     }
 
     private String message(Job job, Evidence evidence, String login, String link) {

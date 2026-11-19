@@ -20,9 +20,9 @@ public final class NotifyAuthor {
             Runnable authorize = () -> authorization.requireAuthorized(job.pr().scope());
             try {
                 authorize.run();
-                var receipt = publisher.publish(job, recipient -> store.reserve(job, recipient, authorize));
-                if (receipt.isPresent()) store.sent(job, receipt.getAsLong());
-                else store.skip(job);
+                if (!publisher.publish(job, (recipient, post) -> store.deliver(job, recipient, authorize, post))) {
+                    store.skip(job);
+                }
             } catch (AuthorizationDenied denied) {
                 store.skip(job);
             }
