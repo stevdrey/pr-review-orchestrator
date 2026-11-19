@@ -107,9 +107,12 @@ public final class GitHubReviewNormalizer {
 
     private boolean ownNotification(JsonNode comment) {
         JsonNode actor = comment.path("author");
-        return !notificationBotLogin.isEmpty() && "Bot".equals(actor.path("__typename").asString())
-                && notificationBotLogin.equalsIgnoreCase(actor.path("login").asString())
-                && body(comment).startsWith(GitHubAuthorNotices.MARKER);
+        if (notificationBotLogin.isEmpty() || !"Bot".equals(actor.path("__typename").asString())) return false;
+        String login = actor.path("login").asString();
+        // GraphQL Bot logins can omit the REST [bot] suffix.
+        boolean sameApp = notificationBotLogin.equalsIgnoreCase(login)
+                || notificationBotLogin.equalsIgnoreCase(login + "[bot]");
+        return sameApp && body(comment).startsWith(GitHubAuthorNotices.MARKER);
     }
 
     private Iterable<JsonNode> nodes(JsonNode connection) {

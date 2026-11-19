@@ -19,7 +19,7 @@ orchestrator:
     bot-login: example-review-app[bot]
 ```
 
-Set `bot-login` to the exact identity of the same GitHub App. GraphQL evidence fetchers must select `author { __typename login }` on PR conversation comments and use the configured `GitHubReviewNormalizer`. The normalizer retains comment provenance and classifies the App's own marked notices as system messages. A marker copied into a user comment or another bot's comment carries no authority. Keep the configured bot identity available to normalization while delivery is disabled. Event planners must continue excluding bot-generated comment events from review triggers.
+Set `bot-login` to the REST login of the same GitHub App, including `[bot]`. GraphQL evidence fetchers must select `author { __typename login }` on PR conversation comments and use the configured `GitHubReviewNormalizer`. The normalizer recognizes matching `Bot` actors with or without the suffix, retains comment provenance and classifies the App's own marked notices as system messages. A marker copied into a user comment or another bot's comment carries no authority. Keep the configured bot identity available to normalization while delivery is disabled. Event planners must continue excluding bot-generated comment events from review triggers.
 
 GitHub controls delivery of the mention under the author's notification settings. This feature uses the GitHub channel. Email requires a separate integration with verified addresses and explicit opt-in.
 
@@ -39,3 +39,5 @@ Disabling delivery stops scheduled sends. The outbox retains transition intents 
 ## Verification
 
 `./gradlew --offline clean build` passed all 297 tests on Java 27 with Testcontainers PostgreSQL and a local GitHub API fixture. Coverage includes transition capture, CI invalidation, head changes, concurrent reservations, uncertain POST outcomes, metadata-only messages and bot notice classification. `git diff --check` passed. Live App permission and author mention delivery remain unverified.
+
+In the PR #66 follow-up, `./gradlew --offline test --tests '*.GitHubReviewNormalizerTest.onlyRecognizedAppNotificationIsExcludedFromFeedback'` reproduced the misclassification on `124599f` with the GraphQL login shape. After the fix, `./gradlew --offline test --tests '*.GitHubReviewNormalizerTest'` passed, including checks for a human with the same login, an unrelated bot and a comment without the notice marker.
