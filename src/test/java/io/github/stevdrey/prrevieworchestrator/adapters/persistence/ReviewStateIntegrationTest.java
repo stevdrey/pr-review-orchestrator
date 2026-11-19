@@ -9,6 +9,7 @@ import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
@@ -19,10 +20,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -140,6 +144,208 @@ class ReviewStateIntegrationTest {
 
     PullRequestReview passCi(PullRequestReview state) {
         return lifecycle.reconcileCi(state.version(), ci(state, Ci.PASSED));
+    }
+
+    private JdbcAuthorNoticeStore notices() {
+        var manager = new DataSourceTransactionManager(dataSource);
+        return new JdbcAuthorNoticeStore(jdbc, new JdbcReviewStateStore(jdbc, manager), manager);
+    }
+
+    @Test
+    void readyNoticeUsesCurrentCiAndCorrelatedProviderEvidenceAndSkipsEarlierReadiness() {
+        var state = reviewing(FIRST);
+        var baseline = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        state = outcomes().recordClean(baseline, UUID.randomUUID(), CLEAR);
+        var deep = outcome(state, ReviewOutcome.Stage.DEEP, ReviewOutcome.Conclusion.NO_FINDINGS);
+        state = outcomes().recordClean(deep, UUID.randomUUID(), CLEAR);
+        state = step(passCi(state), MARK_READY_FOR_HUMAN);
+        var previous = notices().claim().orElseThrow();
+
+        state = lifecycle.reconcileCi(state.version(), ci(state, Ci.PENDING));
+        assertFalse(notices().deliver(previous, 52, () -> {}, evidence -> fail("Stale notice reached the POST")));
+        state = step(passCi(state), MARK_READY_FOR_HUMAN);
+        var current = notices().claim().orElseThrow();
+        assertEquals(state.version(), current.version());
+        assertTrue(notices().deliver(current, 52, () -> {}, evidence -> {
+            assertEquals(new AuthorNotice.Evidence(Ci.PASSED, AuthorNotice.ProviderEvidence.CODEX,
+                    AuthorNotice.ProviderEvidence.CODEX), evidence);
+            return 17;
+        }));
+        assertEquals(17L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+
+        step(step(state, PAUSE), RESUME);
+        assertFalse(notices().deliver(notices().claim().orElseThrow(), 52, () -> {}, evidence -> fail("Duplicate POST")));
+    }
+
+    @Test
+    void notificationPermitSurvivesLostReceiptAndAnotherStateOnSameHeadCanNotify() {
+        var reviewed = step(step(reviewing(FIRST), BASELINE_CLEAN), DEEP_CLEAN);
+        var state = step(passCi(reviewed), MARK_READY_FOR_HUMAN);
+        var notices = notices();
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        var worker = new NotifyAuthor(notices, (job, delivery) -> delivery.send(52, evidence -> {
+            attempts.incrementAndGet();
+            throw new IllegalStateException("Synthetic lost response");
+        }), authorization);
+        assertThrows(IllegalStateException.class, worker::processNext);
+        assertEquals(1, attempts.get());
+        state = step(step(state, PAUSE), RESUME);
+        jdbc.update("UPDATE author_notifications SET available_at = now() - interval '1 minute'");
+        worker.processNext();
+        assertEquals(1, attempts.get());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE status = 'ATTEMPTED'", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE status = 'SKIPPED'", Integer.class));
+
+        step(state, BLOCKING_FINDINGS);
+        var job = notices.claim().orElseThrow();
+        assertEquals(ACTION_REQUIRED, job.state());
+        assertEquals(state.headSha(), job.headSha());
+        assertTrue(notices.deliver(job, 52, () -> {}, evidence -> 18));
+    }
+
+    @Test
+    void notificationClaimIsFencedAndPendingNoticeCannotFollowAHeadChange() {
+        var state = step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var notices = notices();
+        var firstClaim = notices.claim().orElseThrow();
+        assertTrue(notices.claim().isEmpty());
+        jdbc.update("UPDATE author_notifications SET available_at = now() - interval '1 minute'");
+        var secondClaim = notices.claim().orElseThrow();
+        assertEquals(firstClaim.id(), secondClaim.id());
+        assertFalse(notices.deliver(firstClaim, 52, () -> {}, evidence -> fail("Stale claim reached the POST")));
+        notices.skip(firstClaim);
+        step(state, UPDATE_HEAD);
+        assertFalse(notices.deliver(secondClaim, 52, () -> {}, evidence -> fail("Stale head reached the POST")));
+    }
+
+    @Test
+    void competingInstallationsCanReserveOnlyOneNoticeForTheSameGitHubRecipient() throws Exception {
+        var movedScope = new RepositoryScope(202, FIRST.scope().repositoryId());
+        jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (202, 1001, true)");
+        lifecycle = new ReviewLifecycle(new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource)),
+                new RepositoryAuthorization(Set.of(FIRST.scope(), movedScope), new JdbcInstallationAuthorization(jdbc)));
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        step(reviewing(new PullRequestId(movedScope, FIRST.number())), BLOCKING_FINDINGS);
+        var left = notices().claim().orElseThrow();
+        var right = notices().claim().orElseThrow();
+        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = workers.submit(() -> notices().deliver(left, 52, () -> {}, evidence -> 17));
+            var second = workers.submit(() -> notices().deliver(right, 52, () -> {}, evidence -> 18));
+            assertNotEquals(first.get(5, TimeUnit.SECONDS), second.get(5, TimeUnit.SECONDS));
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE recipient_id = 52", Integer.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void notificationDoesNotPostIfAuthorizationIsRevokedAfterPermitCommit(boolean suspendInstallation) {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var observer = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+        var membership = new JdbcInstallationAuthorization(jdbc);
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), scope -> {
+            if (Boolean.TRUE.equals(observer.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM author_notifications WHERE status = 'ATTEMPTED')
+                    """, Boolean.class))) {
+                revokeNoticeAuthorization(observer, suspendInstallation);
+            }
+            return membership.isActiveAndEnabled(scope);
+        });
+        var worker = new NotifyAuthor(notices(), (job, delivery) -> delivery.send(52, evidence ->
+                fail("Authorization was revoked before the POST")), authorization);
+
+        worker.processNext();
+
+        assertFalse(membership.isActiveAndEnabled(FIRST.scope()));
+        // Denied before any POST: the permit is released and the intent is skipped.
+        assertEquals("SKIPPED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        assertNull(jdbc.queryForObject("SELECT recipient_id FROM author_notifications", Long.class));
+        assertTrue(notices().claim().isEmpty());
+    }
+
+    private boolean permitCommitted() {
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM author_notifications WHERE status = 'ATTEMPTED')", Boolean.class));
+    }
+
+    @Test
+    void staleRecheckAfterPermitReleasesItSoALaterEntryCanNotify() {
+        var reviewed = step(step(reviewing(FIRST), BASELINE_CLEAN), DEEP_CLEAN);
+        var state = step(passCi(reviewed), MARK_READY_FOR_HUMAN);
+        var job = notices().claim().orElseThrow();
+        var paused = new java.util.concurrent.atomic.AtomicReference<PullRequestReview>();
+        // The send phase no longer holds the PR lock, so a lifecycle write can commit during it.
+        assertFalse(notices().deliver(job, 52, () -> {
+            if (paused.get() == null && permitCommitted()) paused.set(step(state, PAUSE));
+        }, evidence -> fail("Stale notice reached the POST")));
+        assertEquals(Map.of("status", "PENDING"), jdbc.queryForMap(
+                "SELECT status FROM author_notifications WHERE id = ? AND recipient_id IS NULL", job.id()));
+        notices().skip(job);
+
+        step(paused.get(), RESUME);
+        var resumed = notices().claim().orElseThrow();
+        assertNotEquals(job.id(), resumed.id());
+        assertTrue(notices().deliver(resumed, 52, () -> {}, evidence -> 19));
+        assertEquals(19L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+    }
+
+    @Test
+    void failuresBeforeThePostReturnThePermitForRetry() {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var job = notices().claim().orElseThrow();
+        assertThrows(AuthorizationUnavailable.class, () -> notices().deliver(job, 52, () -> {
+            if (permitCommitted()) throw new AuthorizationUnavailable();
+        }, evidence -> fail("Unauthorized notice reached the POST")));
+        String pending = "SELECT count(*) FROM author_notifications WHERE status = 'PENDING' AND recipient_id IS NULL";
+        assertEquals(1, jdbc.queryForObject(pending, Integer.class));
+
+        assertThrows(IllegalStateException.class, () -> notices().deliver(job, 52, () -> {}, evidence -> {
+            throw new io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticePublisher.NotPosted();
+        }));
+        assertEquals(1, jdbc.queryForObject(pending, Integer.class));
+        assertTrue(notices().deliver(job, 52, () -> {}, evidence -> 20));
+    }
+
+    @Test
+    void staleJobIsSkippedLocallyWithoutContactingGitHub() {
+        var state = step(reviewing(FIRST), BLOCKING_FINDINGS);
+        step(state, UPDATE_HEAD);
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var worker = new NotifyAuthor(notices(), (job, delivery) -> fail("Stale job reached GitHub"), authorization);
+        assertTrue(worker.processNext());
+        assertEquals("SKIPPED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        assertFalse(worker.processNext());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void notificationHoldsAuthorizationLocksThroughThePost(boolean suspendInstallation) {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var notices = notices();
+        var job = notices.claim().orElseThrow();
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var revocation = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        revocation.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        assertTrue(notices.deliver(job, 52, () -> authorization.requireAuthorized(FIRST.scope()), evidence -> {
+            var blocked = assertThrows(DataAccessException.class, () -> revocation.executeWithoutResult(status -> {
+                jdbc.execute("SET LOCAL lock_timeout = '100ms'");
+                revokeNoticeAuthorization(jdbc, suspendInstallation);
+            }));
+            assertEquals("55P03", assertInstanceOf(SQLException.class, blocked.getMostSpecificCause()).getSQLState());
+            return 17;
+        }));
+        assertEquals(17L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+        revokeNoticeAuthorization(jdbc, suspendInstallation);
+        assertThrows(AuthorizationDenied.class, () -> authorization.requireAuthorized(FIRST.scope()));
+    }
+
+    private void revokeNoticeAuthorization(JdbcTemplate connection, boolean suspendInstallation) {
+        if (suspendInstallation) {
+            connection.update("UPDATE installations SET status = 'SUSPENDED' WHERE installation_id = 101");
+        } else {
+            connection.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101 AND repository_id = 1001");
+        }
     }
 
     @Test
@@ -1114,7 +1320,7 @@ class ReviewStateIntegrationTest {
                            (101, 1001, 8, ?, 'PAUSED', 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(2, latest.migrate().migrationsExecuted);
+            assertEquals(3, latest.migrate().migrationsExecuted);
             assertEquals("DEEP_REVIEW", jdbc.queryForObject(
                     "SELECT state FROM ci_upgrade_fixture.pr_review_states WHERE pr_number = 7", String.class));
             assertEquals(Map.of("state", "PAUSED", "resume_state", "DEEP_REVIEW", "ci_status", "UNKNOWN", "deep_clean_sha", HEAD),
@@ -1174,7 +1380,7 @@ class ReviewStateIntegrationTest {
                     """, requestId, snapshot.id(), "2".repeat(64));
 
             var latest = Flyway.configure().dataSource(scoped).schemas(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             var fixed = stateStore.find(FIRST, () -> {}).orElseThrow();
             assertEquals(Ci.UNKNOWN, fixed.ci());
             assertEquals(NEXT, fixed.headSha());

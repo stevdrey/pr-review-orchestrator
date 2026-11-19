@@ -32,9 +32,9 @@ An optional adapter may expose read-only PR status and controlled actions via MC
 
 Possible event kinds: `pr.review.completed`, `pr.feedback.detected`, `pr.feedback.resolved`, `pr.ci.failed`, `pr.ready.for.validation`, `pr.review.limit.reached`, `pr.human.approval.required`. Include event ID, repo/PR identifiers, SHA, trace ID and only redacted metadata. Apply replay/idempotency and opt-in subscription policies; do not send full source/diffs by default.
 
-## NotificationPort
+## Author notifications
 
-Notify PR author by email **only when an address and permission are legitimately available**; GitHub notification/comment is the fallback. Respect opt-in, privacy and dedupe rules.
+The [author notification outbox and GitHub adapter](../development/author-notifications.md) deliver metadata-only PR conversation comments using a single-repository App token. Email requires a verified address and explicit opt-in.
 
 ## Optional OpenAI / Anthropic
 

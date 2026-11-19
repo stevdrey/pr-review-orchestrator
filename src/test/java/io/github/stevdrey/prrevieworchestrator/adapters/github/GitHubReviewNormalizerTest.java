@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 class GitHubReviewNormalizerTest {
     static final String HEAD = "a".repeat(40);
     static final PullRequestId PR = new PullRequestId(new RepositoryScope(101, 1001), 7);
-    final GitHubReviewNormalizer normalizer = new GitHubReviewNormalizer();
+    final GitHubReviewNormalizer normalizer = new GitHubReviewNormalizer("");
 
     @Test
     void preservesProvenanceWithoutTrustingProseOrTreatingRepliesAsFindings() throws Exception {
@@ -98,6 +98,29 @@ class GitHubReviewNormalizerTest {
         assertTrue(root.staleFor(HEAD));
         assertNull(source(snapshot, "R1").reviewedSha());
         assertTrue(source(snapshot, "R1").staleFor(HEAD));
+    }
+
+    @Test
+    void onlyRecognizedAppNotificationIsExcludedFromFeedback() throws Exception {
+        String body = GitHubAuthorNotices.MARKER.strip() + "\\nReady for human review";
+        String comments = """
+                "nodes": [
+                    {"id":"I1", "body":"%s", "author":{"__typename":"Bot","login":"app"}, "updatedAt":"2026-11-16T10:00:00Z"},
+                    {"id":"I2", "body":"%s", "author":{"__typename":"User","login":"app"}, "updatedAt":"2026-11-16T10:00:00Z"},
+                    {"id":"I3", "body":"%s", "author":{"__typename":"Bot","login":"another"}, "updatedAt":"2026-11-16T10:00:00Z"},
+                    {"id":"I4", "body":"Concern", "author":{"__typename":"Bot","login":"app"}, "updatedAt":"2026-11-16T10:00:00Z"},
+                    {"id":"I5", "body":"%s", "author":{"__typename":"Bot","login":"APP[bot]"}, "updatedAt":"2026-11-16T10:00:00Z"}
+                ]
+                """.formatted(body, body, body, body);
+        String response = fixture().replace("\"nodes\": []", comments);
+        var snapshot = new GitHubReviewNormalizer("app[bot]").normalize(UUID.randomUUID(), UUID.randomUUID(), PR, HEAD,
+                Instant.now(), response.getBytes(StandardCharsets.UTF_8), Map.of(), Set.of("I1"));
+        assertEquals(Feedback.NONE, source(snapshot, "I1").feedback());
+        assertEquals("app", source(snapshot, "I1").author());
+        assertEquals(Feedback.NONE, source(snapshot, "I5").feedback());
+        for (String id : List.of("I2", "I3", "I4")) {
+            assertEquals(Feedback.NEEDS_HUMAN, source(snapshot, id).feedback());
+        }
     }
 
     @Test

@@ -2,7 +2,7 @@
 
 ## Delivered boundary
 
-The service now has an installation/repository authorization gate, a PostgreSQL membership adapter, RS256 App authentication and a repository-scoped **read-only** installation-token client. Token issuance is disabled unless `orchestrator.github.enabled=true`; the deployment allowlist is empty by default. No HTTP token endpoint, installation auto-enrollment, scheduled GitHub calls, comment writer or OAuth callback is supplied. Issue #12 adds a separate opt-in [webhook receiver](webhook-ingress.md). Merely starting the service never contacts GitHub.
+The service now has an installation/repository authorization gate, a PostgreSQL membership adapter, RS256 App authentication and repository-scoped installation tokens for specific operations. Token issuance is disabled unless `orchestrator.github.enabled=true`; the deployment allowlist is empty by default. Issue #22 adds separately enabled [GitHub author notifications](../development/author-notifications.md). Issue #12 adds a separate opt-in [webhook receiver](webhook-ingress.md). With notifications and dispatch disabled, starting the service does not contact GitHub.
 
 This is the implementation and operator registration contract for [issue #11](https://github.com/stevdrey/pr-review-orchestrator/issues/11), under accepted [ADR 0002](../adr/0002-github-app-webhook-trust.md). The [registration evidence](issue-11-registration-evidence.md) records the operator-approved development App, installation on three repositories and live scoped-token checks. Remote token invalidation remains unproven; this is distinct from local authorization checks and does not certify other installations. Webhook signature validation and replay-safe metadata acceptance are documented under [issue #12 ingress](webhook-ingress.md); asynchronous processing remains #13.
 
@@ -20,9 +20,9 @@ Configure these repository permissions for the read-only integration contract; g
 | `checks` | Read | Check runs and suites for the reviewed SHA | `CHECKS` |
 | `actions` | Read | Workflow-run status for the reviewed SHA | `WORKFLOWS` |
 
-Every issued token requests **one repository ID** and **only one operation's permission plus metadata**. There is no arbitrary permission input or write operation. Do not grant Contents, Administration, Workflows write, Checks write, organization membership, email access, secrets, deployments or merge authority. PR diffs do not require cloning repository contents in this increment.
+Every issued token requests **one repository ID** and **only one operation's permission plus metadata**. The client accepts only the predefined operation scopes. Do not grant Contents, Administration, Workflows write, Checks write, organization membership, email access, secrets, deployments or merge authority. PR diffs do not require cloning repository contents in this increment.
 
-A later comment/notification implementation must justify and explicitly approve upgrading `pull_requests` to write for PR conversation writes (or `issues` write for issue writes), then add an action-specific token policy with current-SHA/idempotency gates. Do not enable these permissions preemptively. Do not use a user token or a PAT to compensate for missing App permissions.
+For [author notifications](../development/author-notifications.md), the operator must approve upgrading the App to **Pull requests: write**. This permits PR conversation comments using an action-specific installation token scoped to one repository. Keep the read-only registration for deployments without notifications.
 
 ## Event subscription contract (activate only with verified ingress)
 

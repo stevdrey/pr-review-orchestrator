@@ -23,6 +23,8 @@ import tools.jackson.databind.json.JsonMapper;
 
 /** No cache, retry, redirect, caller-supplied host, or user-token fallback. */
 public final class GitHubInstallationTokens {
+    private static final Map<String, String> NOTIFICATION_PERMISSIONS =
+            Map.of("metadata", "read", "pull_requests", "write");
     private static final URI API = URI.create("https://api.github.com/");
     private static final Duration DEADLINE = Duration.ofSeconds(10);
     static final int MAX_BODY_BYTES = 64 * 1024;
@@ -55,10 +57,18 @@ public final class GitHubInstallationTokens {
     }
 
     public InstallationToken issue(RepositoryScope scope, GitHubReadOperation operation) {
-        authorization.requireAuthorized(scope);
         if (operation == null) {
             throw new IllegalArgumentException("A supported GitHub read operation is required");
         }
+        return issue(scope, operation.permissions(), false);
+    }
+
+    InstallationToken issueForAuthorNotification(RepositoryScope scope) {
+        return issue(scope, NOTIFICATION_PERMISSIONS, true);
+    }
+
+    private InstallationToken issue(RepositoryScope scope, Map<String, String> requested, boolean requireRepositoryName) {
+        authorization.requireAuthorized(scope);
         String token = null;
         try {
             var request = HttpRequest.newBuilder(api.resolve("app/installations/" + scope.installationId() + "/access_tokens"))
@@ -68,7 +78,7 @@ public final class GitHubInstallationTokens {
                     .header("Content-Type", "application/json")
                     .header("X-GitHub-Api-Version", "2026-03-10")
                     .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(Map.of(
-                            "repository_ids", List.of(scope.repositoryId()), "permissions", operation.permissions()))))
+                            "repository_ids", List.of(scope.repositoryId()), "permissions", requested))))
                     .build();
             // One deadline covers headers and body; only a successful response body is buffered, and only up to a cap.
             var response = within(http.sendAsync(request, info -> info.statusCode() == 201
@@ -95,14 +105,23 @@ public final class GitHubInstallationTokens {
             JsonNode repositories = body.path("repositories");
             if (!repositories.isArray() || repositories.size() != 1
                     || !repositories.get(0).path("id").isIntegralNumber()
+                    || !repositories.get(0).path("id").canConvertToLong()
                     || repositories.get(0).path("id").asLong() != scope.repositoryId()) {
                 throw new IllegalStateException();
             }
+            String repository = null;
+            if (requireRepositoryName) {
+                repository = repositories.get(0).path("full_name").asString();
+                if (!repository.matches("[a-zA-Z0-9-]{1,39}/[a-zA-Z0-9_.-]{1,100}")
+                        || repository.endsWith("/.") || repository.endsWith("/..")) {
+                    throw new IllegalStateException();
+                }
+            }
             JsonNode permissions = body.path("permissions");
-            if (!permissions.isObject() || permissions.size() != operation.permissions().size()) {
+            if (!permissions.isObject() || permissions.size() != requested.size()) {
                 throw new IllegalStateException();
             }
-            for (var permission : operation.permissions().entrySet()) {
+            for (var permission : requested.entrySet()) {
                 JsonNode granted = permissions.path(permission.getKey());
                 if (!granted.isString() || !permission.getValue().equals(granted.asString())) {
                     throw new IllegalStateException();
@@ -110,7 +129,7 @@ public final class GitHubInstallationTokens {
             }
             // A revocation/disable committed during the HTTP exchange must prevent use of this token.
             authorization.requireAuthorized(scope);
-            return new InstallationToken(token, expiry);
+            return new InstallationToken(token, expiry, repository);
         } catch (SecurityException denied) {
             // Keep authorization denials distinct from transient unavailability; the gate's exception is sanitized.
             revoke(token);
@@ -124,6 +143,11 @@ public final class GitHubInstallationTokens {
             revoke(token);
             throw unavailable();
         }
+    }
+
+    /** Best-effort revocation of a single-use token after its action; all outcomes are ignored. */
+    void revoke(InstallationToken token) {
+        revoke(token.secret());
     }
 
     /** Best-effort: a rejected token must not stay usable remotely. All outcomes are ignored. */

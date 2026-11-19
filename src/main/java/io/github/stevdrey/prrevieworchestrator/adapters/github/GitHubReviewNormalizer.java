@@ -15,6 +15,12 @@ public final class GitHubReviewNormalizer {
     private static final JsonMapper JSON = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
+    private final String notificationBotLogin;
+
+    /** Pass the App's bot login, or "" only where the App never posts author notices. */
+    public GitHubReviewNormalizer(String notificationBotLogin) {
+        this.notificationBotLogin = Objects.requireNonNull(notificationBotLogin);
+    }
 
     public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
             Instant capturedAt, byte[] response) {
@@ -63,7 +69,7 @@ public final class GitHubReviewNormalizer {
                 sources.add(new Source(id, Kind.ISSUE_COMMENT, null, null, null, author(comment),
                         null, null, hash(body(comment)), Instant.parse(string(comment, "updatedAt")),
                         null, null, null, null, null, null, severities.getOrDefault(id, Severity.UNKNOWN),
-                        feedback(comment, actionableIds)));
+                        ownNotification(comment) ? Feedback.NONE : feedback(comment, actionableIds)));
             }
             for (JsonNode thread : nodes(pull.path("reviewThreads"))) {
                 String threadId = string(thread, "id");
@@ -94,6 +100,19 @@ public final class GitHubReviewNormalizer {
     private Feedback feedback(JsonNode node, Set<String> actionableIds) {
         if (body(node).isBlank()) return Feedback.NONE;
         return actionableIds.contains(string(node, "id")) ? Feedback.ACTIONABLE : Feedback.NEEDS_HUMAN;
+    }
+
+    private boolean ownNotification(JsonNode comment) {
+        JsonNode actor = comment.path("author");
+        if (notificationBotLogin.isEmpty()) return false;
+        // Without the actor type a marked notice cannot be told apart from a user copy; fail closed.
+        require(actor.isNull() || actor.path("__typename").isString());
+        if (!"Bot".equals(actor.path("__typename").asString())) return false;
+        String login = actor.path("login").asString();
+        // GraphQL Bot logins can omit the REST [bot] suffix.
+        boolean sameApp = notificationBotLogin.equalsIgnoreCase(login)
+                || notificationBotLogin.equalsIgnoreCase(login + "[bot]");
+        return sameApp && body(comment).startsWith(GitHubAuthorNotices.MARKER);
     }
 
     private Iterable<JsonNode> nodes(JsonNode connection) {

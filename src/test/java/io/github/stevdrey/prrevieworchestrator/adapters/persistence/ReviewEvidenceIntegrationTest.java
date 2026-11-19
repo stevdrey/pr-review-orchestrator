@@ -70,7 +70,7 @@ class ReviewEvidenceIntegrationTest {
     }
 
     Snapshot snapshot(UUID id, UUID cycle, String sha, Instant at, String content) {
-        return new GitHubReviewNormalizer().normalize(id, cycle, PR, sha, at,
+        return new GitHubReviewNormalizer("").normalize(id, cycle, PR, sha, at,
                 content.getBytes(StandardCharsets.UTF_8), Map.of("C1", Severity.HIGH));
     }
 
@@ -262,7 +262,7 @@ class ReviewEvidenceIntegrationTest {
                     VALUES (?, ?, 101, 1001, ?, 'github', 'REVIEW_COMMENT', 'legacy-comment', 'legacy-thread', true)
                     """, finding, cycle, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(10, latest.migrate().migrationsExecuted);
+            assertEquals(11, latest.migrate().migrationsExecuted);
             var row = jdbc.queryForMap("SELECT * FROM review_upgrade_fixture.findings WHERE id = ?", finding);
             assertEquals("legacy-comment", row.get("source_id"));
             assertEquals("legacy-thread", row.get("thread_id"));

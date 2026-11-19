@@ -1,6 +1,6 @@
 # Review lifecycle and stop conditions
 
-**Internal state machine implemented; live orchestration remains planned.** Issue #15 supplies persistent guarded transitions and clean evidence for exact head SHAs. See the [action/guard table, caller trust contract and verification](../development/review-state-machine.md). The diagram below is the broader target workflow; separate budget states, provider dispatch and automatic notifications are not enabled.
+**Internal state machine implemented; live orchestration remains planned.** Issue #15 supplies persistent guarded transitions and clean evidence for exact head SHAs. See the [action/guard table, caller trust contract and verification](../development/review-state-machine.md). The diagram below is the broader target workflow; Provider dispatch remains disabled by default.
 
 ```mermaid
 stateDiagram-v2
@@ -48,4 +48,4 @@ Issue #17 implements [general findings and audited internal dispositions](../dev
 
 ## Notifications
 
-Send human notifications only for state changes (ready, paused, budget, required intervention) with a per-recipient dedupe key. Default notice for clean review: link to PR, SHA, provider stages, CI evidence and caveat that the code still requires human merge authorization.
+The [opt-in GitHub author notification worker](../development/author-notifications.md) sends on entry into ready-for-human or action-required states. Each notice is tied to the PR's head SHA and verified author, with CI and review evidence and a next action.
