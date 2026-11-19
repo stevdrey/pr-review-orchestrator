@@ -23,6 +23,8 @@ A late completion during an existing pause updates the request's fingerprint and
 
 An authenticated completed assessment with no comparable findings stores the latest snapshot with a null fingerprint. This breaks the comparison with the next round and retains the request's pause attribution. Recording a clean outcome also clears the request's comparable fingerprint.
 
+An authenticated `FINDINGS` conclusion can make a previous `UNSTRUCTURED` assessment comparable on the same snapshot. A change to the snapshot, review source ID or fingerprint triggers comparison when the resulting fingerprint is comparable and the request is eligible to pause.
+
 ## Rollout and verification
 
 V14 preserves request IDs, keys, states and receipts. It assigns iteration slots to retained requests and initializes CI to unknown, withdrawing unsupported legacy readiness while retaining clean verdicts and history. V15 invalidates cached V14 fingerprints because V14 did not record uncomparable assessments. It keeps the assessment snapshots and pause history. V15 also clears persisted CI that the journal cannot tie to the current head visit and resets CI on journaled head updates and confirmations from older writers.

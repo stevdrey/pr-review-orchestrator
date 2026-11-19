@@ -152,16 +152,18 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                         rs.getString(3), rs.getBoolean(4)), run.requestId()).stream().findFirst().orElse(null);
         var current = states.load(run.pr(), false).orElseThrow();
         boolean previouslyStopped = stored != null && stored.noProgress();
-        boolean sameSnapshot = stored != null && stored.snapshotId().equals(assessment.snapshotId());
+        // The provider conclusion can make findings comparable without a new GitHub snapshot.
+        boolean sameEvidence = stored != null && stored.snapshotId().equals(assessment.snapshotId())
+                && stored.reviewId().equals(reviewId) && Objects.equals(stored.fingerprint(), fingerprint);
         // The journal key binds the hold to this request across snapshot changes and human resumes.
         UUID stopId = UUID.nameUUIDFromBytes(("review-no-progress/" + run.requestId()).getBytes(StandardCharsets.UTF_8));
         var updated = current;
-        if (!sameSnapshot && fingerprint != null && !previouslyStopped && current.state() != State.PAUSED
+        if (!sameEvidence && fingerprint != null && !previouslyStopped && current.state() != State.PAUSED
                 && repeatsPriorRound(run, reviewId, fingerprint)) {
             updated = states.stopLocked(current, Intervention.NO_PROGRESS, stopId);
         }
         boolean causedPause = updated.version() != current.version();
-        if (!sameSnapshot || !stored.reviewId().equals(reviewId) || !Objects.equals(stored.fingerprint(), fingerprint)) {
+        if (!sameEvidence) {
             saveProgress(assessment, fingerprint, causedPause);
         }
         return causedPause || (outcome.verdict() == Verdict.ACTION_REQUIRED && previouslyStopped && ownsActivePause(updated, stopId))

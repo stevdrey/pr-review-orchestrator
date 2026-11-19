@@ -327,6 +327,33 @@ class ReviewStateIntegrationTest {
         assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
     }
 
+    @Test
+    void refinedCompletionRechecksNoProgressOnTheSameSnapshot() {
+        var firstState = reviewing(FIRST);
+        var stage = ReviewOutcome.Stage.BASELINE;
+        String finding = "1".repeat(64);
+        var first = outcome(firstState, stage, ReviewOutcome.Conclusion.FINDINGS, "review-first", finding);
+        assertEquals(ReviewOutcome.Reason.BLOCKING_FINDINGS, outcomes().assess(first).reason());
+
+        var reviewing = step(passCi(step(firstState, UPDATE_HEAD)), START_REVIEW);
+        var unstructured = outcome(reviewing, stage, ReviewOutcome.Conclusion.UNSTRUCTURED, "review-second", finding);
+        assertEquals(ReviewOutcome.Reason.BLOCKING_FINDINGS, outcomes().assess(unstructured).reason());
+        assertEquals(reviewing, lifecycle.find(FIRST).orElseThrow());
+
+        var completed = new ReviewOutcome.Completion(unstructured.run(), unstructured.completion().reviewId(),
+                ReviewOutcome.Status.COMPLETED, ReviewOutcome.Conclusion.FINDINGS);
+        var refined = new ReviewOutcome.Assessment(unstructured.run(), unstructured.expectedVersion(),
+                completed, unstructured.snapshotId());
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(refined).reason());
+        var paused = lifecycle.find(FIRST).orElseThrow();
+        assertEquals(PAUSED, paused.state());
+        assertEquals(PullRequestReview.Intervention.NO_PROGRESS, paused.intervention());
+
+        var replay = new ReviewOutcome.Assessment(refined.run(), paused.version(), completed, refined.snapshotId());
+        assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(replay).reason());
+        assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
+    }
+
     @ParameterizedTest
     @CsvSource({"false", "true"})
     void newerUncomparableSnapshotClearsTheFingerprintAndPreservesPauseOwnership(boolean ownedPause) {
