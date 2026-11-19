@@ -1,6 +1,6 @@
 # ADR 0004: Deterministic policy before AI decisions, with hard budgets
 
-**Status:** Accepted (implementation pending)  
+**Status:** Accepted (internal CI, iteration and no-progress gates implemented; verified financial budgets pending)
 **Date:** 2026-11-13
 
 ## Context
@@ -22,3 +22,5 @@ Let model decide all actions: vulnerable to prompt injection, unpredictable cost
 ## Verification
 
 Race tests on budget reservations; hard-cap bypass attempts; no-progress stop; model requesting forbidden action; missing usage metadata must fail closed or pause.
+
+Issue #21 implements [current-head CI and bounded review policy](../development/ci-and-iteration-policy.md). The persisted cap counts reservations across all stages and providers. Identical findings in consecutive authenticated rounds for a provider and stage pause the PR. Financial approval and accounting remain separate gates.

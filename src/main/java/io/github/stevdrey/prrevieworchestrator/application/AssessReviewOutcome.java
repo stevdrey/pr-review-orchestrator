@@ -16,7 +16,9 @@ public final class AssessReviewOutcome {
         this.authorization = Objects.requireNonNull(authorization);
     }
 
-    /** The version is captured with the evidence read, never refreshed to make delayed evidence pass. */
+    /** The version is captured with the evidence read, never refreshed to make delayed evidence pass.
+     * An authenticated completion updates progress evidence. Repeated actionable findings can request human intervention.
+     */
     public ReviewOutcome assess(Assessment assessment) {
         return store.assess(assessment, () -> authorization.requireAuthorized(assessment.run().pr().scope()));
     }

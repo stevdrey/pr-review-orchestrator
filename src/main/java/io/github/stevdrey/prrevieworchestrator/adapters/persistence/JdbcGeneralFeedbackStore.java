@@ -52,6 +52,32 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 AND s.feedback = f.feedback
             """;
 
+    // Shared by the pending-findings gate and the no-progress comparison.
+    static final String EFFECTIVE_INLINE_FINDING_CTES = """
+            inline_findings AS (
+                SELECT f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
+                    latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
+                FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
+                LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
+                LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
+                WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
+                    AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD')
+            ), effective_inline_findings AS (
+                SELECT f.* FROM inline_findings f
+                WHERE NOT EXISTS (
+                    -- Only a same-head observation can supersede a retained finding from another round.
+                    SELECT 1 FROM inline_findings n WHERE n.stable_finding_id = f.stable_finding_id
+                        AND (n.at_round > coalesce(f.at_round, f.linked_at)
+                            -- A copy only seen in another round's read yields to a same-head
+                            -- observation of the identical source revision.
+                            OR (f.at_round IS NULL AND n.at_round IS NOT NULL
+                                AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
+                                AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at)))
+            ), pending_inline_findings AS (
+                SELECT stable_finding_id FROM effective_inline_findings WHERE status IN ('OPEN', 'ACKNOWLEDGED')
+            )
+            """;
+
     record FindingGates(boolean inlinePending, boolean generalPending, boolean generalActionable,
             boolean generalNeedsDisposition) {
         ReviewOutcome.PendingFindings pending() {
@@ -90,29 +116,10 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                         AND legacy.status IN ('OPEN', 'ACKNOWLEDGED')
                 ), pending_general AS (
                     SELECT * FROM general WHERE decision IS DISTINCT FROM 'DISMISSED'
-                ), inline_findings AS (
-                    -- round_observed_at is written at ingest; the joins below are primary-key lookups.
-                    SELECT f.stable_finding_id, f.status, f.round_observed_at AS at_round,
-                        latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
-                    FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
-                    LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
-                    LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
-                    WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
-                        AND f.source_kind IN ('REVIEW_COMMENT', 'REVIEW_THREAD')
-                )
-                SELECT EXISTS (
-                    -- Only a same-head observation can supersede a retained finding from another round.
-                    SELECT 1 FROM inline_findings f
-                    WHERE f.status IN ('OPEN', 'ACKNOWLEDGED')
-                        AND NOT EXISTS (
-                            SELECT 1 FROM inline_findings n WHERE n.stable_finding_id = f.stable_finding_id
-                                AND (n.at_round > coalesce(f.at_round, f.linked_at)
-                                    -- A copy only seen in another round's read yields to a same-head
-                                    -- observation of the identical source revision.
-                                    OR (f.at_round IS NULL AND n.at_round IS NOT NULL
-                                        AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
-                                        AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at))))
-                , count(*) > 0, coalesce(bool_or(feedback = 'ACTIONABLE'), false),
+                ),
+                """ + EFFECTIVE_INLINE_FINDING_CTES + """
+                SELECT EXISTS (SELECT 1 FROM pending_inline_findings),
+                    count(*) > 0, coalesce(bool_or(feedback = 'ACTIONABLE'), false),
                     coalesce(bool_or(decision IS DISTINCT FROM 'CLAIMED'), false)
                 FROM pending_general
                 """, (rs, row) -> new FindingGates(rs.getBoolean(1), rs.getBoolean(2), rs.getBoolean(3), rs.getBoolean(4)),

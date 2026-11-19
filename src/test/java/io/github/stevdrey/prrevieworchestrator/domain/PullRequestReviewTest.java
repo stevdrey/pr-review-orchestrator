@@ -34,7 +34,7 @@ class PullRequestReviewTest {
         State effective = state == PAUSED ? REVIEWING : state;
         String baseline = effective == DEEP_REVIEW || effective == READY_FOR_HUMAN ? HEAD : null;
         return new PullRequestReview(PR, HEAD, 3, state, state == PAUSED ? REVIEWING : null,
-                baseline, effective == READY_FOR_HUMAN ? HEAD : null);
+                baseline, effective == READY_FOR_HUMAN ? HEAD : null, Ci.PASSED, null);
     }
 
     @Test
@@ -51,10 +51,12 @@ class PullRequestReviewTest {
         assertEquals(NEXT, state.baselineCleanSha());
         state = step(state, DEEP_CLEAN);
         assertEquals(DEEP_REVIEW, state.state());
+        rejected(state, MARK_READY_FOR_HUMAN, CLEAR);
+        state = step(state, RECONCILE_CI);
         state = step(state, MARK_READY_FOR_HUMAN);
         assertEquals(READY_FOR_HUMAN, state.state());
         assertEquals(NEXT, state.deepCleanSha());
-        assertEquals(9, state.version());
+        assertEquals(10, state.version());
     }
 
     @ParameterizedTest
@@ -74,7 +76,8 @@ class PullRequestReviewTest {
             if (source == DEEP_REVIEW && action == MARK_READY_FOR_HUMAN) state = step(state, DEEP_CLEAN);
             var request = command(state, action, action == BLOCKING_FINDINGS ? BLOCKED : CLEAR);
             var current = state;
-            if (action == CONFIRM_HEAD || allowed.get(source).contains(action)) {
+            if (action == CONFIRM_HEAD || action == RECONCILE_CI || action == STOP_ITERATION_LIMIT
+                    || action == STOP_NO_PROGRESS || allowed.get(source).contains(action)) {
                 assertEquals(current.version() + 1, current.transition(request).version(), source + "/" + action);
             } else {
                 assertEquals(ILLEGAL_TRANSITION, assertThrows(ReviewConflict.class,
@@ -173,9 +176,9 @@ class PullRequestReviewTest {
         rejected(at(REVIEWING), BLOCKING_FINDINGS, CLEAR);
         rejected(at(DEEP_REVIEW), MARK_READY_FOR_HUMAN, CLEAR);
         for (Ci ci : List.of(Ci.UNKNOWN, Ci.PENDING, Ci.FAILED)) {
-            var gates = new Gates(true, false, false, true, false, ci);
-            rejected(step(at(DEEP_REVIEW), DEEP_CLEAN), MARK_READY_FOR_HUMAN, gates);
-            rejected(step(at(READY_FOR_HUMAN), PAUSE), RESUME, gates);
+            // Only the reconciled CI on the aggregate counts; a caller-supplied passing gate cannot substitute.
+            var unreconciled = new PullRequestReview(PR, HEAD, 3, DEEP_REVIEW, null, HEAD, HEAD, ci, null);
+            rejected(unreconciled, MARK_READY_FOR_HUMAN, CLEAR);
         }
         rejected(step(at(DEEP_REVIEW), DEEP_CLEAN), MARK_READY_FOR_HUMAN, BLOCKED);
     }
@@ -226,9 +229,12 @@ class PullRequestReviewTest {
     void invalidIdentityAndInconsistentSnapshotsAreRejected() {
         assertThrows(IllegalArgumentException.class, () -> new PullRequestId(PR.scope(), 0));
         assertThrows(IllegalArgumentException.class, () -> PullRequestReview.initial(PR, "main"));
-        assertThrows(IllegalArgumentException.class, () -> new PullRequestReview(PR, HEAD, 0, READY_FOR_HUMAN, null, HEAD, null));
-        assertThrows(IllegalArgumentException.class, () -> new PullRequestReview(PR, HEAD, 0, PAUSED, PAUSED, null, null));
-        assertThrows(IllegalArgumentException.class, () -> new PullRequestReview(PR, HEAD, 0, DEEP_REVIEW, null, NEXT, null));
+        assertThrows(IllegalArgumentException.class, () ->
+                new PullRequestReview(PR, HEAD, 0, READY_FOR_HUMAN, null, HEAD, HEAD, Ci.UNKNOWN, null));
+        assertThrows(IllegalArgumentException.class, () ->
+                new PullRequestReview(PR, HEAD, 0, PAUSED, PAUSED, null, null, Ci.UNKNOWN, null));
+        assertThrows(IllegalArgumentException.class, () ->
+                new PullRequestReview(PR, HEAD, 0, DEEP_REVIEW, null, NEXT, null, Ci.UNKNOWN, null));
         assertEquals("c".repeat(64), PullRequestReview.initial(PR, "c".repeat(64)).headSha());
     }
 

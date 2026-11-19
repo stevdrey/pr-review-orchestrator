@@ -34,16 +34,18 @@ public final class CodexReviewAdapter implements ReviewProvider {
         if (!request.provider().equals("codex") || !request.stage().equals("BASELINE")) {
             throw new ReviewRequestFailure(UNSUPPORTED_TRIGGER);
         }
-        Runnable guards = () -> {
-            authorization.requireAuthorized(request.pr().scope());
-            approval.requirePermitted(request);
-        };
-        var reserved = store.reserve(request, actorId, limit, guards);
+        Runnable authorize = () -> authorization.requireAuthorized(request.pr().scope());
+        Runnable approve = () -> approval.requirePermitted(request);
+        var reserved = store.reserve(request, actorId, limit, authorize, approve);
         if (!reserved.created()) return switch (reserved.state()) {
             case RESERVED -> Result.PENDING;
             case ATTEMPTED -> Result.OUTCOME_UNKNOWN;
             case NOT_SENT -> Result.NOT_SENT;
             case COMMENT_CREATED, COMMENT_CREATED_HEAD_UNCONFIRMED -> Result.DUPLICATE;
+        };
+        Runnable guards = () -> {
+            authorize.run();
+            approve.run();
         };
         try {
             store.send(request, reserved.id(), guards, () -> comments.create(request, actorId, guards));

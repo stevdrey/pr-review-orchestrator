@@ -4,8 +4,11 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewConflict.Code
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 
 import io.github.stevdrey.prrevieworchestrator.domain.*;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.Intervention;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
@@ -30,7 +33,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
 
     @Override
     public ReviewOutcome assess(Assessment assessment, Runnable authorize) {
-        return states.locked(assessment.run().pr(), authorize, () -> classify(assessment));
+        return states.locked(assessment.run().pr(), authorize, () -> classify(assessment, true));
     }
 
     @Override
@@ -42,7 +45,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     run.stage().cleanAction(), null, gates);
             // CLEAN_FOR_SHA already requires no pending inline/general findings, so it replaces the default guard.
             var state = states.applyLocked(run.pr(), transition, () -> {
-                if (classify(assessment).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
+                if (classify(assessment, false).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
             });
             jdbc.update("""
                     INSERT INTO review_clean_evidence (installation_id, repository_id, pr_number, transition_id,
@@ -51,6 +54,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     """, run.pr().scope().installationId(), run.pr().scope().repositoryId(), run.pr().number(), commandId,
                     run.requestId(), run.cycleId(), assessment.snapshotId(), run.headSha(), run.stage().name(),
                     run.provider(), run.evidenceProvider(), assessment.completion().reviewId(), run.reviewer());
+            saveProgress(assessment, null, false);
             return state;
         });
     }
@@ -78,7 +82,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         throw new ReviewConflict(exact ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
     }
 
-    private ReviewOutcome classify(Assessment assessment) {
+    private ReviewOutcome classify(Assessment assessment, boolean recordProgress) {
         Run run = assessment.run();
         var pr = run.pr();
         var current = jdbc.queryForList("""
@@ -128,8 +132,107 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 SELECT source_id FROM findings WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT'
                     AND status IN ('DISMISSED', 'VERIFIED_FIXED')
                 """, String.class, snapshot.id()));
-        return classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
+        var outcome = classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
                 dismissed, closedInline);
+        if (!recordProgress) return outcome;
+        return classifier.progressEvidence(run, assessment.completion(), snapshot, dismissed, closedInline)
+                .map(progress -> recordProgress(assessment, outcome,
+                        outcome.verdict() == Verdict.ACTION_REQUIRED ? progress.fingerprint() : null))
+                .orElse(outcome);
+    }
+
+    private ReviewOutcome recordProgress(Assessment assessment, ReviewOutcome outcome, String fingerprint) {
+        Run run = assessment.run();
+        String reviewId = assessment.completion().reviewId();
+        // The caller holds the PR lock and classify only accepts the uniquely latest snapshot for the current head,
+        // so a different stored snapshot is older evidence for this same request.
+        var stored = jdbc.query("""
+                SELECT snapshot_id, review_source_id, finding_sha256, no_progress FROM review_round_progress WHERE request_id = ?
+                """, (rs, row) -> new StoredProgress(rs.getObject(1, UUID.class), rs.getString(2),
+                        rs.getString(3), rs.getBoolean(4)), run.requestId()).stream().findFirst().orElse(null);
+        var current = states.load(run.pr(), false).orElseThrow();
+        boolean previouslyStopped = stored != null && stored.noProgress();
+        // The provider conclusion can make findings comparable without a new GitHub snapshot.
+        boolean sameEvidence = stored != null && stored.snapshotId().equals(assessment.snapshotId())
+                && stored.reviewId().equals(reviewId) && Objects.equals(stored.fingerprint(), fingerprint);
+        // The journal key binds the hold to this request across snapshot changes and human resumes.
+        UUID stopId = UUID.nameUUIDFromBytes(("review-no-progress/" + run.requestId()).getBytes(StandardCharsets.UTF_8));
+        var updated = current;
+        if (!sameEvidence && fingerprint != null && !previouslyStopped && current.state() != State.PAUSED
+                && repeatsPriorRound(run, reviewId, fingerprint)) {
+            updated = states.stopLocked(current, Intervention.NO_PROGRESS, stopId);
+        }
+        boolean causedPause = updated.version() != current.version();
+        if (!sameEvidence) {
+            saveProgress(assessment, fingerprint, causedPause);
+        }
+        return causedPause || (outcome.verdict() == Verdict.ACTION_REQUIRED && previouslyStopped && ownsActivePause(updated, stopId))
+                ? outcome.noProgress(updated.version()) : outcome;
+    }
+
+    private void saveProgress(Assessment assessment, String fingerprint, boolean causedPause) {
+        jdbc.update("""
+                INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256, no_progress)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT (request_id) DO UPDATE SET snapshot_id = EXCLUDED.snapshot_id,
+                    review_source_id = EXCLUDED.review_source_id, finding_sha256 = EXCLUDED.finding_sha256,
+                    no_progress = review_round_progress.no_progress OR EXCLUDED.no_progress
+                """, assessment.run().requestId(), assessment.snapshotId(), assessment.completion().reviewId(), fingerprint, causedPause);
+    }
+
+    private record StoredProgress(UUID snapshotId, String reviewId, String fingerprint, boolean noProgress) {}
+
+    private boolean ownsActivePause(PullRequestReview state, UUID stopId) {
+        if (state.intervention() != Intervention.NO_PROGRESS) return false;
+        var pr = state.pr();
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT (
+                    SELECT transition_id FROM pr_review_transitions
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ? AND action = 'STOP_NO_PROGRESS'
+                    ORDER BY resulting_version DESC LIMIT 1
+                ) = ?
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), stopId));
+    }
+
+    private boolean repeatsPriorRound(Run run, String reviewId, String fingerprint) {
+        // Select the immediately preceding request that may have reached the provider, even when it has no
+        // fingerprint. RESERVED and NOT_SENT requests provably made no remote write, so they are not rounds.
+        // Use the effective closure across cycles for the same stable finding and exact prior revision.
+        var pr = run.pr();
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                WITH previous AS (
+                    SELECT progress.snapshot_id, progress.review_source_id, progress.finding_sha256
+                    FROM review_requests current JOIN review_requests prior
+                        USING (installation_id, repository_id, pr_number, stage, provider)
+                    LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
+                    WHERE current.id = ? AND prior.iteration < current.iteration
+                        AND prior.state NOT IN ('RESERVED', 'NOT_SENT')
+                    ORDER BY prior.iteration DESC LIMIT 1
+                ),
+                """ + JdbcGeneralFeedbackStore.EFFECTIVE_INLINE_FINDING_CTES + """
+                SELECT EXISTS (
+                    SELECT 1 FROM previous p
+                    WHERE p.finding_sha256 = ? AND p.review_source_id <> ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_evidence_snapshots o
+                        JOIN review_evidence_sources review ON review.snapshot_id = o.id
+                            AND review.source_id = p.review_source_id
+                        JOIN review_evidence_sources source ON source.snapshot_id = o.id
+                            AND source.review_id = review.source_id AND source.author_login = review.author_login
+                        JOIN finding_identities i ON i.installation_id = o.installation_id
+                            AND i.repository_id = o.repository_id AND i.pr_number = o.pr_number AND i.provider = o.provider
+                            AND i.source_kind = source.source_kind AND i.source_id = source.source_id
+                        JOIN effective_inline_findings f ON f.stable_finding_id = i.id
+                        WHERE o.id = p.snapshot_id AND source.reviewed_sha = o.head_sha
+                            AND source.source_kind = 'REVIEW_COMMENT' AND source.reply_to_id IS NULL
+                            AND source.thread_outdated = false AND f.status = 'VERIFIED_FIXED'
+                            AND f.verified_at >= o.ingested_at
+                            AND f.body_sha256 = source.body_sha256 AND f.feedback = source.feedback
+                            AND f.source_updated_at = source.source_updated_at
+                            AND NOT EXISTS (SELECT 1 FROM pending_inline_findings n WHERE n.stable_finding_id = i.id)
+                    )
+                )
+                """, Boolean.class, run.requestId(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                fingerprint, reviewId));
     }
 
     private Loaded loadSnapshot(Assessment assessment) {

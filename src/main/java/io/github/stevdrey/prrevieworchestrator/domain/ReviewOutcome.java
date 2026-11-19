@@ -20,7 +20,7 @@ public final class ReviewOutcome {
     public enum Reason {
         CORRELATED_NO_FINDINGS, BLOCKING_FINDINGS, AMBIGUOUS_FEEDBACK, MISSING_COMPLETION,
         PROVIDER_NOT_COMPLETED, UNCORRELATED_COMPLETION, INCOMPLETE_EVIDENCE,
-        MISSING_REVIEW, UNVERIFIED_REVIEW, UNKNOWN_CONCLUSION, CONTRADICTORY_EVIDENCE
+        MISSING_REVIEW, UNVERIFIED_REVIEW, UNKNOWN_CONCLUSION, CONTRADICTORY_EVIDENCE, NO_PROGRESS
     }
 
     /** Established by a trusted caller from the durable request and cycle, not echoed provider prose. */
@@ -75,6 +75,10 @@ public final class ReviewOutcome {
     public long version() { return version; }
     public Verdict verdict() { return verdict; }
     public Reason reason() { return reason; }
+
+    public ReviewOutcome noProgress(long pausedVersion) {
+        return new ReviewOutcome(run, pausedVersion, Verdict.NEEDS_HUMAN, Reason.NO_PROGRESS);
+    }
 
     /**
      * Version-bound command for domain policy tests only. Production clean transitions go through

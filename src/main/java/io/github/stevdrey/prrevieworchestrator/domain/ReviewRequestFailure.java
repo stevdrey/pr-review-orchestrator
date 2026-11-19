@@ -4,7 +4,8 @@ package io.github.stevdrey.prrevieworchestrator.domain;
 public final class ReviewRequestFailure extends RuntimeException {
     public enum Code {
         DISABLED, UNSUPPORTED_TRIGGER, CAPABILITY_UNVERIFIED, ACTOR_DENIED, STALE_HEAD,
-        PR_NOT_READY, LIMIT_REACHED, POLICY_DENIED, REMOTE_UNAVAILABLE, OUTCOME_UNKNOWN, STORE_UNAVAILABLE
+        PR_NOT_READY, LIMIT_REACHED, CI_NOT_PASSED, HUMAN_INTERVENTION_REQUIRED, POLICY_DENIED,
+        REMOTE_UNAVAILABLE, OUTCOME_UNKNOWN, STORE_UNAVAILABLE
     }
     private final Code code;
     public ReviewRequestFailure(Code code) { super(code.name()); this.code = code; }

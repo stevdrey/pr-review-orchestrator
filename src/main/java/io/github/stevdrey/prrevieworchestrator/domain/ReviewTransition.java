@@ -8,7 +8,8 @@ public record ReviewTransition(UUID id, long expectedVersion, String expectedHea
         String newHeadSha, Gates gates) {
     public enum Action {
         MARK_READY, START_REVIEW, BLOCKING_FINDINGS, AWAIT_FIX, BASELINE_CLEAN,
-        DEEP_CLEAN, MARK_READY_FOR_HUMAN, PAUSE, RESUME, UPDATE_HEAD, CONFIRM_HEAD
+        DEEP_CLEAN, MARK_READY_FOR_HUMAN, PAUSE, RESUME, UPDATE_HEAD, CONFIRM_HEAD,
+        RECONCILE_CI, STOP_ITERATION_LIMIT, STOP_NO_PROGRESS
     }
     public enum Ci { UNKNOWN, PENDING, FAILED, PASSED }
 
