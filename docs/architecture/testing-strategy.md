@@ -31,7 +31,33 @@ PostgreSQL migrations, inbox/outbox transactions, token rotation, GitHub API rat
 
 ## End-to-end acceptance
 
-Use a safe test repository/PR to demonstrate new PR → review → inline/general finding → push → re-review → deep review (optional) → CI check → ready notification. Assert that no merge occurred and that clean verdict matches the final SHA.
+[Issue #23](https://github.com/stevdrey/pr-review-orchestrator/issues/23) adds `FeedbackLoopSandboxIntegrationTest` to the regular Gradle suite. It uses disposable Git commits, the Spring HTTP webhook endpoint, PostgreSQL/Flyway, and a loopback server for the GitHub API. The test drives the internal reconciliation services from claimed inbox rows and exercises the Codex request and author notification HTTP adapters with generated or synthetic test credentials.
+
+| Scenario | Evidence asserted by the sandbox test |
+| --- | --- |
+| Authenticated opening and replay | Invalid signatures and foreign repositories create no work. Same-ID and renamed replays create one inbox row. Repeating the request through a new adapter instance leaves one GitHub comment for the opening head. |
+| Findings, fix and re-review | A complete fixture snapshot creates an inline finding and a general review-body finding. Git confirms a changed committed tree. The general finding requires an audited disposition for the fix head. Failed or stale CI blocks re-review until required checks pass for that head. |
+| Clean evidence and notice | Retained findings block a clean completion until the fixture verifier records the inline fix and a human fixture dismisses the general finding at the fix head. Requests, cycles, snapshots and reviewed source SHAs are checked for all rounds. The final head has correlated baseline and deep evidence. Passing current-head CI enables one author notice despite transition replay, pause/resume and a bot-comment event. |
+| Policy stops and uncertain receipt | A denied test budget creates zero reservations and zero comments. Repeating comparable findings pauses the PR and prevents another request. A separate scenario reaches the configured iteration limit while budget remains available. A comment accepted by the fixture with an ambiguous response keeps a durable send permit and is never posted again on replay. |
+| Allowed effects and data | The HTTP fixture accepts only PR preflight reads, scoped authentication, token revocation and PR conversation comments. An approval, merge or other unexpected route fails the test. The two Codex triggers contain the fixed command and the author notice excludes test credentials and raw review/PR text. |
+
+Run from a checkout with Git, Java 27, Docker and a populated Gradle cache.
+
+```sh
+./gradlew --offline test --tests '*.FeedbackLoopSandboxIntegrationTest'
+./gradlew --offline clean build
+git diff --check
+```
+
+On 2026-11-19, the focused run passed all 4 scenarios. The clean build passed all 312 tests with zero failures, errors or skips. Whitespace checks passed.
+
+The sandbox supplies structured completions, complete GitHub read snapshots, CI outcomes, a per-key budget fixture and the deep-review receipt. A test-only database write records the inline verification after checking the contents of the affected file in both Git commits. The test ages the recorded head observation to exercise the persisted quiet period without a 30-second wait. GitHub's acceptance of the trigger, financial accounting, automatic reconciliation, and delivery of the author mention remain live acceptance work.
+
+### Live sandbox acceptance
+
+Use an operator-approved disposable GitHub repository and PR with synthetic source, known required checks, and an approved App installation. The live run depends on approved event and command wiring, a complete GitHub review/CI reader, verified OAuth identity and an authenticated provider completion contract. Keep the Codex request path disabled until the prerequisites in [ADR 0002](../adr/0002-github-app-webhook-trust.md) and [ADR 0004](../adr/0004-deterministic-policy-and-budget-gates.md) are met. The [issue #42 accounting decision](../spikes/issue-42-review-accounting.md) records the unresolved per-review attribution. [Issue #28](https://github.com/stevdrey/pr-review-orchestrator/issues/28) tracks budget reservations and usage reconciliation. Use only human-authorized finding dispositions and independently verified inline fix evidence.
+
+Once those prerequisites are available, record the sandbox PR URL, delivery IDs and correlation IDs, original and fixed commit SHAs, review request and completion IDs with the provider-confirmed SHAs, finding and disposition IDs, required-check run URLs, and the final author comment URL. Replay a delivery and a request at the same head and compare effect counts. Demonstrate CI, budget, iteration and no-progress stops within the sandbox's approved cap. Verify that the PR is still open and that no orchestrator approval or merge appears in the timeline. Keep credentials and raw payloads out of the evidence record.
 
 ## Delivery controls
 

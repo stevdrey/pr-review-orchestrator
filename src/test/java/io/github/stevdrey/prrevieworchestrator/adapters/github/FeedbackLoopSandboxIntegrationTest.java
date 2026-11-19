@@ -1,0 +1,587 @@
+package io.github.stevdrey.prrevieworchestrator.adapters.github;
+
+import static io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State.*;
+import static io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Action.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.*;
+
+import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcAuthorNoticeStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRequestStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
+import io.github.stevdrey.prrevieworchestrator.application.*;
+import io.github.stevdrey.prrevieworchestrator.domain.*;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
+import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
+import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Result;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyPairGenerator;
+import java.sql.Timestamp;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.HashSet;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
+
+@Testcontainers
+@SpringBootTest(classes = PrReviewOrchestratorApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {"orchestrator.github.enabled=false", "orchestrator.github.webhook.enabled=true",
+                "orchestrator.dispatch.enabled=false", "orchestrator.codex.enabled=false",
+                "orchestrator.notifications.enabled=false", "orchestrator.notifications.bot-login=fixture-app[bot]"})
+class FeedbackLoopSandboxIntegrationTest {
+    private static final String SECRET = "sandbox-webhook-signing-fixture-only";
+    private static final Path SECRET_FILE = fixtureSecret();
+    private static final PullRequestId PR = new PullRequestId(new RepositoryScope(101, 1001), 7);
+    private static final ReviewTransition.Gates OPEN = new ReviewTransition.Gates(true, false, false, true, false, Ci.UNKNOWN);
+    private static final ReviewTransition.Gates BLOCKED = new ReviewTransition.Gates(true, false, false, true, true, Ci.UNKNOWN);
+    private static final Duration TOKEN_LIFETIME = Duration.ofHours(1);
+
+    @Container
+    static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer(DockerImageName.parse(Objects.requireNonNull(
+            System.getProperty("test.postgres.image"))).asCompatibleSubstituteFor("postgres"));
+
+    @DynamicPropertySource
+    static void properties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("orchestrator.github.webhook.secret-file", SECRET_FILE::toString);
+        registry.add("orchestrator.github.repositories.101[0]", () -> "1001");
+    }
+
+    @LocalServerPort int port;
+    @TempDir Path directory;
+    @Autowired JdbcTemplate jdbc;
+    @Autowired PlatformTransactionManager transactions;
+    @Autowired RepositoryAuthorization authorization;
+    @Autowired ReviewLifecycle lifecycle;
+    @Autowired CorrelateFixes fixes;
+    @Autowired DisposeGeneralFeedback feedback;
+    @Autowired IngestReviewEvidence evidence;
+    @Autowired AssessReviewOutcome outcomes;
+    @Autowired GitHubReviewNormalizer normalizer;
+    @Autowired JdbcReviewStateStore states;
+
+    private JdbcWorkQueue queue;
+    private JdbcReviewRequestStore requests;
+    private SandboxRepository repository;
+    private SandboxGitHub github;
+    private NotifyAuthor notices;
+    private HttpClient webhookClient;
+    private final Clock clock = Clock.systemUTC();
+    private int nextCheckRunId = 1;
+
+    @BeforeEach
+    void openSandbox() throws Exception {
+        jdbc.execute("TRUNCATE installations, inbox_events CASCADE");
+        jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
+        jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+        var limits = new DurableWork.Limits(Duration.ofSeconds(30), Duration.ofSeconds(1), Duration.ofSeconds(10));
+        queue = new JdbcWorkQueue(jdbc, transactions, limits);
+        requests = new JdbcReviewRequestStore(jdbc, transactions, states);
+        repository = new SandboxRepository(directory);
+        github = new SandboxGitHub(repository.openedSha, clock.instant().plus(TOKEN_LIFETIME));
+        webhookClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+
+        var keys = KeyPairGenerator.getInstance("RSA");
+        keys.initialize(2048);
+        Path key = directory.resolve("fixture-app.pem");
+        Files.writeString(key, "-----BEGIN PRIVATE KEY-----\n"
+                + Base64.getMimeEncoder().encodeToString(keys.generateKeyPair().getPrivate().getEncoded())
+                + "\n-----END PRIVATE KEY-----\n");
+        var tokens = new GitHubInstallationTokens(authorization, new GitHubAppJwt("Iv1.sandbox", key, clock), clock, github.uri());
+        notices = new NotifyAuthor(new JdbcAuthorNoticeStore(jdbc, states, transactions),
+                new GitHubAuthorNotices(tokens, clock, SandboxGitHub.BOT, github.uri()), authorization);
+    }
+
+    @AfterEach
+    void closeSandbox() {
+        if (webhookClient != null) webhookClient.close();
+        if (github != null) {
+            github.close();
+            assertThat(github.unexpectedRequests()).isEmpty();
+        }
+    }
+
+    @AfterAll
+    static void deleteSigningFixture() throws IOException {
+        Files.deleteIfExists(SECRET_FILE);
+    }
+
+    @Test
+    void replaySafeFeedbackLoopNotifiesOnceWithPassingCiAndCurrentReviewEvidence() throws Exception {
+        var provider = codex(new FixtureBudget(2), 6);
+        var opening = pullWebhook("opened", repository.openedSha);
+        var id = UUID.randomUUID();
+        assertEquals(401, send("pull_request", id, opening, "sha256=" + "0".repeat(64)).statusCode());
+        var foreign = opening.replace("\"id\":1001", "\"id\":2002");
+        assertEquals(403, signed("pull_request", id, foreign).statusCode());
+        assertTrue(queue.claimEvent().isEmpty());
+        assertThat(github.comments()).isEmpty();
+
+        var accepted = signed("pull_request", id, opening);
+        var replay = signed("pull_request", id, opening);
+        assertEquals(202, accepted.statusCode());
+        assertEquals(200, replay.statusCode());
+        assertEquals(accepted.headers().firstValue("X-Correlation-ID"), replay.headers().firstValue("X-Correlation-ID"));
+        assertEquals(200, signed("pull_request", UUID.randomUUID(), opening).statusCode());
+        var first = startReview(claim("pull_request", "opened", repository.openedSha));
+        assertEquals(Result.COMMENT_CREATED, provider.request(first));
+        assertEquals(Result.DUPLICATE, codex(new FixtureBudget(0), 6).request(first));
+        assertTrue(queue.claimEvent().isEmpty());
+
+        var firstRound = observeRound(first, "R1", Conclusion.FINDINGS);
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(firstRound).verdict());
+        assertThat(jdbc.queryForList("SELECT source_kind FROM findings", String.class))
+                .containsExactlyInAnyOrder("REVIEW_COMMENT", "REVIEW");
+        step(BLOCKING_FINDINGS, BLOCKED);
+        assertEquals(ACTION_REQUIRED, current().state());
+        step(AWAIT_FIX, OPEN);
+        assertTrue(notices.processNext(), "superseded action notice must be skipped before sending");
+
+        var synchronize = push(repository.fixedSha);
+        assertTrue(fixes.observeSynchronize(synchronize, current(), head()));
+        var afterPush = current();
+        assertTrue(fixes.observeSynchronize(synchronize, afterPush, head()));
+        assertEquals(afterPush, current());
+        complete(synchronize);
+        assertEquals(Ci.UNKNOWN, current().ci());
+        assertEquals(ReviewConflict.Code.STALE_VERSION,
+                assertThrows(ReviewConflict.class, () -> outcomes.assess(firstRound)).code());
+        var stale = new Assessment(firstRound.run(), afterPush.version(), firstRound.completion(), firstRound.snapshotId());
+        assertEquals(ReviewConflict.Code.STALE_HEAD, assertThrows(ReviewConflict.class, () -> outcomes.assess(stale)).code());
+
+        assertEquals(FixCorrelation.Status.WAITING_FOR_PUSHES, assessFix(repository.openedSha).status());
+        ageSynchronize();
+        assertEquals(FixCorrelation.Status.GENERAL_DISPOSITION_REQUIRED, assessFix(repository.openedSha).status());
+        dispose(firstRound, GeneralFeedback.Action.CLAIM_FIXED, repository.fixedSha);
+        var candidate = assessFix(repository.openedSha);
+        assertEquals(FixCorrelation.Status.ELIGIBLE, candidate.status());
+        assertEquals(candidate.candidateId(), assessFix(repository.openedSha).candidateId());
+        var rerun = baseline(repository.fixedSha, ReviewRequest.Trigger.PR_SYNCHRONIZE, candidate.headEpoch());
+
+        check(repository.openedSha, Ci.PASSED);
+        check(repository.fixedSha, Ci.FAILED);
+        assertCode(ReviewRequestFailure.Code.CI_NOT_PASSED, () -> provider.request(rerun));
+        assertThat(github.comments()).hasSize(1);
+        check(repository.fixedSha, Ci.PASSED);
+        step(START_REVIEW, OPEN);
+        assertEquals(Result.COMMENT_CREATED, provider.request(rerun));
+        assertEquals(Result.DUPLICATE, provider.request(rerun));
+
+        var clean = observeRound(rerun, "R2", Conclusion.NO_FINDINGS);
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(clean).verdict(),
+                "a fix claim and a clean response cannot clear retained findings");
+        recordFixtureInlineVerification(firstRound);
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(clean).verdict(), "general fix claim still blocks");
+        dispose(firstRound, GeneralFeedback.Action.DISMISS, null);
+        var wrongRequest = new Run(PR, repository.fixedSha, rerun.provider(), Stage.BASELINE, firstRound.run().requestId(),
+                clean.run().cycleId(), clean.run().evidenceProvider(), clean.run().reviewer());
+        var miscorrelated = new Assessment(wrongRequest, current().version(),
+                new Completion(wrongRequest, "R2", Status.COMPLETED, Conclusion.NO_FINDINGS), clean.snapshotId());
+        assertEquals(Verdict.UNKNOWN, outcomes.assess(miscorrelated).verdict());
+        var readyBaseline = outcomes.recordClean(clean, UUID.randomUUID(), OPEN);
+        assertEquals(DEEP_REVIEW, readyBaseline.state());
+
+        var deep = new ReviewRequest(PR, repository.fixedSha, "DEEP", "sandbox-deep", ReviewRequest.Trigger.PR_SYNCHRONIZE, 42, false);
+        var deepBudget = new FixtureBudget(1);
+        var ticket = requests.reserve(deep, 42, 6, this::authorize, () -> deepBudget.requirePermitted(deep));
+        requests.send(deep, ticket.id(), this::authorize, () -> new Receipt(9901, true));
+        var deepClean = observeRound(deep, "R3", Conclusion.NO_FINDINGS);
+        outcomes.recordClean(deepClean, UUID.randomUUID(), OPEN);
+        check(repository.fixedSha, Ci.PENDING);
+        assertEquals(ReviewConflict.Code.GUARD_REJECTED,
+                assertThrows(ReviewConflict.class, () -> step(MARK_READY_FOR_HUMAN, OPEN)).code());
+        assertFalse(notices.processNext());
+        check(repository.fixedSha, Ci.PASSED);
+        var ready = transition(MARK_READY_FOR_HUMAN, OPEN);
+        assertEquals(READY_FOR_HUMAN, lifecycle.apply(PR, ready).state());
+        assertEquals(ReviewConflict.Code.DUPLICATE_TRANSITION,
+                assertThrows(ReviewConflict.class, () -> lifecycle.apply(PR, ready)).code());
+        assertFalse(notices.processNext());
+        step(PAUSE, OPEN);
+        step(RESUME, OPEN);
+        assertFalse(notices.processNext());
+        assertFalse(notices.processNext());
+
+        assertThat(github.comments()).extracting(SandboxGitHub.Comment::head)
+                .containsExactly(repository.openedSha, repository.fixedSha, repository.fixedSha);
+        assertThat(github.comments().subList(0, 2)).extracting(SandboxGitHub.Comment::body).containsOnly("@codex review");
+        var notice = github.comments().getLast();
+        assertThat(notice.body()).contains("@fixture-author **Ready for human review**", repository.fixedSha, "CI at dispatch: PASSED",
+                "Codex", "Approval and any merge decision require human action")
+                .doesNotContain(repository.openedSha, SandboxGitHub.PRIVATE_TEXT, SECRET, SandboxGitHub.APP_TOKEN, SandboxGitHub.USER_TOKEN);
+        assertThat(jdbc.queryForList("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class))
+                .containsExactly(notice.id());
+        var comment = enqueue("issue_comment", "created", null, """
+                {"action":"created","installation":{"id":101},"repository":{"id":1001},
+                 "issue":{"number":7,"pull_request":{}},"comment":{"id":%d},"sender":{"id":98,"type":"Bot"}}
+                """.formatted(notice.id()));
+        var noticeTrigger = new ReviewRequest(PR, github.head(), "BASELINE", "codex", ReviewRequest.Trigger.COMMENT, 98, true);
+        assertEquals(Result.IGNORED, provider.request(noticeTrigger));
+        complete(comment);
+        assertThat(github.comments()).hasSize(3);
+        assertEquals(3, count("review_requests"));
+        assertReviewShaEvidence();
+    }
+
+    @Test
+    void repeatedComparableFindingsPauseTheLoopAfterTwoPostedRequests() throws Exception {
+        var provider = codex(new FixtureBudget(6), 6);
+        var first = openReview();
+        assertEquals(Result.COMMENT_CREATED, provider.request(first));
+        var initial = observeRound(first, "R1", Conclusion.FINDINGS);
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(initial).verdict());
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(initial).verdict());
+        var second = moveToFix(initial);
+        assertEquals(Result.COMMENT_CREATED, provider.request(second));
+        var repeated = observeRound(second, "R2", Conclusion.FINDINGS);
+        assertEquals(Reason.NO_PROGRESS, outcomes.assess(repeated).reason());
+        var paused = current();
+        assertEquals(PAUSED, paused.state());
+        assertEquals(PullRequestReview.Intervention.NO_PROGRESS, paused.intervention());
+        assertEquals(Reason.NO_PROGRESS, outcomes.assess(
+                new Assessment(repeated.run(), paused.version(), repeated.completion(), repeated.snapshotId())).reason());
+        assertEquals(paused, current());
+
+        advance(repository.followUpSha);
+        assertCode(ReviewRequestFailure.Code.HUMAN_INTERVENTION_REQUIRED,
+                () -> provider.request(baseline(repository.followUpSha, ReviewRequest.Trigger.PR_SYNCHRONIZE, 0)));
+        assertThat(github.comments()).hasSize(2);
+        assertEquals(2, count("review_requests"));
+        assertEquals(0, count("review_clean_evidence"));
+    }
+
+    @Test
+    void deniedBudgetReservesNothingAndIterationLimitStopsBeforeAnotherPost() throws Exception {
+        var first = openReview();
+        assertCode(ReviewRequestFailure.Code.POLICY_DENIED, () -> codex(new FixtureBudget(0), 2).request(first));
+        assertEquals(0, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+
+        var provider = codex(new FixtureBudget(6), 2);
+        assertEquals(Result.COMMENT_CREATED, provider.request(first));
+        var initial = observeRound(first, "R1", Conclusion.FINDINGS);
+        assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(initial).verdict());
+        var second = moveToFix(initial);
+        assertEquals(Result.COMMENT_CREATED, provider.request(second));
+        assertEquals(Result.DUPLICATE, provider.request(second));
+        advance(repository.followUpSha);
+        assertCode(ReviewRequestFailure.Code.LIMIT_REACHED,
+                () -> provider.request(baseline(repository.followUpSha, ReviewRequest.Trigger.PR_SYNCHRONIZE, 0)));
+        assertEquals(PAUSED, current().state());
+        assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, current().intervention());
+        assertEquals(2, count("review_requests"));
+        assertThat(github.comments()).hasSize(2);
+        assertEquals(0, count("review_clean_evidence"));
+    }
+
+    @Test
+    void ambiguousCommentReceiptSurvivesWorkerRecreationWithoutResending() throws Exception {
+        var request = openReview();
+        github.rejectCommentReceipt();
+        assertEquals(Result.OUTCOME_UNKNOWN, codex(new FixtureBudget(1), 6).request(request));
+        assertEquals(Result.OUTCOME_UNKNOWN, codex(new FixtureBudget(0), 6).request(request));
+        assertThat(github.comments()).extracting(SandboxGitHub.Comment::body).containsExactly("@codex review");
+        assertThat(jdbc.queryForMap("SELECT state, comment_id, head_sha FROM review_requests"))
+                .containsEntry("state", "ATTEMPTED").containsEntry("comment_id", null).containsEntry("head_sha", repository.openedSha);
+        assertEquals(0, count("review_clean_evidence"));
+        assertFalse(notices.processNext());
+    }
+
+    private void assertReviewShaEvidence() {
+        assertThat(jdbc.queryForList("""
+                SELECT p.review_source_id || '/' || r.head_sha || '/' || c.head_sha || '/' || s.reviewed_sha
+                       || '/' || o.head_sha || '/' || o.observed_head_sha
+                FROM review_round_progress p JOIN review_requests r ON r.id = p.request_id
+                JOIN review_evidence_snapshots o ON o.id = p.snapshot_id JOIN review_cycles c ON c.id = o.review_cycle_id
+                JOIN review_evidence_sources s ON s.snapshot_id = o.id AND s.source_id = p.review_source_id
+                ORDER BY p.review_source_id
+                """, String.class)).containsExactly("R1" + ("/" + repository.openedSha).repeat(5),
+                "R2" + ("/" + repository.fixedSha).repeat(5), "R3" + ("/" + repository.fixedSha).repeat(5));
+        assertThat(jdbc.queryForList("""
+                SELECT r.head_sha || '/' || c.head_sha || '/' || e.head_sha || '/' || e.review_source_id
+                FROM review_clean_evidence e JOIN review_requests r ON r.id = e.request_id
+                JOIN review_cycles c ON c.id = e.cycle_id ORDER BY e.review_source_id
+                """, String.class)).containsExactly(repository.fixedSha + "/" + repository.fixedSha + "/" + repository.fixedSha + "/R2",
+                repository.fixedSha + "/" + repository.fixedSha + "/" + repository.fixedSha + "/R3");
+    }
+
+    private Assessment observeRound(ReviewRequest request, String reviewId, Conclusion conclusion) throws Exception {
+        var receipt = jdbc.queryForObject("SELECT id, iteration FROM review_requests WHERE request_key = ?",
+                (rs, row) -> new RoundReceipt(rs.getObject("id", UUID.class), rs.getInt("iteration")), request.key());
+        var cycle = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider, iteration)
+                VALUES (?, 101, 1001, 7, ?, ?, ?, ?)
+                """, cycle, request.headSha(), request.stage(), request.provider(), receipt.iteration());
+        String sha = request.headSha();
+        var event = enqueue("pull_request_review", "submitted", sha,
+                prEnvelope("submitted", sha, ",\"review\":{\"id\":" + (100 + receipt.iteration()) + "}"));
+        boolean findings = conclusion == Conclusion.FINDINGS;
+        var updatedAt = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        var snapshot = normalizer.normalize(UUID.randomUUID(), cycle, PR, github.head(), updatedAt,
+                reviewJson(reviewId, sha, updatedAt, findings).getBytes(StandardCharsets.UTF_8),
+                Map.of(reviewId + "-inline", ReviewEvidence.Severity.HIGH), findings ? Set.of(reviewId) : Set.of());
+        assertTrue(evidence.ingest(snapshot));
+        assertFalse(evidence.ingest(snapshot));
+        complete(event);
+        var run = new Run(PR, sha, request.provider(), Stage.valueOf(request.stage()), receipt.id(), cycle,
+                "github", "fixture-reviewer");
+        return new Assessment(run, current().version(), new Completion(run, reviewId, Status.COMPLETED, conclusion), snapshot.id());
+    }
+
+    private record RoundReceipt(UUID id, int iteration) {}
+
+    private String reviewJson(String reviewId, String sha, Instant seen, boolean findings) {
+        String thread = findings ? """
+                {"id":"%1$s-thread","isResolved":false,"isOutdated":false,"path":"Example.java","line":1,"originalLine":1,
+                 "comments":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"%1$s-inline","body":"Check the edge case",
+                 "author":{"login":"fixture-reviewer"},"commit":{"oid":"%2$s"},"originalCommit":{"oid":"%2$s"},
+                 "pullRequestReview":{"id":"%1$s"},"replyTo":null,"updatedAt":"%3$s",
+                 "path":"Example.java","line":1,"originalLine":1}]}}
+                """.formatted(reviewId, sha, seen) : "";
+        return """
+                {"data":{"repository":{"databaseId":1001,"pullRequest":{"number":7,"headRefOid":"%1$s",
+                 "comments":{"pageInfo":{"hasNextPage":false},"nodes":[]},
+                 "reviews":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"%2$s","state":"COMMENTED",
+                 "author":{"login":"fixture-reviewer"},"commit":{"oid":"%1$s"},"updatedAt":"%3$s","body":"%4$s"}]},
+                 "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[%5$s]}}}}}
+                """.formatted(sha, reviewId, seen, findings ? SandboxGitHub.PRIVATE_TEXT : "", thread);
+    }
+
+    private void recordFixtureInlineVerification(Assessment initial) throws IOException, InterruptedException {
+        assertTrue(repository.verifiesFix(initial.run().headSha(), github.head()));
+        // The approved inline fix verifier does not exist yet. Seed only its exact observation on the disposable DB.
+        assertEquals(1, jdbc.update("""
+                UPDATE findings SET status = 'VERIFIED_FIXED', evidence_sha = ?, verified_at = clock_timestamp(),
+                    disposition_actor = 'fixture-verifier', disposition_reason = 'Sandbox fixture verified the fix'
+                WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT' AND reviewed_sha = ? AND status = 'OPEN'
+                """, repository.fixedSha, initial.snapshotId(), repository.openedSha));
+    }
+
+    private void dispose(Assessment round, GeneralFeedback.Action action, String evidenceSha) {
+        var finding = jdbc.queryForObject("SELECT id FROM finding_identities WHERE source_kind = 'REVIEW' AND source_id = ?",
+                UUID.class, round.completion().reviewId());
+        var state = current();
+        assertTrue(feedback.dispose(PR, new GeneralFeedback.Disposition(UUID.randomUUID(), finding, round.snapshotId(),
+                state.headSha(), state.version(), action, "fixture-author", "Sandbox author disposition", evidenceSha)));
+    }
+
+    private ReviewRequest openReview() throws Exception {
+        return startReview(enqueue("pull_request", "opened", repository.openedSha, pullWebhook("opened", repository.openedSha)));
+    }
+
+    private ReviewRequest startReview(Event opened) {
+        assertEquals(github.head(), opened.observedHeadSha());
+        lifecycle.create(PR, opened.observedHeadSha());
+        step(MARK_READY, OPEN);
+        step(START_REVIEW, OPEN);
+        complete(opened);
+        return baseline(opened.observedHeadSha(), ReviewRequest.Trigger.PR_OPENED, 0);
+    }
+
+    private ReviewRequest moveToFix(Assessment initial) throws Exception {
+        step(BLOCKING_FINDINGS, BLOCKED);
+        step(AWAIT_FIX, OPEN);
+        advance(repository.fixedSha);
+        ageSynchronize();
+        dispose(initial, GeneralFeedback.Action.CLAIM_FIXED, repository.fixedSha);
+        var decision = assessFix(repository.openedSha);
+        assertEquals(FixCorrelation.Status.ELIGIBLE, decision.status());
+        step(START_REVIEW, OPEN);
+        return baseline(repository.fixedSha, ReviewRequest.Trigger.PR_SYNCHRONIZE, decision.headEpoch());
+    }
+
+    private void advance(String sha) throws Exception {
+        var event = push(sha);
+        assertTrue(fixes.observeSynchronize(event, current(), head()));
+        complete(event);
+        check(sha, Ci.PASSED);
+    }
+
+    private Event push(String sha) throws Exception {
+        github.push(sha);
+        return enqueue("pull_request", "synchronize", sha, pullWebhook("synchronize", sha));
+    }
+
+    private void check(String eventSha, Ci status) throws Exception {
+        var event = enqueue("check_run", "completed", eventSha, """
+                {"action":"completed","installation":{"id":101},"repository":{"id":1001},
+                 "check_run":{"id":%d,"head_sha":"%s","conclusion":"success"}}
+                """.formatted(nextCheckRunId++, eventSha));
+        var required = new CiEvidence.Check(2, "build");
+        var read = new CiEvidence(event.lease().id(), PR, github.head(), Set.of(required),
+                List.of(new CiEvidence.Run(required, github.head(), status)), true);
+        var result = lifecycle.observeCi(event, current().version(), read);
+        if (eventSha.equals(github.head())) {
+            assertEquals(status, result.orElseThrow().ci());
+        } else {
+            assertTrue(result.isEmpty());
+            assertEquals(Ci.UNKNOWN, current().ci());
+        }
+        complete(event);
+    }
+
+    private FixCorrelation.Head head() {
+        return new FixCorrelation.Head(PR, github.head(), true, false);
+    }
+
+    private FixCorrelation.Decision assessFix(String baseSha) throws IOException, InterruptedException {
+        return fixes.assess(new FixCorrelation.Assessment(head(), current().version(), false,
+                new FixCorrelation.Comparison(baseSha, github.head(), repository.changed(baseSha, github.head()))));
+    }
+
+    private void ageSynchronize() {
+        // Move the fixture past the persisted quiet period without sleeping or changing the production timer.
+        assertEquals(1, jdbc.update("""
+                UPDATE pr_review_transitions SET occurred_at = clock_timestamp() - interval '31 seconds'
+                WHERE action = 'UPDATE_HEAD' AND resulting_version = (
+                    SELECT max(resulting_version) FROM pr_review_transitions WHERE action = 'UPDATE_HEAD')
+                """));
+    }
+
+    private ReviewRequest baseline(String sha, ReviewRequest.Trigger trigger, long epoch) {
+        return new ReviewRequest(PR, sha, "BASELINE", "codex", trigger, 52, false, epoch);
+    }
+
+    private CodexReviewAdapter codex(CodexApproval approval, int limit) {
+        var credential = new Credential(PR.scope(), 42, SandboxGitHub.REPOSITORY, SandboxGitHub.USER_TOKEN,
+                clock.instant().plus(TOKEN_LIFETIME));
+        var client = new GitHubCodexComments(scope -> credential, clock, github.uri());
+        return new CodexReviewAdapter(authorization, requests, approval, client, 42, limit);
+    }
+
+    private static final class FixtureBudget implements CodexApproval {
+        private final int allowance;
+        private final Set<String> reserved = new HashSet<>();
+
+        FixtureBudget(int allowance) {
+            this.allowance = allowance;
+        }
+        @Override public void requirePermitted(ReviewRequest request) {
+            if (!reserved.contains(request.key()) && reserved.size() >= allowance) {
+                throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            }
+            reserved.add(request.key());
+        }
+
+    }
+
+    private PullRequestReview current() {
+        return lifecycle.find(PR).orElseThrow();
+    }
+
+    private ReviewTransition transition(ReviewTransition.Action action, ReviewTransition.Gates gates) {
+        var state = current();
+        return new ReviewTransition(UUID.randomUUID(), state.version(), state.headSha(), action, null, gates);
+    }
+
+    private void step(ReviewTransition.Action action, ReviewTransition.Gates gates) {
+        lifecycle.apply(PR, transition(action, gates));
+    }
+
+    private int count(String table) {
+        return jdbc.queryForObject("SELECT count(*) FROM " + table, Integer.class);
+    }
+
+    private void authorize() {
+        authorization.requireAuthorized(PR.scope());
+    }
+
+    private void assertCode(ReviewRequestFailure.Code code, Runnable operation) {
+        assertEquals(code, assertThrows(ReviewRequestFailure.class, operation::run).code());
+    }
+
+    private Event enqueue(String type, String action, String sha, String body) throws Exception {
+        assertEquals(202, signed(type, UUID.randomUUID(), body).statusCode());
+        return claim(type, action, sha);
+    }
+
+    private Event claim(String type, String action, String sha) {
+        var event = queue.claimEvent().orElseThrow();
+        assertEquals(PR.scope(), event.scope());
+        assertEquals(type, event.eventType());
+        assertEquals(action, event.action());
+        assertEquals(sha, event.observedHeadSha());
+        if (!type.equals("check_run")) assertEquals(PR.number(), event.prNumber());
+        return event;
+    }
+
+    private void complete(Event event) {
+        assertTrue(queue.completeEvent(event, List.of(), this::authorize));
+    }
+
+    private String pullWebhook(String action, String sha) {
+        return prEnvelope(action, sha, ",\"number\":7");
+    }
+
+    private String prEnvelope(String action, String sha, String extra) {
+        return """
+                {"action":"%s","installation":{"id":101},"repository":{"id":1001},
+                 "pull_request":{"number":7,"head":{"sha":"%s"}}%s}
+                """.formatted(action, sha, extra);
+    }
+
+    private HttpResponse<String> signed(String type, UUID id, String body) throws Exception {
+        var mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return send(type, id, body, "sha256=" + HexFormat.of().formatHex(mac.doFinal(body.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    private HttpResponse<String> send(String type, UUID id, String body, String signature) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/webhooks/github"))
+                .header("Content-Type", "application/json")
+                .header("X-GitHub-Delivery", id.toString())
+                .header("X-GitHub-Event", type)
+                .header("X-Hub-Signature-256", signature)
+                .timeout(Duration.ofSeconds(5)).POST(HttpRequest.BodyPublishers.ofString(body)).build();
+        return webhookClient.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static Path fixtureSecret() {
+        try {
+            var file = Files.createTempFile("sandbox-webhook", ".secret");
+            Files.writeString(file, SECRET);
+            return file;
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}

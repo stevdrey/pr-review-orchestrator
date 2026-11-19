@@ -20,6 +20,8 @@ Issue #21 adds [internal CI reconciliation and automatic review limits](developm
 
 Issue #22 adds [opt-in GitHub author notifications](development/author-notifications.md) on ready-for-human and action-required transitions, with a durable send permit per state, recipient and head SHA.
 
+Issue #23 adds [local sandbox feedback-loop acceptance coverage and live prerequisites](architecture/testing-strategy.md#end-to-end-acceptance), including replay protection, current-SHA review and CI evidence, bounded stops and one author notice.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |
