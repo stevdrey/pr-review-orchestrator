@@ -17,10 +17,7 @@ public final class GitHubReviewNormalizer {
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private final String notificationBotLogin;
 
-    public GitHubReviewNormalizer() {
-        this("");
-    }
-
+    /** Pass the App's bot login, or "" only where the App never posts author notices. */
     public GitHubReviewNormalizer(String notificationBotLogin) {
         this.notificationBotLogin = Objects.requireNonNull(notificationBotLogin);
     }
@@ -107,7 +104,10 @@ public final class GitHubReviewNormalizer {
 
     private boolean ownNotification(JsonNode comment) {
         JsonNode actor = comment.path("author");
-        if (notificationBotLogin.isEmpty() || !"Bot".equals(actor.path("__typename").asString())) return false;
+        if (notificationBotLogin.isEmpty()) return false;
+        // Without the actor type a marked notice cannot be told apart from a user copy; fail closed.
+        require(actor.isNull() || actor.path("__typename").isString());
+        if (!"Bot".equals(actor.path("__typename").asString())) return false;
         String login = actor.path("login").asString();
         // GraphQL Bot logins can omit the REST [bot] suffix.
         boolean sameApp = notificationBotLogin.equalsIgnoreCase(login)

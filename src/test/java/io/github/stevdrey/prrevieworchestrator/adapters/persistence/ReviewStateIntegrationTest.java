@@ -258,8 +258,64 @@ class ReviewStateIntegrationTest {
         worker.processNext();
 
         assertFalse(membership.isActiveAndEnabled(FIRST.scope()));
-        assertEquals("ATTEMPTED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        // Denied before any POST: the permit is released and the intent is skipped.
+        assertEquals("SKIPPED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        assertNull(jdbc.queryForObject("SELECT recipient_id FROM author_notifications", Long.class));
         assertTrue(notices().claim().isEmpty());
+    }
+
+    private boolean permitCommitted() {
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM author_notifications WHERE status = 'ATTEMPTED')", Boolean.class));
+    }
+
+    @Test
+    void staleRecheckAfterPermitReleasesItSoALaterEntryCanNotify() {
+        var reviewed = step(step(reviewing(FIRST), BASELINE_CLEAN), DEEP_CLEAN);
+        var state = step(passCi(reviewed), MARK_READY_FOR_HUMAN);
+        var job = notices().claim().orElseThrow();
+        var paused = new java.util.concurrent.atomic.AtomicReference<PullRequestReview>();
+        // The send phase no longer holds the PR lock, so a lifecycle write can commit during it.
+        assertFalse(notices().deliver(job, 52, () -> {
+            if (paused.get() == null && permitCommitted()) paused.set(step(state, PAUSE));
+        }, evidence -> fail("Stale notice reached the POST")));
+        assertEquals(Map.of("status", "PENDING"), jdbc.queryForMap(
+                "SELECT status FROM author_notifications WHERE id = ? AND recipient_id IS NULL", job.id()));
+        notices().skip(job);
+
+        step(paused.get(), RESUME);
+        var resumed = notices().claim().orElseThrow();
+        assertNotEquals(job.id(), resumed.id());
+        assertTrue(notices().deliver(resumed, 52, () -> {}, evidence -> 19));
+        assertEquals(19L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+    }
+
+    @Test
+    void failuresBeforeThePostReturnThePermitForRetry() {
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var job = notices().claim().orElseThrow();
+        assertThrows(AuthorizationUnavailable.class, () -> notices().deliver(job, 52, () -> {
+            if (permitCommitted()) throw new AuthorizationUnavailable();
+        }, evidence -> fail("Unauthorized notice reached the POST")));
+        String pending = "SELECT count(*) FROM author_notifications WHERE status = 'PENDING' AND recipient_id IS NULL";
+        assertEquals(1, jdbc.queryForObject(pending, Integer.class));
+
+        assertThrows(IllegalStateException.class, () -> notices().deliver(job, 52, () -> {}, evidence -> {
+            throw new io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticePublisher.NotPosted();
+        }));
+        assertEquals(1, jdbc.queryForObject(pending, Integer.class));
+        assertTrue(notices().deliver(job, 52, () -> {}, evidence -> 20));
+    }
+
+    @Test
+    void staleJobIsSkippedLocallyWithoutContactingGitHub() {
+        var state = step(reviewing(FIRST), BLOCKING_FINDINGS);
+        step(state, UPDATE_HEAD);
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var worker = new NotifyAuthor(notices(), (job, delivery) -> fail("Stale job reached GitHub"), authorization);
+        assertTrue(worker.processNext());
+        assertEquals("SKIPPED", jdbc.queryForObject("SELECT status FROM author_notifications", String.class));
+        assertFalse(worker.processNext());
     }
 
     @ParameterizedTest

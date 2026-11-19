@@ -98,7 +98,7 @@ class FixCorrelationIntegrationTest {
 
     @Test
     void closePushesCoalesceAtTheLatestHeadAcrossWorkersAndStoreRecreation() throws Exception {
-        var normalizer = new GitHubReviewNormalizer();
+        var normalizer = new GitHubReviewNormalizer("");
         String fixture = inlineReviewFixture();
         var initial = normalizer.normalize(UUID.randomUUID(), cycle, PR, BASE, TIME,
                 fixture.getBytes(StandardCharsets.UTF_8));
@@ -166,7 +166,7 @@ class FixCorrelationIntegrationTest {
 
     @Test
     void historicalResolutionWithDismissedOccurrenceCannotHideCurrentOpenFinding() throws Exception {
-        var normalizer = new GitHubReviewNormalizer();
+        var normalizer = new GitHubReviewNormalizer("");
         String fixture = inlineReviewFixture();
         waitingForFix(normalizer.normalize(UUID.randomUUID(), cycle, PR, BASE, TIME, fixture.getBytes(StandardCharsets.UTF_8)));
         jdbc.update("""
@@ -206,7 +206,7 @@ class FixCorrelationIntegrationTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void historicalResolutionPreservesValidClosureUntilTheSourceRevisionChanges(boolean firstSeenHistorically) throws Exception {
-        var normalizer = new GitHubReviewNormalizer();
+        var normalizer = new GitHubReviewNormalizer("");
         String fixture = inlineReviewFixture();
         String firstResponse = fixture.replace("\"headRefOid\": \"" + BASE, "\"headRefOid\": \"" + FIRST);
         byte[] roundResponse = firstResponse.getBytes(StandardCharsets.UTF_8);

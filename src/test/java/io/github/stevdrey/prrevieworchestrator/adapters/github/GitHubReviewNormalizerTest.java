@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 class GitHubReviewNormalizerTest {
     static final String HEAD = "a".repeat(40);
     static final PullRequestId PR = new PullRequestId(new RepositoryScope(101, 1001), 7);
-    final GitHubReviewNormalizer normalizer = new GitHubReviewNormalizer();
+    final GitHubReviewNormalizer normalizer = new GitHubReviewNormalizer("");
 
     @Test
     void preservesProvenanceWithoutTrustingProseOrTreatingRepliesAsFindings() throws Exception {

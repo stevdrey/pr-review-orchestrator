@@ -268,16 +268,60 @@ class GitHubCredentialsTest {
         assertTrue(posted.get().contains("Approval and any merge decision require human action"));
         assertFalse(posted.get().contains("PRIVATE_SOURCE"));
         assertFalse(posted.get().contains(TOKEN));
+        assertEquals("DELETE Bearer " + TOKEN, revokedAuthorization);
+        assertEquals(1, revocations.get());
+    }
+
+    @Test
+    void normalizedEchoedBodyStillRecordsTheReceipt() {
+        var notice = notices();
+        server.createContext("/repos/owner/repository/pulls/7",
+                exchange -> respond(exchange, 200, pull("a".repeat(40), "fixture-author")));
+        server.createContext("/repos/owner/repository/issues/7/comments", exchange -> {
+            String body = json.readTree(exchange.getRequestBody().readAllBytes()).path("body").asString();
+            respond(exchange, 201, json.writeValueAsString(Map.of("id", 91, "body", body.replace("\n", "\r\n").strip(),
+                    "user", Map.of("login", "fixture-app[bot]", "type", "Bot"))));
+        });
+        assertTrue(notice.publish(noticeJob(State.ACTION_REQUIRED), (recipient, post) -> post.applyAsLong(
+                new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)) == 91));
+    }
+
+    @Test
+    void tokenTooCloseToExpiryIsReportedAsNotPosted() {
+        var reads = new AtomicInteger();
+        var advancing = new Clock() {
+            @Override public java.time.ZoneId getZone() { return ZoneOffset.UTC; }
+            @Override public Clock withZone(java.time.ZoneId zone) { return this; }
+            // Preflight sees 11s of validity; the POST check sees 2s, below its 3s request deadline.
+            @Override public Instant instant() { return NOW.plusSeconds(reads.getAndIncrement() == 0 ? 3589 : 3598); }
+        };
+        var notice = new GitHubAuthorNotices(tokens, advancing, "fixture-app[bot]",
+                URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/"));
+        notices();
+        server.createContext("/repos/owner/repository/pulls/7",
+                exchange -> respond(exchange, 200, pull("a".repeat(40), "fixture-author")));
+        var thrown = new AtomicReference<RuntimeException>();
+        assertThrows(IllegalStateException.class, () -> notice.publish(noticeJob(State.ACTION_REQUIRED), (recipient, post) -> {
+            try {
+                return post.applyAsLong(new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)) > 0;
+            } catch (RuntimeException failure) {
+                thrown.set(failure);
+                throw failure;
+            }
+        }));
+        assertInstanceOf(io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticePublisher.NotPosted.class, thrown.get());
+        assertEquals(1, revocations.get());
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"stale", "draft", "closed", "invalid-author", "denied-permit"})
+    @ValueSource(strings = {"stale", "draft", "closed", "locked", "invalid-author", "denied-permit"})
     void preflightMustProveHeadEligibilityAndAuthorBeforePosting(String condition) {
         var notice = notices();
         String head = condition.equals("stale") ? "b".repeat(40) : "a".repeat(40);
         String author = condition.equals("invalid-author") ? "author @someone-else" : "fixture-author";
         String pr = pull(head, author);
-        if (condition.equals("draft")) pr = pr.replace("false", "true");
+        if (condition.equals("draft")) pr = pr.replace("\"draft\":false", "\"draft\":true");
+        if (condition.equals("locked")) pr = pr.replace("\"locked\":false", "\"locked\":true");
         if (condition.equals("closed")) pr = pr.replace("open", "closed");
         String response = pr;
         server.createContext("/repos/owner/repository/pulls/7", exchange -> respond(exchange, 200, response));
@@ -286,6 +330,7 @@ class GitHubCredentialsTest {
             return false;
         }));
         assertEquals(1, requests.get()); // an unexpected comment POST would hit the catch-all handler
+        assertEquals(1, revocations.get());
     }
 
     @Test
@@ -304,6 +349,7 @@ class GitHubCredentialsTest {
                 (recipient, post) -> post.applyAsLong(
                         new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)) > 0)));
         assertEquals(1, posts.get());
+        assertEquals(1, revocations.get());
         assertTrue(posted.get().contains("@fixture-author **Action required**"));
         assertTrue(posted.get().contains("CI at dispatch: FAILED"));
         assertTrue(posted.get().contains("address or explicitly disposition the feedback"));
@@ -324,7 +370,7 @@ class GitHubCredentialsTest {
 
     private String pull(String head, String author) {
         return """
-                {"number":7, "state":"open", "draft":false, "head":{"sha":"%s"}, "base":{"repo":{"id":1001}},
+                {"number":7, "state":"open", "draft":false, "locked":false, "head":{"sha":"%s"}, "base":{"repo":{"id":1001}},
                 "user":{"id":123,"login":"%s","type":"User"}, "body":"PRIVATE_SOURCE"}
                 """.formatted(head, author);
     }

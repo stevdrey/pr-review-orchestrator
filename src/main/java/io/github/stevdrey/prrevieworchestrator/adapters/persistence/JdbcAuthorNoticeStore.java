@@ -7,10 +7,12 @@ import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticePublisher;
 import io.github.stevdrey.prrevieworchestrator.ports.AuthorNoticeStore;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.ToLongFunction;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -55,22 +57,30 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
     public boolean deliver(Job job, long recipientId, Runnable authorize, ToLongFunction<Evidence> post) {
         if (!reserve(job, recipientId, authorize)) return false;
 
-        // A rollback or lost response here leaves the independently committed permit in place.
+        // Once the POST may have started, a rollback or lost response keeps the committed permit in place.
+        var mayHaveSent = new AtomicBoolean();
         try {
-            return Boolean.TRUE.equals(sends.execute(status -> {
+            boolean sent = Boolean.TRUE.equals(sends.execute(status -> {
                 try {
                     long start = System.nanoTime();
                     PostgresDeadlines.apply(jdbc, SEND_DEADLINE);
                     // JdbcInstallationAuthorization holds FOR SHARE locks until this transaction ends.
                     authorize.run();
-                    PostgresLocks.lockPr(jdbc, job.pr());
-                    var current = currentTransition(job);
+                    // Recheck without the PR lock: lifecycle writers must not wait on the GitHub POST.
+                    var current = currentTransition(job, false);
                     if (current.isEmpty()) return false;
                     Evidence evidence = evidence(job, current.get());
                     if (System.nanoTime() - start >= SEND_DEADLINE.minus(MIN_POST_BUDGET).toNanos()) {
                         throw new IllegalStateException("Author notification send deadline exhausted");
                     }
-                    long commentId = post.applyAsLong(evidence);
+                    mayHaveSent.set(true);
+                    long commentId;
+                    try {
+                        commentId = post.applyAsLong(evidence);
+                    } catch (AuthorNoticePublisher.NotPosted notPosted) {
+                        mayHaveSent.set(false);
+                        throw notPosted;
+                    }
                     jdbc.update("""
                             UPDATE author_notifications SET status = 'SENT', comment_id = ?
                             WHERE id = ? AND status = 'ATTEMPTED' AND attempts = ?
@@ -80,15 +90,35 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
                     throw sanitized(failure);
                 }
             }));
+            if (!sent) release(job);
+            return sent;
         } catch (RuntimeException failure) {
+            if (!mayHaveSent.get()) release(job);
             throw sanitized(failure);
         }
+    }
+
+    /** Best effort: return a permit that provably never reached GitHub; a failure here keeps it (fail closed). */
+    private void release(Job job) {
+        try {
+            jdbc.update("""
+                    UPDATE author_notifications SET status = 'PENDING', recipient_id = NULL
+                    WHERE id = ? AND status = 'ATTEMPTED' AND attempts = ? AND comment_id IS NULL
+                    """, job.id(), job.attempt());
+        } catch (RuntimeException ignored) {
+            // The permit stays ATTEMPTED; never surface database diagnostics.
+        }
+    }
+
+    @Override
+    public boolean isCurrent(Job job, Runnable authorize) {
+        return states.locked(job.pr(), authorize, () -> currentTransition(job, true).isPresent());
     }
 
     private boolean reserve(Job job, long recipientId, Runnable authorize) {
         var pr = job.pr();
         return states.locked(pr, authorize, () -> {
-            if (currentTransition(job).isEmpty()) return false;
+            if (currentTransition(job, true).isEmpty()) return false;
             // Installations may change, but two installations must never publish the same effect.
             jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> {},
                     "author-notice:" + pr.scope().repositoryId() + ":" + pr.number());
@@ -106,8 +136,8 @@ public final class JdbcAuthorNoticeStore implements AuthorNoticeStore {
         });
     }
 
-    private Optional<PullRequestReview> currentTransition(Job job) {
-        return states.load(job.pr(), true).filter(current ->
+    private Optional<PullRequestReview> currentTransition(Job job, boolean lock) {
+        return states.load(job.pr(), lock).filter(current ->
                 current.headSha().equals(job.headSha()) && current.state() == job.state() && !superseded(job));
     }
 

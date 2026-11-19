@@ -11,4 +11,11 @@ public interface AuthorNoticePublisher {
     interface Delivery {
         boolean send(long recipientId, ToLongFunction<Evidence> post);
     }
+
+    /** Thrown by a POST function only when no request reached GitHub, so the send permit may be released. */
+    final class NotPosted extends RuntimeException {
+        public NotPosted() {
+            super("Author notification was not posted", null, false, false);
+        }
+    }
 }

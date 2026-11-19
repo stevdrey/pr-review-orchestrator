@@ -47,18 +47,20 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
 
     @Override
     public boolean publish(Job job, Delivery delivery) {
+        InstallationToken token = null;
         try {
-            var token = tokens.issueForAuthorNotification(job.pr().scope());
+            token = tokens.issueForAuthorNotification(job.pr().scope());
             String repository = "repos/" + token.repository();
             int number = job.pr().number();
             var pr = exchange(token, repository + "/pulls/" + number, null);
             var head = pr.path("head").path("sha");
             if (id(pr.path("base").path("repo").path("id")) != job.pr().scope().repositoryId()
                     || id(pr.path("number")) != number || !pr.path("draft").isBoolean()
-                    || !pr.path("state").isString() || !head.isString()) {
+                    || !pr.path("state").isString() || !pr.path("locked").isBoolean() || !head.isString()) {
                 throw unavailable();
             }
-            if (!"open".equals(pr.path("state").asString()) || pr.path("draft").asBoolean()
+            // GitHub refuses comments on locked conversations; do not spend the permit on a certain refusal.
+            if (!"open".equals(pr.path("state").asString()) || pr.path("draft").asBoolean() || pr.path("locked").asBoolean()
                     || !job.headSha().equals(head.asString())) {
                 return false;
             }
@@ -72,8 +74,9 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
             }
             if (!token.expiresAt().isAfter(clock.instant().plusSeconds(10))) throw unavailable();
             String link = "https://github.com/" + token.repository() + "/pull/" + number;
+            var issued = token;
             return delivery.send(recipient, evidence ->
-                    post(token, repository + "/issues/" + number + "/comments", message(job, evidence, login, link)));
+                    post(issued, repository + "/issues/" + number + "/comments", message(job, evidence, login, link)));
         } catch (AuthorizationDenied denied) {
             throw new AuthorizationDenied();
         } catch (InterruptedException interrupted) {
@@ -81,15 +84,19 @@ public final class GitHubAuthorNotices implements AuthorNoticePublisher {
             throw unavailable();
         } catch (Exception ignored) {
             throw unavailable();
+        } finally {
+            // The write-scoped token is single-use; never leave it live remotely after this job.
+            if (token != null) tokens.revoke(token);
         }
     }
 
     private long post(InstallationToken token, String path, String body) {
-        if (!token.expiresAt().isAfter(clock.instant().plus(DEADLINE))) throw unavailable();
+        if (!token.expiresAt().isAfter(clock.instant().plus(DEADLINE))) throw new AuthorNoticePublisher.NotPosted();
         try {
             var comment = exchange(token, path, body);
             long commentId = id(comment.path("id"));
-            if (commentId > 0 && body.equals(comment.path("body").asString())
+            // GitHub may normalize whitespace or line endings; the id, marker and App author identify the receipt.
+            if (commentId > 0 && comment.path("body").asString().startsWith(MARKER.strip())
                     && botLogin.equalsIgnoreCase(comment.path("user").path("login").asString())
                     && "Bot".equals(comment.path("user").path("type").asString())) {
                 return commentId;

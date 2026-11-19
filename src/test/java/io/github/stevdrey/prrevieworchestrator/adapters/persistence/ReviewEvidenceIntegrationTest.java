@@ -70,7 +70,7 @@ class ReviewEvidenceIntegrationTest {
     }
 
     Snapshot snapshot(UUID id, UUID cycle, String sha, Instant at, String content) {
-        return new GitHubReviewNormalizer().normalize(id, cycle, PR, sha, at,
+        return new GitHubReviewNormalizer("").normalize(id, cycle, PR, sha, at,
                 content.getBytes(StandardCharsets.UTF_8), Map.of("C1", Severity.HIGH));
     }
 

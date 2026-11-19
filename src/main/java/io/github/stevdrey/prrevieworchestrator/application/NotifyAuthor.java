@@ -15,17 +15,25 @@ public final class NotifyAuthor {
         this.authorization = authorization;
     }
 
-    public void processNext() {
-        store.claim().ifPresent(job -> {
-            Runnable authorize = () -> authorization.requireAuthorized(job.pr().scope());
-            try {
-                authorize.run();
-                if (!publisher.publish(job, (recipient, post) -> store.deliver(job, recipient, authorize, post))) {
-                    store.skip(job);
-                }
-            } catch (AuthorizationDenied denied) {
+    /** Returns true only when a claimed job was skipped locally without contacting GitHub. */
+    public boolean processNext() {
+        var claimed = store.claim();
+        if (claimed.isEmpty()) return false;
+        var job = claimed.get();
+        Runnable authorize = () -> authorization.requireAuthorized(job.pr().scope());
+        try {
+            authorize.run();
+            // Superseded intents are common; settle them before minting a token or calling GitHub.
+            if (!store.isCurrent(job, authorize)) {
+                store.skip(job);
+                return true;
+            }
+            if (!publisher.publish(job, (recipient, post) -> store.deliver(job, recipient, authorize, post))) {
                 store.skip(job);
             }
-        });
+        } catch (AuthorizationDenied denied) {
+            store.skip(job);
+        }
+        return false;
     }
 }

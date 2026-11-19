@@ -145,6 +145,11 @@ public final class GitHubInstallationTokens {
         }
     }
 
+    /** Best-effort revocation of a single-use token after its action; all outcomes are ignored. */
+    void revoke(InstallationToken token) {
+        revoke(token.secret());
+    }
+
     /** Best-effort: a rejected token must not stay usable remotely. All outcomes are ignored. */
     private void revoke(String token) {
         if (token == null) {

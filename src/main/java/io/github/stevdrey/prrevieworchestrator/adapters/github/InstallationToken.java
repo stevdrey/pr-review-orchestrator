@@ -22,6 +22,10 @@ public final class InstallationToken {
         return expiresAt;
     }
 
+    String secret() {
+        return token;
+    }
+
     String repository() {
         return repository;
     }

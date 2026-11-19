@@ -49,7 +49,10 @@ public class AuthorNoticeConfiguration {
         @Scheduled(fixedDelay = 1000)
         void tick() {
             try {
-                notifyAuthor.processNext();
+                // Drain locally stale backlog rows quickly; any GitHub-contacting job ends this tick.
+                for (int i = 0; i < 100 && notifyAuthor.processNext(); i++) {
+                    // continue
+                }
             } catch (RuntimeException ignored) {
                 LoggerFactory.getLogger(Ticks.class).warn("Author notification failed; see author_notifications status");
             }
