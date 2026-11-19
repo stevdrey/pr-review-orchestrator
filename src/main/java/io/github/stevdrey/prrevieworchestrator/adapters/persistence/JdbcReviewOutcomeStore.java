@@ -147,19 +147,46 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
             var current = states.load(run.pr(), false).orElseThrow();
             return current.intervention() == Intervention.NO_PROGRESS ? outcome.noProgress(current.version()) : outcome;
         }
-        // Unverified, failed and clean rounds carry no fingerprint. Do not compare across a gap.
-        var previous = jdbc.query("""
-                SELECT progress.finding_sha256 = ? AND progress.review_source_id <> ?
-                FROM review_requests current JOIN review_requests prior
-                    USING (installation_id, repository_id, pr_number, stage, provider)
-                LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
-                WHERE current.id = ? AND prior.iteration < current.iteration
-                ORDER BY prior.iteration DESC LIMIT 1
-                """, (rs, row) -> rs.getBoolean(1), fingerprint, reviewId, run.requestId());
-        if (previous.isEmpty() || !previous.getFirst()) return outcome;
+        if (!repeatsPriorRound(run.requestId(), reviewId, fingerprint)) return outcome;
         var current = states.load(run.pr(), false).orElseThrow();
         var stopped = states.stopLocked(current, Intervention.NO_PROGRESS);
         return outcome.noProgress(stopped.version());
+    }
+
+    private boolean repeatsPriorRound(UUID requestId, String reviewId, String fingerprint) {
+        // Select the immediately preceding request even when it has no fingerprint.
+        // A verified fix after its snapshot establishes progress for the exact prior source revision.
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                WITH previous AS (
+                    SELECT progress.snapshot_id, progress.review_source_id, progress.finding_sha256
+                    FROM review_requests current JOIN review_requests prior
+                        USING (installation_id, repository_id, pr_number, stage, provider)
+                    LEFT JOIN review_round_progress progress ON progress.request_id = prior.id
+                    WHERE current.id = ? AND prior.iteration < current.iteration
+                    ORDER BY prior.iteration DESC LIMIT 1
+                )
+                SELECT EXISTS (
+                    SELECT 1 FROM previous p
+                    WHERE p.finding_sha256 = ? AND p.review_source_id <> ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_evidence_snapshots o
+                        JOIN review_evidence_sources review ON review.snapshot_id = o.id
+                            AND review.source_id = p.review_source_id
+                        JOIN review_evidence_sources source ON source.snapshot_id = o.id
+                            AND source.review_id = review.source_id AND source.author_login = review.author_login
+                        JOIN findings f ON f.review_cycle_id = o.review_cycle_id AND f.source_provider = o.provider
+                            AND f.source_kind = source.source_kind AND f.source_id = source.source_id
+                        JOIN review_evidence_sources retained ON retained.snapshot_id = f.evidence_snapshot_id
+                            AND retained.source_id = f.source_id
+                        WHERE o.id = p.snapshot_id AND source.reviewed_sha = o.head_sha
+                            AND source.source_kind = 'REVIEW_COMMENT' AND source.reply_to_id IS NULL
+                            AND source.thread_outdated = false AND f.status = 'VERIFIED_FIXED'
+                            AND f.verified_at >= o.ingested_at
+                            AND retained.body_sha256 = source.body_sha256
+                            AND retained.source_updated_at = source.source_updated_at
+                    )
+                )
+                """, Boolean.class, requestId, fingerprint, reviewId));
     }
 
     private Loaded loadSnapshot(Assessment assessment) {

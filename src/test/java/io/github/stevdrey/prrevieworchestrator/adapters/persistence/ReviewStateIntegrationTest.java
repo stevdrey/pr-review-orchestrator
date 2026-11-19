@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.*;
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -16,6 +17,8 @@ import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -81,6 +84,11 @@ class ReviewStateIntegrationTest {
 
     ReviewOutcome.Assessment outcome(PullRequestReview state, ReviewOutcome.Stage stage, ReviewOutcome.Conclusion conclusion,
             String reviewId, String findingHash) {
+        return outcome(state, stage, conclusion, reviewId, findingHash, null);
+    }
+
+    private ReviewOutcome.Assessment outcome(PullRequestReview state, ReviewOutcome.Stage stage,
+            ReviewOutcome.Conclusion conclusion, String reviewId, String findingHash, Integer inlineLine) {
         var request = new ReviewRequest(state.pr(), state.headSha(), stage.name(), "codex", ReviewRequest.Trigger.PR_OPENED,
                 1, false, JdbcFixCorrelationStore.headEpoch(jdbc, state.pr(), state.headSha()));
         var ids = jdbc.query("SELECT id FROM review_requests WHERE request_key = ?", (rs, row) -> rs.getObject(1, UUID.class), request.key());
@@ -100,12 +108,17 @@ class ReviewStateIntegrationTest {
                 state.headSha(), stage.name(), iteration);
         var run = new ReviewOutcome.Run(state.pr(), state.headSha(), "codex", stage, requestId, cycleId, "github", "fixture-codex");
         var seen = findingHash == null ? Instant.EPOCH : jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
-        var source = new ReviewEvidence.Source(reviewId, ReviewEvidence.Kind.REVIEW, reviewId, null, null,
-                run.reviewer(), state.headSha(), null, findingHash == null ? "0".repeat(64) : findingHash, seen,
-                "COMMENTED", null, null, null, null, null, ReviewEvidence.Severity.UNKNOWN,
-                findingHash == null ? ReviewEvidence.Feedback.NONE : ReviewEvidence.Feedback.ACTIONABLE);
+        boolean actionableBody = findingHash != null && inlineLine == null;
+        var source = new Source(reviewId, Kind.REVIEW, reviewId, null, null,
+                run.reviewer(), state.headSha(), null, actionableBody ? findingHash : "0".repeat(64), seen,
+                "COMMENTED", null, null, null, null, null, Severity.UNKNOWN,
+                actionableBody ? Feedback.ACTIONABLE : Feedback.NONE);
+        var sources = inlineLine == null ? List.of(source) : List.of(source,
+                new Source(reviewId + "-inline", Kind.REVIEW_COMMENT, reviewId, reviewId + "-thread", null,
+                        run.reviewer(), state.headSha(), state.headSha(), findingHash, seen, null, false, false,
+                        "src/Example.java", inlineLine, inlineLine, Severity.MEDIUM, Feedback.NONE));
         var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), state.pr(), "github", state.headSha(),
-                findingHash == null ? Instant.now() : seen.plusMillis(1), List.of(source));
+                findingHash == null ? Instant.now() : seen.plusMillis(1), sources);
         new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {});
         return new ReviewOutcome.Assessment(run, state.version(),
                 new ReviewOutcome.Completion(run, reviewId, ReviewOutcome.Status.COMPLETED, conclusion), snapshot.id());
@@ -180,6 +193,46 @@ class ReviewStateIntegrationTest {
         assertEquals(ReviewOutcome.Reason.NO_PROGRESS, outcomes().assess(same).reason());
         assertEquals(paused, newLifecycle().find(FIRST).orElseThrow());
         assertNull(step(paused, RESUME).intervention());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "150, true,  ACTION_REQUIRED",
+            "150, false, ACTION_REQUIRED",
+            "10,  true,  ACTION_REQUIRED",
+            "10,  false, NEEDS_HUMAN"
+    })
+    void inlineProgressAccountsForLocationAndVerifiedFixes(int secondLine, boolean verifiedFix,
+            ReviewOutcome.Verdict expected) {
+        var firstState = reviewing(FIRST);
+        var stage = ReviewOutcome.Stage.BASELINE;
+        var findings = ReviewOutcome.Conclusion.FINDINGS;
+        String sameComment = "1".repeat(64);
+        var first = outcome(firstState, stage, findings, "review-first", sameComment, 10);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(first).verdict());
+        var next = step(step(step(firstState, BLOCKING_FINDINGS), AWAIT_FIX), UPDATE_HEAD);
+        if (verifiedFix) {
+            assertEquals(1, jdbc.update("""
+                    UPDATE findings SET status = 'VERIFIED_FIXED', disposition_actor = 'maintainer',
+                        disposition_reason = 'The original issue was verified fixed',
+                        evidence_sha = ?, verified_at = clock_timestamp()
+                    WHERE review_cycle_id = ? AND source_id = 'review-first-inline'
+                    """, NEXT, first.run().cycleId()));
+        }
+        var reReviewing = step(passCi(next), START_REVIEW);
+        var second = outcome(reReviewing, stage, findings, "review-second", sameComment, secondLine);
+        assertEquals(2, jdbc.queryForObject("""
+                SELECT count(DISTINCT stable_finding_id) FROM findings WHERE source_kind = 'REVIEW_COMMENT'
+                """, Integer.class));
+        var decision = outcomes().assess(second);
+        assertEquals(expected, decision.verdict());
+        var current = newLifecycle().find(FIRST).orElseThrow();
+        if (expected == ReviewOutcome.Verdict.NEEDS_HUMAN) {
+            assertEquals(PAUSED, current.state());
+            assertEquals(PullRequestReview.Intervention.NO_PROGRESS, current.intervention());
+        } else {
+            assertEquals(reReviewing, current);
+        }
     }
 
     @Test

@@ -64,7 +64,7 @@ public final class ReviewOutcomeClassifier {
         return result(expected, version, CLEAN_FOR_SHA, CORRELATED_NO_FINDINGS);
     }
 
-    /** Fingerprint only the authenticated review's current actionable findings. Ignore IDs and shifted lines. */
+    /** Fingerprint actionable findings from this review, including their current inline locations when applicable. */
     public Optional<String> findingFingerprint(Run expected, Completion completion, Snapshot snapshot,
             Set<String> dismissedGeneralSources, Set<String> closedInlineSources) {
         if (completion == null || !expected.equals(completion.run()) || completion.status() != Status.COMPLETED
@@ -79,11 +79,16 @@ public final class ReviewOutcomeClassifier {
                 .filter(source -> source.general()
                         ? source.feedback() == Feedback.ACTIONABLE && !dismissedGeneralSources.contains(source.id())
                         : !closedInlineSources.contains(source.id()))
+                .toList();
+        // Text alone cannot establish that an inline finding with an unavailable location is repeated.
+        if (findings.isEmpty() || findings.stream().anyMatch(source -> !source.general()
+                && (source.path() == null || source.line() == null))) return Optional.empty();
+        var keys = findings.stream()
                 .map(source -> source.kind().name() + "/" + source.bodySha256() + "/"
-                        + Sha256.hex(Objects.toString(source.path(), "").getBytes(StandardCharsets.UTF_8)))
+                        + Sha256.hex(Objects.toString(source.path(), "").getBytes(StandardCharsets.UTF_8))
+                        + "/" + Objects.toString(source.line(), ""))
                 .sorted().toList();
-        return findings.isEmpty() ? Optional.empty()
-                : Optional.of(Sha256.hex(String.join("\n", findings).getBytes(StandardCharsets.UTF_8)));
+        return Optional.of(Sha256.hex(String.join("\n", keys).getBytes(StandardCharsets.UTF_8)));
     }
 
     private boolean matchesSnapshot(Run expected, Snapshot snapshot) {
