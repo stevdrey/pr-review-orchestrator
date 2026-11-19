@@ -64,15 +64,24 @@ public final class ReviewOutcomeClassifier {
         return result(expected, version, CLEAN_FOR_SHA, CORRELATED_NO_FINDINGS);
     }
 
-    /** Fingerprint actionable findings from this review, including their current inline locations when applicable. */
-    public Optional<String> findingFingerprint(Run expected, Completion completion, Snapshot snapshot,
+    /** An authenticated completion with a null fingerprint breaks the no-progress comparison. */
+    public record ProgressEvidence(String fingerprint) {}
+
+    public Optional<ProgressEvidence> progressEvidence(Run expected, Completion completion, Snapshot snapshot,
             Set<String> dismissedGeneralSources, Set<String> closedInlineSources) {
         if (completion == null || !expected.equals(completion.run()) || completion.status() != Status.COMPLETED
-                || completion.conclusion() != Conclusion.FINDINGS || !matchesSnapshot(expected, snapshot)
-                || futureRevision(snapshot)
+                || !matchesSnapshot(expected, snapshot) || futureRevision(snapshot)
                 || review(completion, snapshot).filter(source -> verifiedReview(expected, source)).isEmpty()) {
             return Optional.empty();
         }
+        String fingerprint = completion.conclusion() == Conclusion.FINDINGS
+                ? findingFingerprint(expected, completion, snapshot, dismissedGeneralSources, closedInlineSources)
+                : null;
+        return Optional.of(new ProgressEvidence(fingerprint));
+    }
+
+    private String findingFingerprint(Run expected, Completion completion, Snapshot snapshot,
+            Set<String> dismissedGeneralSources, Set<String> closedInlineSources) {
         var findings = snapshot.sources().stream().filter(Source::candidate)
                 .filter(source -> completion.reviewId().equals(source.reviewId())
                         && expected.reviewer().equals(source.author()) && !source.staleFor(expected.headSha()))
@@ -82,13 +91,13 @@ public final class ReviewOutcomeClassifier {
                 .toList();
         // Text alone cannot establish that an inline finding with an unavailable location is repeated.
         if (findings.isEmpty() || findings.stream().anyMatch(source -> !source.general()
-                && (source.path() == null || source.line() == null))) return Optional.empty();
+                && (source.path() == null || source.line() == null))) return null;
         var keys = findings.stream()
                 .map(source -> source.kind().name() + "/" + source.bodySha256() + "/"
                         + Sha256.hex(Objects.toString(source.path(), "").getBytes(StandardCharsets.UTF_8))
                         + "/" + Objects.toString(source.line(), ""))
                 .sorted().toList();
-        return Optional.of(Sha256.hex(String.join("\n", keys).getBytes(StandardCharsets.UTF_8)));
+        return Sha256.hex(String.join("\n", keys).getBytes(StandardCharsets.UTF_8));
     }
 
     private boolean matchesSnapshot(Run expected, Snapshot snapshot) {

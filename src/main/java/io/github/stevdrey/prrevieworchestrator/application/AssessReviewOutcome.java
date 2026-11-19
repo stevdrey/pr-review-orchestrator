@@ -17,7 +17,7 @@ public final class AssessReviewOutcome {
     }
 
     /** The version is captured with the evidence read, never refreshed to make delayed evidence pass.
-     * A correlated actionable completion can persist progress evidence and request human intervention.
+     * An authenticated completion updates progress evidence. Repeated actionable findings can request human intervention.
      */
     public ReviewOutcome assess(Assessment assessment) {
         return store.assess(assessment, () -> authorization.requireAuthorized(assessment.run().pr().scope()));

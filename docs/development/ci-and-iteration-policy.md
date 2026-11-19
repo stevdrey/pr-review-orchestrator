@@ -21,9 +21,13 @@ Read the active reason from `ReviewLifecycle.find(pr).intervention()` and its hi
 
 A late completion during an existing pause updates the request's fingerprint and returns its actionable outcome. The journal identifies the request that caused each no-progress pause. A replay reports that pause only while it is the active hold. An earlier hold with unlinked journal evidence remains in place and its replay reports the actionable outcome.
 
+An authenticated completed assessment with no comparable findings stores the latest snapshot with a null fingerprint. This breaks the comparison with the next round and retains the request's pause attribution. Recording a clean outcome also clears the request's comparable fingerprint.
+
 ## Rollout and verification
 
-V14 preserves request IDs, keys, states and receipts. It assigns iteration slots to retained requests and initializes CI to unknown, withdrawing unsupported legacy readiness while retaining clean verdicts and history. Keep the schema and audit evidence during rollback. Disable review dispatch and readiness writes if rolling back to an older binary, which cannot enforce the new gates.
+V14 preserves request IDs, keys, states and receipts. It assigns iteration slots to retained requests and initializes CI to unknown, withdrawing unsupported legacy readiness while retaining clean verdicts and history. V15 invalidates cached V14 fingerprints because V14 did not record uncomparable assessments. It keeps the assessment snapshots and pause history. V15 also clears persisted CI that the journal cannot tie to the current head visit and resets CI on journaled head updates and confirmations from older writers.
+
+Keep the schema and audit evidence during rollback. Stop review dispatch, evidence writes and all lifecycle writers while an older binary is connected to the retained schema. On roll-forward, reconcile the current PR head and required CI before reactivating automation or readiness writes.
 
 The internal reconciliation entry points require an approved caller to read current GitHub state, evaluate the configured dependencies and revalidate them at dispatch. The existing default-disabled provider and dispatcher settings still apply. Local fixtures use synthetic event, CI and provider observations with disposable PostgreSQL. Live CI fetching, notification delivery and the end-to-end GitHub/Codex workflow remain separate integrations.
 
@@ -44,3 +48,11 @@ The follow-up focused run (`./gradlew --offline test --tests '*.ReviewStateInteg
 The four new PostgreSQL test cases reproduced incorrect attribution on `828ce3a`. They cover a late repeated review and its replay during no-progress, iteration-limit and human holds, plus an earlier pause owner replayed during a later hold. The focused run (`./gradlew --offline test --tests '*.ReviewStateIntegrationTest' --tests '*.ReviewRequestIntegrationTest'`) passed all 56 tests after the fix.
 
 `./gradlew --offline clean build` passed all 278 tests, with zero failures or skips.
+
+### PR #65 latest evidence and rollback regressions
+
+With the regressions applied to `a5ccd9e`, the two incomplete-location cases reproduced stale comparison state or lost pause attribution. The V13 writer fixtures reproduced a passing CI status after both a head update and a same-head confirmation. The V14-to-V15 fixture covers repair of already stale CI, preservation of a valid observation, and verification that invalidating old hashes retains snapshot and pause evidence.
+
+The focused run (`./gradlew --offline test --tests '*.ReviewStateIntegrationTest' --tests '*.ReviewOutcomeClassifierTest' --tests '*.ReviewRequestIntegrationTest' --tests '*.DatabaseIntegrationTest'`) passed 93 tests with zero failures or skips.
+
+`./gradlew --offline clean build` passed all 283 tests with zero failures or skips.

@@ -54,6 +54,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                     """, run.pr().scope().installationId(), run.pr().scope().repositoryId(), run.pr().number(), commandId,
                     run.requestId(), run.cycleId(), assessment.snapshotId(), run.headSha(), run.stage().name(),
                     run.provider(), run.evidenceProvider(), assessment.completion().reviewId(), run.reviewer());
+            saveProgress(assessment, null, false);
             return state;
         });
     }
@@ -133,9 +134,11 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 """, String.class, snapshot.id()));
         var outcome = classifier.classify(run, assessment.expectedVersion(), assessment.completion(), snapshot, pending,
                 dismissed, closedInline);
-        if (!recordProgress || outcome.verdict() != Verdict.ACTION_REQUIRED) return outcome;
-        return classifier.findingFingerprint(run, assessment.completion(), snapshot, dismissed, closedInline)
-                .map(fingerprint -> recordProgress(assessment, outcome, fingerprint)).orElse(outcome);
+        if (!recordProgress) return outcome;
+        return classifier.progressEvidence(run, assessment.completion(), snapshot, dismissed, closedInline)
+                .map(progress -> recordProgress(assessment, outcome,
+                        outcome.verdict() == Verdict.ACTION_REQUIRED ? progress.fingerprint() : null))
+                .orElse(outcome);
     }
 
     private ReviewOutcome recordProgress(Assessment assessment, ReviewOutcome outcome, String fingerprint) {
@@ -144,32 +147,37 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         // The caller holds the PR lock and classify only accepts the uniquely latest snapshot for the current head,
         // so a different stored snapshot is older evidence for this same request.
         var stored = jdbc.query("""
-                SELECT snapshot_id, no_progress FROM review_round_progress WHERE request_id = ?
-                """, (rs, row) -> new StoredProgress(rs.getObject(1, UUID.class), rs.getBoolean(2)), run.requestId());
+                SELECT snapshot_id, review_source_id, finding_sha256, no_progress FROM review_round_progress WHERE request_id = ?
+                """, (rs, row) -> new StoredProgress(rs.getObject(1, UUID.class), rs.getString(2),
+                        rs.getString(3), rs.getBoolean(4)), run.requestId()).stream().findFirst().orElse(null);
         var current = states.load(run.pr(), false).orElseThrow();
-        boolean previouslyStopped = !stored.isEmpty() && stored.getFirst().noProgress();
+        boolean previouslyStopped = stored != null && stored.noProgress();
+        boolean sameSnapshot = stored != null && stored.snapshotId().equals(assessment.snapshotId());
         // The journal key binds the hold to this request across snapshot changes and human resumes.
         UUID stopId = UUID.nameUUIDFromBytes(("review-no-progress/" + run.requestId()).getBytes(StandardCharsets.UTF_8));
-        if (!stored.isEmpty() && stored.getFirst().snapshotId().equals(assessment.snapshotId())) {
-            return previouslyStopped && ownsActivePause(current, stopId)
-                    ? outcome.noProgress(current.version()) : outcome;
-        }
         var updated = current;
-        if (!previouslyStopped && current.state() != State.PAUSED && repeatsPriorRound(run, reviewId, fingerprint)) {
+        if (!sameSnapshot && fingerprint != null && !previouslyStopped && current.state() != State.PAUSED
+                && repeatsPriorRound(run, reviewId, fingerprint)) {
             updated = states.stopLocked(current, Intervention.NO_PROGRESS, stopId);
         }
         boolean causedPause = updated.version() != current.version();
+        if (!sameSnapshot || !stored.reviewId().equals(reviewId) || !Objects.equals(stored.fingerprint(), fingerprint)) {
+            saveProgress(assessment, fingerprint, causedPause);
+        }
+        return causedPause || (outcome.verdict() == Verdict.ACTION_REQUIRED && previouslyStopped && ownsActivePause(updated, stopId))
+                ? outcome.noProgress(updated.version()) : outcome;
+    }
+
+    private void saveProgress(Assessment assessment, String fingerprint, boolean causedPause) {
         jdbc.update("""
                 INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256, no_progress)
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (request_id) DO UPDATE SET snapshot_id = EXCLUDED.snapshot_id,
                     review_source_id = EXCLUDED.review_source_id, finding_sha256 = EXCLUDED.finding_sha256,
                     no_progress = review_round_progress.no_progress OR EXCLUDED.no_progress
-                """, run.requestId(), assessment.snapshotId(), reviewId, fingerprint, causedPause);
-        return causedPause || previouslyStopped && ownsActivePause(updated, stopId)
-                ? outcome.noProgress(updated.version()) : outcome;
+                """, assessment.run().requestId(), assessment.snapshotId(), assessment.completion().reviewId(), fingerprint, causedPause);
     }
 
-    private record StoredProgress(UUID snapshotId, boolean noProgress) {}
+    private record StoredProgress(UUID snapshotId, String reviewId, String fingerprint, boolean noProgress) {}
 
     private boolean ownsActivePause(PullRequestReview state, UUID stopId) {
         if (state.intervention() != Intervention.NO_PROGRESS) return false;

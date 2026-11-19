@@ -23,6 +23,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -324,6 +325,52 @@ class ReviewStateIntegrationTest {
                 SELECT no_progress FROM review_round_progress WHERE request_id = ?
                 """, Boolean.class, firstStop.run().requestId()));
         assertEquals(paused, lifecycle.find(FIRST).orElseThrow());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void newerUncomparableSnapshotClearsTheFingerprintAndPreservesPauseOwnership(boolean ownedPause) {
+        var state = reviewing(FIRST);
+        var stage = ReviewOutcome.Stage.BASELINE;
+        var conclusion = ReviewOutcome.Conclusion.FINDINGS;
+        String finding = "1".repeat(64);
+        if (ownedPause) {
+            var earlier = outcome(state, stage, conclusion, "review-earlier", finding, 10);
+            assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(earlier).verdict());
+            state = step(step(state, UPDATE_HEAD), START_REVIEW);
+        }
+        var first = outcome(state, stage, conclusion, "review-first", finding, 10);
+        assertEquals(ownedPause ? ReviewOutcome.Reason.NO_PROGRESS : ReviewOutcome.Reason.BLOCKING_FINDINGS,
+                outcomes().assess(first).reason());
+        var current = lifecycle.find(FIRST).orElseThrow();
+        Instant seen = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        var review = new Source("review-first", Kind.REVIEW, "review-first", null, null,
+                first.run().reviewer(), current.headSha(), null, "0".repeat(64), seen, "COMMENTED",
+                null, null, null, null, null, Severity.UNKNOWN, Feedback.NONE);
+        var comment = new Source("review-first-inline", Kind.REVIEW_COMMENT, "review-first", "review-first-thread", null,
+                first.run().reviewer(), current.headSha(), current.headSha(), finding, seen, null, false, false,
+                "src/Example.java", null, 10, Severity.MEDIUM, Feedback.NONE);
+        var snapshot = new Snapshot(UUID.randomUUID(), first.run().cycleId(), FIRST, "github", current.headSha(),
+                seen.plusMillis(1), List.of(review, comment));
+        assertTrue(new JdbcReviewEvidenceStore(jdbc, new DataSourceTransactionManager(dataSource)).ingest(snapshot, () -> {}));
+        var latest = new ReviewOutcome.Assessment(first.run(), current.version(), first.completion(), snapshot.id());
+        var expected = ownedPause ? ReviewOutcome.Reason.NO_PROGRESS : ReviewOutcome.Reason.BLOCKING_FINDINGS;
+        assertEquals(expected, outcomes().assess(latest).reason());
+        assertEquals(expected, outcomes().assess(latest).reason());
+        var stored = jdbc.queryForMap("""
+                SELECT snapshot_id, finding_sha256, no_progress FROM review_round_progress WHERE request_id = ?
+                """, first.run().requestId());
+        assertEquals(snapshot.id(), stored.get("snapshot_id"));
+        assertNull(stored.get("finding_sha256"));
+        assertEquals(ownedPause, stored.get("no_progress"));
+
+        if (ownedPause) current = step(current, RESUME);
+        var moved = lifecycle.apply(FIRST, new ReviewTransition(UUID.randomUUID(), current.version(), current.headSha(),
+                UPDATE_HEAD, "c".repeat(40), CLEAR));
+        var reviewing = step(passCi(moved), START_REVIEW);
+        var repeated = outcome(reviewing, stage, conclusion, "review-second", finding, 10);
+        assertEquals(ReviewOutcome.Verdict.ACTION_REQUIRED, outcomes().assess(repeated).verdict());
+        assertEquals(reviewing, lifecycle.find(FIRST).orElseThrow());
     }
 
     @ParameterizedTest
@@ -970,6 +1017,47 @@ class ReviewStateIntegrationTest {
         assertEquals(1, journalCount());
     }
 
+    @ParameterizedTest
+    @CsvSource({"UPDATE_HEAD", "CONFIRM_HEAD"})
+    void oldWriterCannotCarryPassingCiIntoAnotherHeadVisit(Action action) {
+        var prior = passCi(reviewing(FIRST));
+        recordReceipt(prior, ReviewOutcome.Stage.BASELINE);
+        var transactions = new DataSourceTransactionManager(dataSource);
+        new TransactionTemplate(transactions).executeWithoutResult(status ->
+                applyLegacyHeadWrite(jdbc, prior, action, action == UPDATE_HEAD ? NEXT : null));
+        var current = lifecycle.find(FIRST).orElseThrow();
+        assertEquals(Ci.UNKNOWN, current.ci());
+        var request = new ReviewRequest(FIRST, current.headSha(), "BASELINE", "codex", ReviewRequest.Trigger.PR_SYNCHRONIZE,
+                1, false, JdbcFixCorrelationStore.headEpoch(jdbc, FIRST, current.headSha()));
+        var requests = new JdbcReviewRequestStore(jdbc, transactions);
+        assertEquals(ReviewRequestFailure.Code.CI_NOT_PASSED, assertThrows(ReviewRequestFailure.class,
+                () -> requests.reserve(request, 1, 6, () -> {}, () -> fail("Stale CI must block before approval"))).code());
+
+        var deep = step(step(step(current, START_REVIEW), BASELINE_CLEAN), DEEP_CLEAN);
+        assertCode(GUARD_REJECTED, () -> step(deep, MARK_READY_FOR_HUMAN));
+        assertEquals(READY_FOR_HUMAN, step(passCi(deep), MARK_READY_FOR_HUMAN).state());
+    }
+
+    private void applyLegacyHeadWrite(JdbcTemplate target, PullRequestReview prior, Action action, String newHead) {
+        var transition = new ReviewTransition(UUID.randomUUID(), prior.version(), prior.headSha(), action, newHead, CLEAR);
+        var next = prior.transition(transition);
+        var pr = prior.pr();
+        // V13 updates the aggregate and journals the new visit without writing ci_status.
+        target.update("""
+                UPDATE pr_review_states SET head_sha = ?, version = ?, state = ?, resume_state = ?,
+                    baseline_clean_sha = ?, deep_clean_sha = ?
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                """, next.headSha(), next.version(), next.state().name(),
+                next.resumeState() == null ? null : next.resumeState().name(), next.baselineCleanSha(), next.deepCleanSha(),
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
+        target.update("""
+                INSERT INTO pr_review_transitions (installation_id, repository_id, pr_number, transition_id,
+                    expected_version, expected_head_sha, action, resulting_version, resulting_head_sha, resulting_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), transition.id(),
+                prior.version(), prior.headSha(), action.name(), next.version(), next.headSha(), next.state().name());
+    }
+
     @Test
     void databaseRejectsInconsistentEvidenceAndPauseSnapshots() {
         lifecycle.create(FIRST, HEAD);
@@ -999,7 +1087,7 @@ class ReviewStateIntegrationTest {
                            (101, 1001, 8, ?, 'PAUSED', 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             assertEquals("DEEP_REVIEW", jdbc.queryForObject(
                     "SELECT state FROM ci_upgrade_fixture.pr_review_states WHERE pr_number = 7", String.class));
             assertEquals(Map.of("state", "PAUSED", "resume_state", "DEEP_REVIEW", "ci_status", "UNKNOWN", "deep_clean_sha", HEAD),
@@ -1013,6 +1101,67 @@ class ReviewStateIntegrationTest {
                     """, Integer.class));
         } finally {
             jdbc.execute("DROP SCHEMA IF EXISTS ci_upgrade_fixture CASCADE");
+        }
+    }
+
+    @Test
+    void v14UpgradeInvalidatesUnprovenComparisonsAndStaleCiButKeepsEvidence() {
+        String schema = "current_evidence_upgrade";
+        String url = POSTGRES.getJdbcUrl();
+        var scoped = new DriverManagerDataSource(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema,
+                POSTGRES.getUsername(), POSTGRES.getPassword());
+        var scopedJdbc = new JdbcTemplate(scoped);
+        var transactions = new DataSourceTransactionManager(scoped);
+        try {
+            Flyway.configure().dataSource(scoped).schemas(schema).target("14").load().migrate();
+            scopedJdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
+            scopedJdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+            var stateStore = new JdbcReviewStateStore(scopedJdbc, transactions);
+            var validPr = new PullRequestId(FIRST.scope(), 8);
+            var passing = stateStore.reconcileCi(0, ci(stateStore.create(FIRST, HEAD, () -> {}), Ci.PASSED), () -> {});
+            var valid = stateStore.reconcileCi(0, ci(stateStore.create(validPr, HEAD, () -> {}), Ci.PASSED), () -> {});
+            new TransactionTemplate(transactions).executeWithoutResult(status ->
+                    applyLegacyHeadWrite(scopedJdbc, passing, UPDATE_HEAD, NEXT));
+            assertEquals(Ci.PASSED, stateStore.find(FIRST, () -> {}).orElseThrow().ci());
+
+            var request = new ReviewRequest(FIRST, HEAD, "BASELINE", "codex", ReviewRequest.Trigger.PR_OPENED, 1, false);
+            UUID requestId = UUID.randomUUID();
+            UUID cycle = UUID.randomUUID();
+            scopedJdbc.update("""
+                    INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
+                        head_sha, stage, provider, actor_id, iteration)
+                    VALUES (?, ?, 101, 1001, 7, ?, 'BASELINE', 'codex', 1, 1)
+                    """, requestId, request.key(), HEAD);
+            scopedJdbc.update("""
+                    INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider)
+                    VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'codex')
+                    """, cycle, HEAD);
+            var review = new Source("review", Kind.REVIEW, "review", null, null, "reviewer", HEAD, null,
+                    "1".repeat(64), Instant.EPOCH, "COMMENTED", null, null, null, null, null,
+                    Severity.UNKNOWN, Feedback.ACTIONABLE);
+            var snapshot = new Snapshot(UUID.randomUUID(), cycle, FIRST, "github", HEAD, Instant.now(), List.of(review));
+            new JdbcReviewEvidenceStore(scopedJdbc, transactions).ingest(snapshot, () -> {});
+            scopedJdbc.update("""
+                    INSERT INTO review_round_progress (request_id, snapshot_id, review_source_id, finding_sha256, no_progress)
+                    VALUES (?, ?, 'review', ?, true)
+                    """, requestId, snapshot.id(), "2".repeat(64));
+
+            var latest = Flyway.configure().dataSource(scoped).schemas(schema).load();
+            assertEquals(1, latest.migrate().migrationsExecuted);
+            var fixed = stateStore.find(FIRST, () -> {}).orElseThrow();
+            assertEquals(Ci.UNKNOWN, fixed.ci());
+            assertEquals(NEXT, fixed.headSha());
+            assertEquals(passing.version() + 2, fixed.version());
+            assertEquals(valid, stateStore.find(validPr, () -> {}).orElseThrow());
+            var progress = scopedJdbc.queryForMap("""
+                    SELECT snapshot_id, finding_sha256, no_progress FROM review_round_progress WHERE request_id = ?
+                    """, requestId);
+            assertEquals(snapshot.id(), progress.get("snapshot_id"));
+            assertEquals(true, progress.get("no_progress"));
+            assertNull(progress.get("finding_sha256"));
+            assertTrue(latest.validateWithResult().validationSuccessful);
+        } finally {
+            jdbc.execute("DROP SCHEMA IF EXISTS current_evidence_upgrade CASCADE");
         }
     }
 
