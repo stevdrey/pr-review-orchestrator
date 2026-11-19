@@ -15,6 +15,15 @@ public final class GitHubReviewNormalizer {
     private static final JsonMapper JSON = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
+    private final String notificationBotLogin;
+
+    public GitHubReviewNormalizer() {
+        this("");
+    }
+
+    public GitHubReviewNormalizer(String notificationBotLogin) {
+        this.notificationBotLogin = Objects.requireNonNull(notificationBotLogin);
+    }
 
     public Snapshot normalize(UUID observationId, UUID cycleId, PullRequestId pr, String expectedHead,
             Instant capturedAt, byte[] response) {
@@ -63,7 +72,7 @@ public final class GitHubReviewNormalizer {
                 sources.add(new Source(id, Kind.ISSUE_COMMENT, null, null, null, author(comment),
                         null, null, hash(body(comment)), Instant.parse(string(comment, "updatedAt")),
                         null, null, null, null, null, null, severities.getOrDefault(id, Severity.UNKNOWN),
-                        feedback(comment, actionableIds)));
+                        ownNotification(comment) ? Feedback.NONE : feedback(comment, actionableIds)));
             }
             for (JsonNode thread : nodes(pull.path("reviewThreads"))) {
                 String threadId = string(thread, "id");
@@ -94,6 +103,13 @@ public final class GitHubReviewNormalizer {
     private Feedback feedback(JsonNode node, Set<String> actionableIds) {
         if (body(node).isBlank()) return Feedback.NONE;
         return actionableIds.contains(string(node, "id")) ? Feedback.ACTIONABLE : Feedback.NEEDS_HUMAN;
+    }
+
+    private boolean ownNotification(JsonNode comment) {
+        JsonNode actor = comment.path("author");
+        return !notificationBotLogin.isEmpty() && "Bot".equals(actor.path("__typename").asString())
+                && notificationBotLogin.equalsIgnoreCase(actor.path("login").asString())
+                && body(comment).startsWith(GitHubAuthorNotices.MARKER);
     }
 
     private Iterable<JsonNode> nodes(JsonNode connection) {

@@ -4,7 +4,13 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import com.sun.net.httpserver.HttpServer;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorNotice.Evidence;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorNotice.Job;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorNotice.ProviderEvidence;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.State;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetSocketAddress;
@@ -21,9 +27,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -220,6 +230,109 @@ class GitHubCredentialsTest {
             tokens.issue(SCOPE, operation);
             assertEquals(json.valueToTree(operation.permissions()), json.readTree(requestBody).path("permissions"));
             assertTrue(operation.permissions().values().stream().allMatch("read"::equals));
+        }
+    }
+
+    @Test
+    void authorNoticeUsesScopedAppTokenAndPostsOnlySafeMetadata() {
+        var notice = notices();
+        var posted = new AtomicReference<String>();
+        server.createContext("/repos/owner/repository/pulls/7",
+                exchange -> respond(exchange, 200, pull("a".repeat(40), "fixture-author")));
+        server.createContext("/repos/owner/repository/issues/7/comments", exchange -> {
+            var payload = json.readTree(exchange.getRequestBody().readAllBytes());
+            posted.set(payload.path("body").asString());
+            if (!"POST".equals(exchange.getRequestMethod())
+                    || !("Bearer " + TOKEN).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                respond(exchange, 403, "{}");
+                return;
+            }
+            respond(exchange, 201, json.writeValueAsString(Map.of("id", 90, "body", posted.get(),
+                    "user", Map.of("login", "fixture-app[bot]", "type", "Bot"))));
+        });
+        var receipt = notice.publish(noticeJob(State.READY_FOR_HUMAN), author -> {
+            assertEquals(123, author);
+            assertNull(posted.get());
+            return Optional.of(new Evidence(Ci.PASSED, ProviderEvidence.CODEX, ProviderEvidence.RECORDED));
+        });
+        assertEquals(90, receipt.orElseThrow());
+        var tokenRequest = json.readTree(requestBody);
+        assertEquals(json.valueToTree(List.of(1001)), tokenRequest.path("repository_ids"));
+        assertEquals(json.valueToTree(Map.of("metadata", "read", "pull_requests", "write")),
+                tokenRequest.path("permissions"));
+        assertTrue(posted.get().contains("@fixture-author **Ready for human review**"));
+        assertTrue(posted.get().contains("github.com/owner/repository/pull/7"));
+        assertTrue(posted.get().contains("a".repeat(40)));
+        assertTrue(posted.get().contains("CI at dispatch: PASSED"));
+        assertTrue(posted.get().contains("Codex"));
+        assertTrue(posted.get().contains("Approval and any merge decision require human action"));
+        assertFalse(posted.get().contains("PRIVATE_SOURCE"));
+        assertFalse(posted.get().contains(TOKEN));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"stale", "draft", "closed", "invalid-author", "denied-permit"})
+    void preflightMustProveHeadEligibilityAndAuthorBeforePosting(String condition) {
+        var notice = notices();
+        String head = condition.equals("stale") ? "b".repeat(40) : "a".repeat(40);
+        String author = condition.equals("invalid-author") ? "author @someone-else" : "fixture-author";
+        String pr = pull(head, author);
+        if (condition.equals("draft")) pr = pr.replace("false", "true");
+        if (condition.equals("closed")) pr = pr.replace("open", "closed");
+        String response = pr;
+        server.createContext("/repos/owner/repository/pulls/7", exchange -> respond(exchange, 200, response));
+        assertTrue(notice.publish(noticeJob(State.ACTION_REQUIRED), recipient -> {
+            assertEquals("denied-permit", condition);
+            return Optional.empty();
+        }).isEmpty());
+        assertEquals(1, requests.get()); // an unexpected comment POST would hit the catch-all handler
+    }
+
+    @Test
+    void actionNoticeExplainsNextStepAndDoesNotRetryAnUncertainPost() {
+        var notice = notices();
+        var posts = new AtomicInteger();
+        var posted = new AtomicReference<String>();
+        server.createContext("/repos/owner/repository/pulls/7",
+                exchange -> respond(exchange, 200, pull("a".repeat(40), "fixture-author")));
+        server.createContext("/repos/owner/repository/issues/7/comments", exchange -> {
+            posts.incrementAndGet();
+            posted.set(json.readTree(exchange.getRequestBody().readAllBytes()).path("body").asString());
+            respond(exchange, 500, "{\"body\":\"PRIVATE_SOURCE\"}");
+        });
+        assertSanitized(assertThrows(IllegalStateException.class, () -> notice.publish(noticeJob(State.ACTION_REQUIRED),
+                recipient -> Optional.of(new Evidence(Ci.FAILED, ProviderEvidence.UNAVAILABLE, ProviderEvidence.UNAVAILABLE)))));
+        assertEquals(1, posts.get());
+        assertTrue(posted.get().contains("@fixture-author **Action required**"));
+        assertTrue(posted.get().contains("CI at dispatch: FAILED"));
+        assertTrue(posted.get().contains("address or explicitly disposition the feedback"));
+        assertFalse(posted.get().contains("PRIVATE_SOURCE"));
+    }
+
+    private GitHubAuthorNotices notices() {
+        response = json.writeValueAsString(Map.of("token", TOKEN, "expires_at", NOW.plusSeconds(3600).toString(),
+                "repositories", List.of(Map.of("id", 1001, "full_name", "owner/repository")),
+                "permissions", Map.of("metadata", "read", "pull_requests", "write")));
+        URI origin = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        return new GitHubAuthorNotices(tokens, CLOCK, "fixture-app[bot]", origin);
+    }
+
+    private Job noticeJob(State state) {
+        return new Job(1, new PullRequestId(SCOPE, 7), "a".repeat(40), state, 12, 1);
+    }
+
+    private String pull(String head, String author) {
+        return """
+                {"number":7, "state":"open", "draft":false, "head":{"sha":"%s"}, "base":{"repo":{"id":1001}},
+                "user":{"id":123,"login":"%s","type":"User"}, "body":"PRIVATE_SOURCE"}
+                """.formatted(head, author);
+    }
+
+    private void respond(com.sun.net.httpserver.HttpExchange exchange, int statusCode, String content) throws java.io.IOException {
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        try (var body = exchange.getResponseBody()) {
+            body.write(bytes);
         }
     }
 

@@ -142,6 +142,96 @@ class ReviewStateIntegrationTest {
         return lifecycle.reconcileCi(state.version(), ci(state, Ci.PASSED));
     }
 
+    private JdbcAuthorNoticeStore notices() {
+        return new JdbcAuthorNoticeStore(jdbc, new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource)));
+    }
+
+    @Test
+    void readyNoticeUsesCurrentCiAndCorrelatedProviderEvidenceAndSkipsEarlierReadiness() {
+        var state = reviewing(FIRST);
+        var baseline = outcome(state, ReviewOutcome.Stage.BASELINE, ReviewOutcome.Conclusion.NO_FINDINGS);
+        state = outcomes().recordClean(baseline, UUID.randomUUID(), CLEAR);
+        var deep = outcome(state, ReviewOutcome.Stage.DEEP, ReviewOutcome.Conclusion.NO_FINDINGS);
+        state = outcomes().recordClean(deep, UUID.randomUUID(), CLEAR);
+        state = step(passCi(state), MARK_READY_FOR_HUMAN);
+        var previous = notices().claim().orElseThrow();
+
+        state = lifecycle.reconcileCi(state.version(), ci(state, Ci.PENDING));
+        assertTrue(notices().reserve(previous, 52, () -> {}).isEmpty());
+        state = step(passCi(state), MARK_READY_FOR_HUMAN);
+        var current = notices().claim().orElseThrow();
+        assertEquals(state.version(), current.version());
+        var evidence = notices().reserve(current, 52, () -> {}).orElseThrow();
+        assertEquals(new AuthorNotice.Evidence(Ci.PASSED, AuthorNotice.ProviderEvidence.CODEX,
+                AuthorNotice.ProviderEvidence.CODEX), evidence);
+        notices().sent(current, 17);
+        assertEquals(17L, jdbc.queryForObject("SELECT comment_id FROM author_notifications WHERE status = 'SENT'", Long.class));
+
+        step(step(state, PAUSE), RESUME);
+        assertTrue(notices().reserve(notices().claim().orElseThrow(), 52, () -> {}).isEmpty());
+    }
+
+    @Test
+    void notificationPermitSurvivesLostReceiptAndAnotherStateOnSameHeadCanNotify() {
+        var reviewed = step(step(reviewing(FIRST), BASELINE_CLEAN), DEEP_CLEAN);
+        var state = step(passCi(reviewed), MARK_READY_FOR_HUMAN);
+        var notices = notices();
+        var authorization = new RepositoryAuthorization(Set.of(FIRST.scope()), new JdbcInstallationAuthorization(jdbc));
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        var worker = new NotifyAuthor(notices, (job, reserve) -> {
+            if (reserve.apply(52).isEmpty()) return OptionalLong.empty();
+            attempts.incrementAndGet();
+            throw new IllegalStateException("Synthetic lost response");
+        }, authorization);
+        assertThrows(IllegalStateException.class, worker::processNext);
+        assertEquals(1, attempts.get());
+        state = step(step(state, PAUSE), RESUME);
+        jdbc.update("UPDATE author_notifications SET available_at = now() - interval '1 minute'");
+        worker.processNext();
+        assertEquals(1, attempts.get());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE status = 'ATTEMPTED'", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE status = 'SKIPPED'", Integer.class));
+
+        step(state, BLOCKING_FINDINGS);
+        var job = notices.claim().orElseThrow();
+        assertEquals(ACTION_REQUIRED, job.state());
+        assertEquals(state.headSha(), job.headSha());
+        assertTrue(notices.reserve(job, 52, () -> {}).isPresent());
+    }
+
+    @Test
+    void notificationClaimIsFencedAndPendingNoticeCannotFollowAHeadChange() {
+        var state = step(reviewing(FIRST), BLOCKING_FINDINGS);
+        var notices = notices();
+        var firstClaim = notices.claim().orElseThrow();
+        assertTrue(notices.claim().isEmpty());
+        jdbc.update("UPDATE author_notifications SET available_at = now() - interval '1 minute'");
+        var secondClaim = notices.claim().orElseThrow();
+        assertEquals(firstClaim.id(), secondClaim.id());
+        assertTrue(notices.reserve(firstClaim, 52, () -> {}).isEmpty());
+        notices.skip(firstClaim);
+        step(state, UPDATE_HEAD);
+        assertTrue(notices.reserve(secondClaim, 52, () -> {}).isEmpty());
+    }
+
+    @Test
+    void competingInstallationsCanReserveOnlyOneNoticeForTheSameGitHubRecipient() throws Exception {
+        var movedScope = new RepositoryScope(202, FIRST.scope().repositoryId());
+        jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (202, 1001, true)");
+        lifecycle = new ReviewLifecycle(new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource)),
+                new RepositoryAuthorization(Set.of(FIRST.scope(), movedScope), new JdbcInstallationAuthorization(jdbc)));
+        step(reviewing(FIRST), BLOCKING_FINDINGS);
+        step(reviewing(new PullRequestId(movedScope, FIRST.number())), BLOCKING_FINDINGS);
+        var left = notices().claim().orElseThrow();
+        var right = notices().claim().orElseThrow();
+        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = workers.submit(() -> notices().reserve(left, 52, () -> {}));
+            var second = workers.submit(() -> notices().reserve(right, 52, () -> {}));
+            assertNotEquals(first.get(5, TimeUnit.SECONDS).isPresent(), second.get(5, TimeUnit.SECONDS).isPresent());
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM author_notifications WHERE recipient_id = 52", Integer.class));
+    }
+
     @Test
     void ciEventsReconcileCurrentDependenciesAndRevokeReadinessOnRerunOrHeadChanges() {
         var state = step(step(reviewing(FIRST), BASELINE_CLEAN), DEEP_CLEAN);
@@ -1114,7 +1204,7 @@ class ReviewStateIntegrationTest {
                            (101, 1001, 8, ?, 'PAUSED', 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(2, latest.migrate().migrationsExecuted);
+            assertEquals(3, latest.migrate().migrationsExecuted);
             assertEquals("DEEP_REVIEW", jdbc.queryForObject(
                     "SELECT state FROM ci_upgrade_fixture.pr_review_states WHERE pr_number = 7", String.class));
             assertEquals(Map.of("state", "PAUSED", "resume_state", "DEEP_REVIEW", "ci_status", "UNKNOWN", "deep_clean_sha", HEAD),
@@ -1174,7 +1264,7 @@ class ReviewStateIntegrationTest {
                     """, requestId, snapshot.id(), "2".repeat(64));
 
             var latest = Flyway.configure().dataSource(scoped).schemas(schema).load();
-            assertEquals(1, latest.migrate().migrationsExecuted);
+            assertEquals(2, latest.migrate().migrationsExecuted);
             var fixed = stateStore.find(FIRST, () -> {}).orElseThrow();
             assertEquals(Ci.UNKNOWN, fixed.ci());
             assertEquals(NEXT, fixed.headSha());

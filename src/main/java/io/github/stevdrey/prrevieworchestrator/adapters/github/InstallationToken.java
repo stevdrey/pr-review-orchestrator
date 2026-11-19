@@ -6,10 +6,12 @@ import java.time.Instant;
 public final class InstallationToken {
     private final String token;
     private final Instant expiresAt;
+    private final String repository;
 
-    InstallationToken(String token, Instant expiresAt) {
+    InstallationToken(String token, Instant expiresAt, String repository) {
         this.token = token;
         this.expiresAt = expiresAt;
+        this.repository = repository;
     }
 
     public String authorizationHeader() {
@@ -18,6 +20,10 @@ public final class InstallationToken {
 
     public Instant expiresAt() {
         return expiresAt;
+    }
+
+    String repository() {
+        return repository;
     }
 
     @Override
