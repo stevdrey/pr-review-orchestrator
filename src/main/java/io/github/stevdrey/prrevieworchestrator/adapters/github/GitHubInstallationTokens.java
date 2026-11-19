@@ -183,10 +183,15 @@ public final class GitHubInstallationTokens {
         return new IllegalStateException("GitHub installation credential unavailable");
     }
 
-    private static final class BoundedBody implements HttpResponse.BodySubscriber<String> {
+    static final class BoundedBody implements HttpResponse.BodySubscriber<String> {
         private final CompletableFuture<String> result = new CompletableFuture<>();
         private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        private final int maxBytes;
         private Flow.Subscription subscription;
+
+        BoundedBody() { this(MAX_BODY_BYTES); }
+
+        BoundedBody(int maxBytes) { this.maxBytes = maxBytes; }
 
         @Override
         public CompletionStage<String> getBody() {
@@ -205,7 +210,7 @@ public final class GitHubInstallationTokens {
                 return;
             }
             for (ByteBuffer item : items) {
-                if (buffer.size() + item.remaining() > MAX_BODY_BYTES) {
+                if (item.remaining() > maxBytes - buffer.size()) {
                     subscription.cancel();
                     result.completeExceptionally(new IllegalStateException());
                     return;

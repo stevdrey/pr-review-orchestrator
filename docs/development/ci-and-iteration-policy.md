@@ -12,6 +12,53 @@ Every required dependency must be present exactly once and pass at the exact hea
 
 CI is journaled and reset to `UNKNOWN` at a head update or same-head confirmation. A new non-passing result drops `READY_FOR_HUMAN` back to `DEEP_REVIEW`, including the resume target of a paused state. Both clean reviews remain valid at that SHA. Readiness also requires the existing eligibility and finding checks. A re-review requires passing CI before reserving a request and before the external effect. This applies after remediation starts, on a new visit to a previously observed SHA or after an earlier request for the same stage.
 
+### Durable sandbox worker
+
+Use an isolated PostgreSQL database and a GitHub App webhook installation limited to the approved sandbox repository. The App needs `Checks: read` and `Actions: read` for the two GitHub event subscriptions. The read credential may come from the webhook App or from a separately approved App installation for the same repository. Provision both memberships in the sandbox database when using two installations. Only the webhook installation belongs in the receiver allowlist.
+
+```yaml
+orchestrator:
+  codex:
+    enabled: false
+  notifications:
+    enabled: false
+  dispatch:
+    enabled: true
+  sandbox-ci:
+    enabled: true
+    installation-id: 101
+    read-installation-id: 202
+    repository-id: 1001
+    repository: sandbox/review-fixture
+    pr-number: 7
+    head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    workflow-ids: [21, 22]
+  github:
+    client-id: Iv1.example
+    private-key-file: /run/secrets/sandbox-read-app.pem
+    repositories:
+      101: [1001]
+    webhook:
+      enabled: true
+      secret-file: /run/secrets/sandbox-webhook
+```
+
+The mode requires both enablement flags and an allowlist with exactly one installation/repository pair. It refuses startup with Codex or author notification delivery enabled and never claims external commands. The configured SHA and workflow IDs are an operator-supplied sandbox policy. Testing a different head requires a fresh sandbox configuration and database. This mode accepts only same-repository PRs.
+
+After a signed `check_run` or `workflow_run` is persisted, the worker matches the event to the configured repository and head. It uses the event as a wake-up signal. It reads the PR head before and after two bounded workflow observations using repository-scoped read tokens. GitHub workflow ID and run number establish the current run for each dependency. The current attempt, PR association and SHA must match. Missing, ambiguous or changing evidence produces `UNKNOWN`. Read failures use bounded inbox retries. Replay keeps the original inbox identity, and distinct same-head events can reconcile a rerun from `PENDING` to `PASSED` or `FAILED`.
+
+The CI transition and inbox completion commit in one fenced PostgreSQL transaction. The worker rechecks both installation scopes and the local aggregate version at commit. If a valid PR has no local state, the worker initializes it in that same transaction. The worker ignores stale heads and unrelated events. A deferred commit failure rolls back the CI transition and the inbox completion together so the retry fetches fresh evidence.
+
+```sh
+./gradlew --offline test --tests '*.FeedbackLoopSandboxIntegrationTest' --tests '*.DurableDispatchConfigurationTest' --tests '*.DurableDispatchIntegrationTest' --tests '*.GitHubCredentialsTest' bootJar
+./gradlew --offline clean build
+git diff --check
+```
+
+On 2026-11-19, the focused suites and the clean build passed, with 314 tests in the clean build and no failures or skips. In a separate sandbox startup, the scheduled worker processed locally signed fixtures for both event types using current GitHub workflow data and the operator-selected policy. Both observations matched the configured SHA, and PostgreSQL recorded zero review requests, outbox commands and author notices.
+
+In the live sandbox on the same date, one re-run of an approved workflow generated four signed GitHub deliveries for the configured head: `check_run.created`, `workflow_run.in_progress`, `check_run.completed` and `workflow_run.completed`. The scheduled worker processed each on its first inbox attempt. CI moved from `PENDING` to `PASSED` using fresh workflow reads. Both completion deliveries received `202 ACCEPTED`. GitHub redelivery returned `200 DUPLICATE` with the original correlation IDs and left the four inbox rows and CI transitions intact. Both required workflows succeeded on the exact SHA. The sandbox recorded zero review requests, outbox commands and author notices. The operator disabled the webhook after the run and stopped the tunnel and disposable database.
+
 ## Stop conditions
 
 - **Iteration limit.** Each automatic request reserves one permanent slot per installation, repository and PR. The default ceiling is six and the Codex configuration accepts a lower ceiling. Slots span SHAs, epochs, providers, stages, crashes, unsent requests and uncertain outcomes. A retry or reconciled duplicate reuses the prior row. A new request at the limit commits `PAUSED` with `ITERATION_LIMIT` before returning `LIMIT_REACHED` when the lifecycle tracks the PR and it is not already paused. An existing human or automatic hold keeps its reason and version. A PR without lifecycle state receives `LIMIT_REACHED` and no aggregate is created. A human resume leaves the count intact.
@@ -31,7 +78,7 @@ V14 preserves request IDs, keys, states and receipts. It assigns iteration slots
 
 Keep the schema and audit evidence during rollback. Stop review dispatch, evidence writes and all lifecycle writers while an older binary is connected to the retained schema. On roll-forward, reconcile the current PR head and required CI before reactivating automation or readiness writes.
 
-The internal reconciliation entry points require an approved caller to read current GitHub state, evaluate the configured dependencies and revalidate them at dispatch. The existing default-disabled provider and dispatcher settings still apply. Local fixtures use synthetic event, CI and provider observations with disposable PostgreSQL. Live CI fetching, notification delivery and the end-to-end GitHub/Codex workflow remain separate integrations.
+General reconciliation still requires an approved caller to read current GitHub state, evaluate the configured dependencies and revalidate them at dispatch. The existing default-disabled provider and dispatcher settings still apply. The durable sandbox worker adds a scoped GitHub CI reader. Local fixtures exercise replay, current attempts and deferred commit rollback with disposable PostgreSQL. Notification delivery and the end-to-end GitHub/Codex workflow require their own acceptance runs.
 
 Local verification used Java 27 and disposable PostgreSQL 17 via Testcontainers. `./gradlew --offline clean build` passed all 262 tests with zero failures or skips. The suite covers stale SHA and rerun events, ambiguous dependencies, competing requests for the final slot, no-progress replay, and the V13-to-V14 upgrade. `git diff --check` passed.
 

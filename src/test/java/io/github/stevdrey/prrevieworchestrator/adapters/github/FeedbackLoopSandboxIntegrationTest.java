@@ -9,6 +9,7 @@ import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcAuthorNoticeStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRequestStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCiInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
@@ -103,6 +104,7 @@ class FeedbackLoopSandboxIntegrationTest {
     private SandboxRepository repository;
     private SandboxGitHub github;
     private NotifyAuthor notices;
+    private GitHubInstallationTokens tokens;
     private HttpClient webhookClient;
     private final Clock clock = Clock.systemUTC();
     private int nextCheckRunId = 1;
@@ -125,7 +127,7 @@ class FeedbackLoopSandboxIntegrationTest {
         Files.writeString(key, "-----BEGIN PRIVATE KEY-----\n"
                 + Base64.getMimeEncoder().encodeToString(keys.generateKeyPair().getPrivate().getEncoded())
                 + "\n-----END PRIVATE KEY-----\n");
-        var tokens = new GitHubInstallationTokens(authorization, new GitHubAppJwt("Iv1.sandbox", key, clock), clock, github.uri());
+        tokens = new GitHubInstallationTokens(authorization, new GitHubAppJwt("Iv1.sandbox", key, clock), clock, github.uri());
         notices = new NotifyAuthor(new JdbcAuthorNoticeStore(jdbc, states, transactions),
                 new GitHubAuthorNotices(tokens, clock, SandboxGitHub.BOT, github.uri()), authorization);
     }
@@ -142,6 +144,98 @@ class FeedbackLoopSandboxIntegrationTest {
     @AfterAll
     static void deleteSigningFixture() throws IOException {
         Files.deleteIfExists(SECRET_FILE);
+    }
+
+    @Test
+    void durableWorkerReconcilesSignedCheckAndWorkflowEventsAcrossAttemptsAtOneSha() throws Exception {
+        var worker = ciWorker();
+        github.workflowRuns(List.of(workflow(21, 1, 1, "completed", "success"),
+                workflow(22, 1, 1, "completed", "success"), workflow(22, 2, 1, "in_progress", "")));
+        var check = UUID.randomUUID();
+        var checkPayload = ciWebhook("check_run", repository.openedSha, 10);
+        assertEquals(202, signed("check_run", check, checkPayload).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PENDING, current().ci());
+
+        github.workflowRuns(List.of(workflow(21, 1, 1, "completed", "success"),
+                workflow(22, 2, 2, "completed", "success")));
+        var workflow = UUID.randomUUID();
+        var workflowPayload = ciWebhook("workflow_run", repository.openedSha, 11);
+        assertEquals(202, signed("workflow_run", workflow, workflowPayload).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(200, signed("check_run", check, checkPayload).statusCode());
+        assertEquals(200, signed("workflow_run", workflow, workflowPayload).statusCode());
+        assertFalse(worker.processEvent());
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", repository.fixedSha, 12)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(4, github.actionReads());
+        assertEquals(2, count("pr_review_transitions"));
+        assertEquals(3, jdbc.queryForObject("SELECT count(*) FROM inbox_events WHERE status='PROCESSED'", Integer.class));
+        assertEquals(Ci.PASSED, current().ci());
+        assertFalse(worker.processCommand());
+        assertEquals(0, count("outbox_commands"));
+        assertEquals(0, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void workerRetriesFromFreshEvidenceWhenInboxCommitRollsBackCi() throws Exception {
+        var worker = ciWorker();
+        github.workflowRuns(List.of(workflow(21, 1, 1, "completed", "success"),
+                workflow(22, 1, 1, "completed", "success")));
+        assertEquals(202, signed("workflow_run", UUID.randomUUID(),
+                ciWebhook("workflow_run", repository.openedSha, 13)).statusCode());
+        jdbc.execute("""
+                CREATE FUNCTION reject_sandbox_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN IF NEW.outcome = 'PROCESSED' THEN RAISE EXCEPTION 'sandbox commit failure'; END IF;
+                RETURN NEW; END; $$
+                """);
+        jdbc.execute("""
+                CREATE CONSTRAINT TRIGGER reject_sandbox_commit AFTER INSERT ON queue_transitions
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_sandbox_commit()
+                """);
+        try {
+            assertTrue(worker.processEvent());
+            assertEquals(0, count("pr_review_transitions"));
+            assertTrue(lifecycle.find(PR).isEmpty());
+            assertEquals("PENDING", jdbc.queryForObject("SELECT status FROM inbox_events", String.class));
+        } finally {
+            jdbc.execute("DROP TRIGGER reject_sandbox_commit ON queue_transitions");
+            jdbc.execute("DROP FUNCTION reject_sandbox_commit()");
+        }
+        github.workflowRuns(List.of(workflow(21, 1, 2, "completed", "failure"),
+                workflow(22, 1, 1, "completed", "success")));
+        jdbc.execute("UPDATE inbox_events SET available_at=clock_timestamp()");
+        assertTrue(ciWorker().processEvent());
+        assertEquals(Ci.FAILED, current().ci());
+        assertEquals(1, count("pr_review_transitions"));
+        assertEquals(2, jdbc.queryForObject("SELECT attempts FROM inbox_events WHERE status='PROCESSED'", Integer.class));
+        assertEquals(0, count("outbox_commands"));
+    }
+
+    private DurableDispatcher ciWorker() {
+        var policy = new SandboxCiReconciler.Policy(PR, PR.scope(), SandboxGitHub.REPOSITORY,
+                repository.openedSha, Set.of(21L, 22L));
+        var reader = new GitHubSandboxCiReader(tokens, github.uri());
+        var reconciler = new SandboxCiReconciler(policy, queue, authorization, lifecycle, reader,
+                new JdbcSandboxCiInbox(jdbc, queue, states));
+        return new DurableDispatcher(queue, authorization, reconciler);
+    }
+
+    private Map<String, Object> workflow(long workflow, long sequence, long attempt, String status, String conclusion) {
+        var repo = Map.of("id", 1001);
+        return Map.of("workflow_id", workflow, "id", workflow * 100 + sequence, "run_number", sequence,
+                "run_attempt", attempt, "head_sha", repository.openedSha, "event", "pull_request", "repository", repo,
+                "status", status, "conclusion", conclusion,
+                "pull_requests", List.of(Map.of("number", 7, "base", Map.of("repo", repo))));
+    }
+
+    private String ciWebhook(String type, String head, int id) {
+        return """
+                {"action":"completed","installation":{"id":101},"repository":{"id":1001},
+                 "%s":{"id":%d,"head_sha":"%s","conclusion":"success"}}
+                """.formatted(type, id, head);
     }
 
     @Test

@@ -9,7 +9,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import tools.jackson.databind.json.JsonMapper;
 
 /** Loopback GitHub transport for the feedback-loop tests. Only allowlisted routes are accepted. */
@@ -32,6 +34,8 @@ final class SandboxGitHub implements AutoCloseable {
     private final Instant tokenExpiry;
     private volatile String head;
     private volatile boolean rejectCommentReceipt;
+    private volatile List<Map<String, Object>> workflowRuns = List.of();
+    private final AtomicInteger actionReads = new AtomicInteger();
 
     SandboxGitHub(String head, Instant tokenExpiry) throws IOException {
         this.head = head;
@@ -65,6 +69,12 @@ final class SandboxGitHub implements AutoCloseable {
         rejectCommentReceipt = true;
     }
 
+    void workflowRuns(List<Map<String, Object>> runs) {
+        workflowRuns = List.copyOf(runs);
+    }
+
+    int actionReads() { return actionReads.get(); }
+
     private void respond(HttpExchange exchange) throws IOException {
         try (exchange) {
             String path = exchange.getRequestURI().getPath();
@@ -76,8 +86,16 @@ final class SandboxGitHub implements AutoCloseable {
                 send(exchange, 200, Map.of("id", 42, "type", "User"));
             } else if (route.equals("GET " + PR_PATH) && (user || app)) {
                 send(exchange, 200, Map.of("number", 7, "state", "open", "draft", false, "locked", false,
-                        "head", Map.of("sha", head), "base", Map.of("repo", Map.of("id", 1001)),
+                        "head", Map.of("sha", head, "repo", Map.of("id", 1001)), "base", Map.of("repo", Map.of("id", 1001)),
                         "user", Map.of("id", 52, "type", "User", "login", "fixture-author"), "body", PRIVATE_TEXT));
+            } else if (route.equals("GET /repos/" + REPOSITORY + "/actions/runs") && app) {
+                if (!("head_sha=" + head + "&event=pull_request&per_page=100").equals(exchange.getRequestURI().getQuery())) {
+                    reject(exchange, route);
+                    return;
+                }
+                actionReads.incrementAndGet();
+                var runs = workflowRuns;
+                send(exchange, 200, Map.of("total_count", runs.size(), "workflow_runs", runs));
             } else if (route.equals("POST " + COMMENTS) && (user || app)) {
                 var payload = json.readTree(exchange.getRequestBody().readAllBytes());
                 if (!payload.isObject() || payload.size() != 1 || !payload.path("body").isString()) {
@@ -96,14 +114,17 @@ final class SandboxGitHub implements AutoCloseable {
             } else if (route.equals("POST /app/installations/101/access_tokens") && token != null
                     && token.startsWith("Bearer eyJ")) {
                 var scope = json.readTree(exchange.getRequestBody().readAllBytes());
+                var permissions = scope.path("permissions");
                 if (!scope.path("repository_ids").equals(json.valueToTree(List.of(1001)))
-                        || !scope.path("permissions").equals(json.valueToTree(NOTICE_PERMISSIONS))) {
+                        || !Set.of(NOTICE_PERMISSIONS, GitHubReadOperation.PULL_REQUESTS.permissions(),
+                                GitHubReadOperation.WORKFLOWS.permissions()).stream()
+                                .anyMatch(expected -> permissions.equals(json.valueToTree(expected)))) {
                     reject(exchange, route);
                     return;
                 }
                 send(exchange, 201, Map.of("token", APP_TOKEN, "expires_at", tokenExpiry.toString(),
                         "repositories", List.of(Map.of("id", 1001, "full_name", REPOSITORY)),
-                        "permissions", NOTICE_PERMISSIONS));
+                        "permissions", permissions));
             } else if (route.equals("DELETE /installation/token") && app) {
                 exchange.sendResponseHeaders(204, -1);
             } else {
