@@ -59,21 +59,22 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     @Override
     public boolean ingest(Snapshot snapshot, Runnable authorize) {
-        String fingerprint = fingerprint(snapshot, true);
         try {
             return Boolean.TRUE.equals(transactions.execute(status -> {
                 try {
                     PostgresDeadlines.apply(jdbc, DEADLINE);
                     authorize.run();
-                    return persist(snapshot, fingerprint);
+                    PostgresLocks.lockPr(jdbc, snapshot.pr());
+                    return ingestLocked(snapshot);
                 } catch (RuntimeException failure) { throw sanitized(failure); }
             }));
         } catch (RuntimeException failure) { throw sanitized(failure); }
     }
 
-    private boolean persist(Snapshot snapshot, String fingerprint) {
+    /** Joins the caller's transaction, which must already hold the PR lock. */
+    boolean ingestLocked(Snapshot snapshot) {
+        String fingerprint = fingerprint(snapshot, true);
         var pr = snapshot.pr();
-        PostgresLocks.lockPr(jdbc, pr);
         // Cycle locking serializes same-round updates and makes the current projection deterministic.
         var cycles = jdbc.query("""
                 SELECT id FROM review_cycles WHERE id = ? AND installation_id = ? AND repository_id = ?

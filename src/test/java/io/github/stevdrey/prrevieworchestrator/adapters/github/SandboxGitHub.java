@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /** Loopback GitHub transport for the feedback-loop tests. Only allowlisted routes are accepted. */
@@ -26,6 +27,7 @@ final class SandboxGitHub implements AutoCloseable {
     private static final Map<String, String> NOTICE_PERMISSIONS = Map.of("metadata", "read", "pull_requests", "write");
 
     record Comment(long id, String head, String body) {}
+    private record ReviewReads(JsonNode graph, JsonNode reviews, JsonNode inline) {}
 
     private final JsonMapper json = JsonMapper.builder().build();
     private final HttpServer server;
@@ -36,6 +38,8 @@ final class SandboxGitHub implements AutoCloseable {
     private volatile boolean rejectCommentReceipt;
     private volatile List<Map<String, Object>> workflowRuns = List.of();
     private final AtomicInteger actionReads = new AtomicInteger();
+    private final AtomicInteger reviewReads = new AtomicInteger();
+    private volatile ReviewReads evidence;
 
     SandboxGitHub(String head, Instant tokenExpiry) throws IOException {
         this.head = head;
@@ -75,6 +79,12 @@ final class SandboxGitHub implements AutoCloseable {
 
     int actionReads() { return actionReads.get(); }
 
+    void reviewEvidence(String graph, String reviews, String inline) {
+        evidence = new ReviewReads(json.readTree(graph), json.readTree(reviews), json.readTree(inline));
+    }
+
+    int reviewReads() { return reviewReads.get(); }
+
     private void respond(HttpExchange exchange) throws IOException {
         try (exchange) {
             String path = exchange.getRequestURI().getPath();
@@ -82,6 +92,7 @@ final class SandboxGitHub implements AutoCloseable {
             boolean user = ("Bearer " + USER_TOKEN).equals(token);
             boolean app = ("Bearer " + APP_TOKEN).equals(token);
             String route = exchange.getRequestMethod() + " " + path;
+            var review = evidence;
             if (route.equals("GET /user") && user) {
                 send(exchange, 200, Map.of("id", 42, "type", "User"));
             } else if (route.equals("GET " + PR_PATH) && (user || app)) {
@@ -96,6 +107,19 @@ final class SandboxGitHub implements AutoCloseable {
                 actionReads.incrementAndGet();
                 var runs = workflowRuns;
                 send(exchange, 200, Map.of("total_count", runs.size(), "workflow_runs", runs));
+            } else if (route.equals("POST /graphql") && app && review != null) {
+                var query = json.readTree(exchange.getRequestBody().readAllBytes());
+                if (!query.path("variables").equals(json.valueToTree(Map.of(
+                        "owner", "sandbox", "repo", "review-fixture", "number", 7)))) {
+                    reject(exchange, route);
+                    return;
+                }
+                reviewReads.incrementAndGet();
+                send(exchange, 200, review.graph());
+            } else if (route.equals("GET " + PR_PATH + "/reviews") && app && review != null) {
+                send(exchange, 200, review.reviews());
+            } else if (route.equals("GET " + PR_PATH + "/comments") && app && review != null) {
+                send(exchange, 200, review.inline());
             } else if (route.equals("POST " + COMMENTS) && (user || app)) {
                 var payload = json.readTree(exchange.getRequestBody().readAllBytes());
                 if (!payload.isObject() || payload.size() != 1 || !payload.path("body").isString()) {
@@ -138,7 +162,7 @@ final class SandboxGitHub implements AutoCloseable {
         send(exchange, 404, Map.of());
     }
 
-    private void send(HttpExchange exchange, int status, Map<String, ?> response) throws IOException {
+    private void send(HttpExchange exchange, int status, Object response) throws IOException {
         byte[] bytes = json.writeValueAsString(response).getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(status, bytes.length);

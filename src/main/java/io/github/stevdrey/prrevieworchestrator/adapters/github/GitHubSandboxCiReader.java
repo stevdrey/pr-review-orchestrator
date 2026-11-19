@@ -8,11 +8,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.ErrorCode;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Failure;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.time.Clock;
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -21,43 +17,36 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.json.JsonMapper;
 
 /** Scoped GitHub reads for the sandbox worker. Only fully observed policy dependencies can pass. */
 public final class GitHubSandboxCiReader implements SandboxCiReconciler.Reader {
-    private static final URI API = URI.create("https://api.github.com/");
-    private static final Duration API_DEADLINE = Duration.ofSeconds(3);
-    private static final Duration OBSERVATION_DEADLINE = Duration.ofSeconds(20);
     private static final int PAGE_LIMIT = 100;
-    private final JsonMapper json = JsonMapper.builder().build();
     private final GitHubInstallationTokens tokens;
-    private final URI api;
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(API_DEADLINE)
-            .followRedirects(HttpClient.Redirect.NEVER).build();
+    private final GitHubSandboxReadClient github;
 
     public GitHubSandboxCiReader(RepositoryAuthorization authorization, GitHubAppJwt jwt, Clock clock) {
-        this(new GitHubInstallationTokens(authorization, jwt, clock, API, API_DEADLINE), API);
+        this(new GitHubInstallationTokens(authorization, jwt, clock, GitHubSandboxReadClient.API,
+                GitHubSandboxReadClient.API_DEADLINE), GitHubSandboxReadClient.API);
     }
 
     GitHubSandboxCiReader(GitHubInstallationTokens tokens, URI api) {
         this.tokens = tokens;
-        this.api = api;
+        this.github = new GitHubSandboxReadClient(api, tokens);
     }
 
     @Override
     public Optional<CiEvidence> read(Policy policy, UUID observationId) {
-        var deadline = System.nanoTime() + OBSERVATION_DEADLINE.toNanos();
+        var deadline = github.observationDeadline();
         var pulls = issue(policy, GitHubReadOperation.PULL_REQUESTS);
         InstallationToken actions = null;
         try {
-            if (!currentPr(policy, pulls, deadline)) return Optional.empty();
+            if (!github.currentPr(policy, pulls, deadline)) return Optional.empty();
             actions = issue(policy, GitHubReadOperation.WORKFLOWS);
             var first = readAttempts(policy, actions, deadline);
             var second = readAttempts(policy, actions, deadline);
-            if (!currentPr(policy, pulls, deadline)) return Optional.empty();
+            if (!github.currentPr(policy, pulls, deadline)) return Optional.empty();
 
             Set<CiEvidence.Dependency> required = policy.workflowIds().stream()
                     .map(CiEvidence.Workflow::new).collect(Collectors.toUnmodifiableSet());
@@ -81,21 +70,10 @@ public final class GitHubSandboxCiReader implements SandboxCiReconciler.Reader {
         }
     }
 
-    private boolean currentPr(Policy policy, InstallationToken token, long deadline) {
-        var pr = get("repos/" + policy.repository() + "/pulls/" + policy.pr().number(), token, deadline);
-        var repositoryId = policy.pr().scope().repositoryId();
-        return pr.path("number").asInt() == policy.pr().number()
-                && pr.path("base").path("repo").path("id").asLong() == repositoryId
-                && pr.path("head").path("repo").path("id").asLong() == repositoryId
-                && policy.head().equals(pr.path("head").path("sha").asString())
-                && "open".equals(pr.path("state").asString())
-                && pr.path("draft").isBoolean() && !pr.path("draft").asBoolean();
-    }
-
     private Optional<Map<Long, Attempt>> readAttempts(Policy policy, InstallationToken token, long deadline) {
         String path = "repos/" + policy.repository() + "/actions/runs?head_sha=" + policy.head()
                 + "&event=pull_request&per_page=" + PAGE_LIMIT;
-        var result = get(path, token, deadline);
+        var result = github.get(policy, path, token, deadline);
         var runs = result.path("workflow_runs");
         if (!runs.isArray() || !result.path("total_count").isIntegralNumber()
                 || result.path("total_count").asLong() != runs.size() || runs.size() >= PAGE_LIMIT) {
@@ -149,32 +127,6 @@ public final class GitHubSandboxCiReader implements SandboxCiReconciler.Reader {
             case "queued", "in_progress", "requested", "pending", "waiting" -> Ci.PENDING;
             default -> Ci.UNKNOWN;
         };
-    }
-
-    private JsonNode get(String path, InstallationToken token, long deadline) {
-        long remaining = Math.min(deadline - System.nanoTime(), API_DEADLINE.toNanos());
-        if (remaining <= 0) throw unavailable();
-
-        var request = HttpRequest.newBuilder(api.resolve(path)).timeout(Duration.ofNanos(remaining))
-                .header("Authorization", token.authorizationHeader())
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2026-03-10")
-                .GET().build();
-        var exchange = http.sendAsync(request, info -> info.statusCode() == 200
-                ? new GitHubInstallationTokens.BoundedBody(2 * 1024 * 1024)
-                : HttpResponse.BodySubscribers.replacing(""));
-        try {
-            var response = exchange.get(remaining, TimeUnit.NANOSECONDS);
-            if (response.statusCode() != 200 || response.headers().firstValue("Link").isPresent()) throw unavailable();
-            return json.readTree(response.body());
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw unavailable();
-        } catch (Exception failure) {
-            throw unavailable();
-        } finally {
-            exchange.cancel(true);
-        }
     }
 
     private Failure unavailable() {

@@ -24,7 +24,11 @@ public final class DurableDispatcher {
 
     /** Run the reconciler on the inbox. This mode never claims external commands. */
     public DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization, SandboxCiReconciler reconciler) {
-        this(queue, authorization, reconciler::complete, Optional.empty());
+        this(queue, authorization, reconciler::complete);
+    }
+
+    public DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization, Predicate<Event> reconciler) {
+        this(queue, authorization, reconciler, Optional.empty());
     }
 
     private DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization,

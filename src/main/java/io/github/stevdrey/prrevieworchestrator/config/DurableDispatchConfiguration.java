@@ -2,15 +2,20 @@ package io.github.stevdrey.prrevieworchestrator.config;
 
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCiInbox;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.PostgresDeadlines;
 import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubAppConfiguration;
 import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubAppJwt;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNormalizer;
 import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxCiReader;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxReviewReader;
 import io.github.stevdrey.prrevieworchestrator.application.DurableDispatcher;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
 import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler;
+import io.github.stevdrey.prrevieworchestrator.application.SandboxReviewReconciler;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Limits;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
@@ -54,7 +59,7 @@ public class DurableDispatchConfiguration {
 
     @ConfigurationProperties("orchestrator.sandbox-ci")
     record SandboxSettings(long installationId, long readInstallationId, long repositoryId,
-            String repository, int prNumber, String head, Set<Long> workflowIds) {
+            String repository, int prNumber, String head, Set<Long> workflowIds, boolean reviewEvidenceEnabled) {
         SandboxCiReconciler.Policy policy() {
             var scope = new RepositoryScope(installationId, repositoryId);
             var readScope = new RepositoryScope(readInstallationId, repositoryId);
@@ -68,6 +73,7 @@ public class DurableDispatchConfiguration {
     static class SandboxConfiguration {
         @Bean
         DurableDispatcher sandboxCiDispatcher(JdbcWorkQueue queue, JdbcTemplate jdbc, JdbcReviewStateStore states,
+                JdbcReviewEvidenceStore evidenceStore, GitHubReviewNormalizer normalizer,
                 ReviewLifecycle lifecycle, RepositoryAuthorization ingressAuthorization, InstallationAuthorization installations,
                 RepositoryAuthorizationConfiguration.Allowlist allowlist, SandboxSettings settings,
                 GitHubAppConfiguration.Settings github, Environment env) {
@@ -81,15 +87,25 @@ public class DurableDispatchConfiguration {
             }
             var readAuthorization = new RepositoryAuthorization(Set.of(policy.readScope()), installations);
             var clock = Clock.systemUTC();
-            var reader = new GitHubSandboxCiReader(readAuthorization,
-                    new GitHubAppJwt(github.clientId(), github.privateKeyFile(), clock), clock);
+            var jwt = new GitHubAppJwt(github.clientId(), github.privateKeyFile(), clock);
+            var reader = new GitHubSandboxCiReader(readAuthorization, jwt, clock);
             var inbox = new JdbcSandboxCiInbox(jdbc, queue, states);
             var reconciler = new SandboxCiReconciler(policy, queue, ingressAuthorization, lifecycle, reader,
                     (event, expected, evidence, authorize) -> inbox.reconcile(event, expected, evidence, () -> {
                         authorize.run();
                         readAuthorization.requireAuthorized(policy.readScope());
                     }));
-            return new DurableDispatcher(queue, ingressAuthorization, reconciler);
+            if (!settings.reviewEvidenceEnabled()) return new DurableDispatcher(queue, ingressAuthorization, reconciler);
+
+            var reviewReader = new GitHubSandboxReviewReader(readAuthorization, jwt, clock, normalizer);
+            var reviewInbox = new JdbcSandboxReviewInbox(jdbc, queue, states, evidenceStore);
+            var reviews = new SandboxReviewReconciler(policy, queue, ingressAuthorization, reviewReader,
+                    (event, snapshot, authorize) -> reviewInbox.reconcile(event, snapshot, () -> {
+                        authorize.run();
+                        readAuthorization.requireAuthorized(policy.readScope());
+                    }));
+            return new DurableDispatcher(queue, ingressAuthorization,
+                    event -> reviews.handles(event) ? reviews.complete(event) : reconciler.complete(event));
         }
     }
 

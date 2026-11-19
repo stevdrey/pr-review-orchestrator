@@ -4,7 +4,7 @@
 
 Issue #15 implements the [internal persistent PR review state machine](development/review-state-machine.md): explicit guards, per-PR optimistic versions, transactional transition deduplication, pause/resume and clean-evidence invalidation on every head change. It does not enable live planning, provider reviews, budget accounting or notifications. Finding normalization is implemented separately by issue #16.
 
-Issue #16 implements [internal GitHub review/thread snapshot normalization and durable ingestion](development/review-evidence.md), including immutable provenance metadata, explicit severity and stable inline candidate identities across review rounds. Resolution remains a signal rather than fix evidence. Live API fetching and webhook-to-snapshot reconciliation remain planned.
+Issue #16 implements [GitHub review/thread snapshot normalization and durable ingestion](development/review-evidence.md), including immutable provenance metadata, explicit severity and stable inline candidate identities across review rounds. Issue #23 adds opt-in [durable reconciliation for one pinned sandbox PR](development/review-evidence.md#durable-sandbox-worker). Resolution is retained as a signal. Fix verification and production review orchestration remain pending.
 
 Issue #17 adds [internal general-feedback tracking and audited dispositions](development/general-feedback.md): complete issue-comment/review-body capture, stable local IDs, conservative human escalation, commit-bearing fix claims and deterministic blocking of clean-stage transitions. New pending feedback revokes existing readiness, including while paused. Live author authentication/action endpoints, verified-fix processing and semantic prose classification remain future integrations.
 

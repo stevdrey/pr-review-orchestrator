@@ -145,6 +145,11 @@ public final class GitHubInstallationTokens {
         }
     }
 
+    void requireUsable(RepositoryScope scope, InstallationToken token) {
+        authorization.requireAuthorized(scope);
+        if (!token.expiresAt().isAfter(clock.instant())) throw unavailable();
+    }
+
     /** Best-effort revocation of a single-use token after its action; all outcomes are ignored. */
     void revoke(InstallationToken token) {
         revoke(token.secret());
