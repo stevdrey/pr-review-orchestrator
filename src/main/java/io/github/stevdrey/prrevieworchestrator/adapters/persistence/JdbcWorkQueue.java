@@ -113,10 +113,17 @@ public final class JdbcWorkQueue implements WorkQueue {
     @Override
     public boolean completeEvent(Event event, List<Intent> intents, Runnable authorize) {
         if (intents.size() > MAX_INTENTS) throw new Failure(ErrorCode.INVALID_EVENT, false);
+        return completeLocalEvent(event, authorize, () -> {
+            for (Intent intent : intents) enqueue(event, intent);
+        });
+    }
+
+    /** The local write shares the inbox claim transaction. It must use the same transaction manager. */
+    boolean completeLocalEvent(Event event, Runnable authorize, Runnable localWrite) {
         return transaction(() -> {
             if (!lock(event.lease())) return false;
             authorize.run();
-            for (Intent intent : intents) enqueue(event, intent);
+            localWrite.run();
             finish(event.lease(), "PROCESSED", null);
             return true;
         });

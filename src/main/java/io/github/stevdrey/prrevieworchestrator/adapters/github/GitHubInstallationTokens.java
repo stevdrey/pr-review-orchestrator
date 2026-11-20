@@ -145,6 +145,11 @@ public final class GitHubInstallationTokens {
         }
     }
 
+    void requireUsable(RepositoryScope scope, InstallationToken token) {
+        authorization.requireAuthorized(scope);
+        if (!token.expiresAt().isAfter(clock.instant())) throw unavailable();
+    }
+
     /** Best-effort revocation of a single-use token after its action; all outcomes are ignored. */
     void revoke(InstallationToken token) {
         revoke(token.secret());
@@ -183,10 +188,15 @@ public final class GitHubInstallationTokens {
         return new IllegalStateException("GitHub installation credential unavailable");
     }
 
-    private static final class BoundedBody implements HttpResponse.BodySubscriber<String> {
+    static final class BoundedBody implements HttpResponse.BodySubscriber<String> {
         private final CompletableFuture<String> result = new CompletableFuture<>();
         private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        private final int maxBytes;
         private Flow.Subscription subscription;
+
+        BoundedBody() { this(MAX_BODY_BYTES); }
+
+        BoundedBody(int maxBytes) { this.maxBytes = maxBytes; }
 
         @Override
         public CompletionStage<String> getBody() {
@@ -205,7 +215,7 @@ public final class GitHubInstallationTokens {
                 return;
             }
             for (ByteBuffer item : items) {
-                if (buffer.size() + item.remaining() > MAX_BODY_BYTES) {
+                if (item.remaining() > maxBytes - buffer.size()) {
                     subscription.cancel();
                     result.completeExceptionally(new IllegalStateException());
                     return;

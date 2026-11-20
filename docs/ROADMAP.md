@@ -4,7 +4,7 @@
 
 Issue #15 implements the [internal persistent PR review state machine](development/review-state-machine.md): explicit guards, per-PR optimistic versions, transactional transition deduplication, pause/resume and clean-evidence invalidation on every head change. It does not enable live planning, provider reviews, budget accounting or notifications. Finding normalization is implemented separately by issue #16.
 
-Issue #16 implements [internal GitHub review/thread snapshot normalization and durable ingestion](development/review-evidence.md), including immutable provenance metadata, explicit severity and stable inline candidate identities across review rounds. Resolution remains a signal rather than fix evidence. Live API fetching and webhook-to-snapshot reconciliation remain planned.
+Issue #16 implements [GitHub review/thread snapshot normalization and durable ingestion](development/review-evidence.md), including immutable provenance metadata, explicit severity and stable inline candidate identities across review rounds. Issue #23 adds opt-in [durable reconciliation for one pinned sandbox PR](development/review-evidence.md#durable-sandbox-worker) and an [internal sandbox verifier](development/fix-correlation.md#verify-an-inline-fix-in-the-sandbox) for an independently checked correction. Resolution is retained as a signal. Production review orchestration remains pending.
 
 Issue #17 adds [internal general-feedback tracking and audited dispositions](development/general-feedback.md): complete issue-comment/review-body capture, stable local IDs, conservative human escalation, commit-bearing fix claims and deterministic blocking of clean-stage transitions. New pending feedback revokes existing readiness, including while paused. Live author authentication/action endpoints, verified-fix processing and semantic prose classification remain future integrations.
 
@@ -19,6 +19,8 @@ Issue #20 adds [internal fix correlation](development/fix-correlation.md). After
 Issue #21 adds [internal CI reconciliation and automatic review limits](development/ci-and-iteration-policy.md). Re-review and readiness depend on current-head CI, and exhausted iteration slots or repeated identical findings require human intervention.
 
 Issue #22 adds [opt-in GitHub author notifications](development/author-notifications.md) on ready-for-human and action-required transitions, with a durable send permit per state, recipient and head SHA.
+
+Issue #23 adds [local sandbox feedback-loop acceptance coverage and live prerequisites](architecture/testing-strategy.md#end-to-end-acceptance), including replay protection, current-SHA review and CI evidence, bounded stops and one author notice.
 
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
