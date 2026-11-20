@@ -37,6 +37,10 @@ final class SandboxRepository {
                 && git("show", head + ":" + SOURCE).equals(FIXED.strip());
     }
 
+    String blob(String commit) throws IOException, InterruptedException {
+        return git("rev-parse", commit + ":" + SOURCE);
+    }
+
     private String commit(String content, String message) throws IOException, InterruptedException {
         Files.writeString(workTree.resolve(SOURCE), content);
         git("add", "--", SOURCE);

@@ -14,6 +14,14 @@ Run the assessment after reconciliation and again at the reported retry time. Ge
 
 When lifecycle state exists, reserving or sending requires its tracked SHA to match the request. Both send phases check the tracked SHA and the epoch in the original request key under the PR lock. A remote return to the requested SHA leaves the previous permit blocked until the return is journaled and a current request is reserved.
 
+## Verify an inline fix in the sandbox
+
+`VerifySandboxInlineFix` is an internal use case for one PR and corrective head in a disposable database. A trusted caller verifies its actor identity, reads the current PR, and inspects the original and corrective commits in the authorized repository. The caller checks the correction against the exact inline finding and supplies the affected path and both Git blob IDs. The finding's evidence must retain the original review round and original source commit separately from the current head.
+
+The store rechecks the repository authorization, current head and aggregate version under the PR lock. It requires the retained root finding and exact snapshot, rejects superseding occurrences and requires distinct commits and file blobs. The finding records the corrective SHA, verifier, reason, compared blobs and database timestamp. Repeating the same proof for that finding, snapshot and head preserves the recorded timestamp. The caller must construct this use case explicitly. Thread events and provider text do not invoke it, and it performs no GitHub writes, review requests or notifications.
+
+On 2026-11-20, an authorized sandbox run checked the before and after blobs of a documentation correction on one private PR. The verifier recorded one inline finding as `VERIFIED_FIXED` at the corrective SHA. A stale version was rejected, exact replay preserved the original timestamp, and five unrelated inline findings stayed open. Codex and author notifications stayed disabled.
+
 ## Persistence and rollout
 
 V10 adds the `CONFIRM_HEAD` journal action and `fix_review_candidates`. A candidate records the baseline SHA, target SHA, head-change journal version and creation time. The per-PR transaction and unique installation/repository/PR/SHA/head-change-version key serialize concurrent assessments. The head-change version determines the base. `ELIGIBLE` creates the row and `ALREADY_ELIGIBLE` returns its ID when a fresh assessment of the same head change still qualifies. Both return the current request epoch. A return to an earlier candidate SHA after new blockers creates a new candidate for the new base. Reuse the candidate's ID as a work reference. Historical rows record previous eligibility. Before consuming one, reassess against fresh evidence and use the provider/stage/SHA/epoch request key and independently enforced dispatch gates.

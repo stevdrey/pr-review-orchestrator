@@ -37,7 +37,7 @@ PostgreSQL migrations, inbox/outbox transactions, token rotation, GitHub API rat
 | --- | --- |
 | Authenticated opening and replay | Invalid signatures and foreign repositories create no work. Same-ID and renamed replays create one inbox row. Repeating the request through a new adapter instance leaves one GitHub comment for the opening head. |
 | Findings, fix and re-review | A complete fixture snapshot creates an inline finding and a general review-body finding. Git confirms a changed committed tree. The general finding requires an audited disposition for the fix head. Failed or stale CI blocks re-review until required checks pass for that head. |
-| Clean evidence and notice | Retained findings block a clean completion until the fixture verifier records the inline fix and a human fixture dismisses the general finding at the fix head. Requests, cycles, snapshots and reviewed source SHAs are checked for all rounds. The final head has correlated baseline and deep evidence. Passing current-head CI enables one author notice despite transition replay, pause/resume and a bot-comment event. |
+| Clean evidence and notice | Retained findings block a clean completion until the sandbox verifier records the inline fix and a human fixture dismisses the general finding at the fix head. Requests, cycles, snapshots and reviewed source SHAs are checked for all rounds. The final head has correlated baseline and deep evidence. Passing current-head CI enables one author notice despite transition replay, pause/resume and a bot-comment event. |
 | Policy stops and uncertain receipt | A denied test budget creates zero reservations and zero comments. Repeating comparable findings pauses the PR and prevents another request. A separate scenario reaches the configured iteration limit while budget remains available. A comment accepted by the fixture with an ambiguous response keeps a durable send permit and is never posted again on replay. |
 | Allowed effects and data | The HTTP fixture accepts only PR preflight reads, scoped authentication, token revocation and PR conversation comments. An approval, merge or other unexpected route fails the test. The two Codex triggers contain the fixed command and the author notice excludes test credentials and raw review/PR text. |
 
@@ -51,7 +51,15 @@ git diff --check
 
 On 2026-11-19, the focused run passed all 4 scenarios. The clean build passed all 312 tests with zero failures, errors or skips. Whitespace checks passed.
 
-The sandbox supplies structured completions, complete GitHub read snapshots, CI outcomes, a per-key budget fixture and the deep-review receipt. A test-only database write records the inline verification after checking the contents of the affected file in both Git commits. The test ages the recorded head observation to exercise the persisted quiet period without a 30-second wait. GitHub's acceptance of the trigger, financial accounting, automatic reconciliation, and delivery of the author mention remain live acceptance work.
+The sandbox supplies structured completions, complete GitHub read snapshots, CI outcomes, a per-key budget fixture and the deep-review receipt. The test checks the two committed file revisions and records the proof through [the internal sandbox verifier](../development/fix-correlation.md#verify-an-inline-fix-in-the-sandbox). The test ages the recorded head observation to exercise the persisted quiet period without a 30-second wait. The authenticated provider completion, financial accounting and delivery of the author mention remain live acceptance work.
+
+### Functional validation with Codex disabled
+
+Run the signed-ingress-to-notice scenario against the loopback GitHub fixture and disposable PostgreSQL. It exercises opening and replay, baseline and deep review completion, findings, an audited general decision, the inline fix, current-head CI and a single author notice. The suite also exercises stale evidence, authorization failures, no progress, iteration exhaustion and an ambiguous receipt. The fixture accounts for its own review requests and notices. Real GitHub review events, review and CI reconciliation, one author acknowledgment and one inline fix have separate sandbox evidence in [draft PR #67](https://github.com/stevdrey/pr-review-orchestrator/pull/67).
+
+### Cost evidence deferred
+
+Per-review cost and billing attribution cannot currently be evaluated. The available activity data aggregates reviews and findings and does not provide an authoritative link from an individual review to charged units, the billed account or workspace, or the funding mechanism. This functional validation uses synthetic budget decisions. It tests the stop behavior while leaving provider cost and usage reconciliation unevaluated. Live dispatch remains disabled under the accepted authorization and spending gates. [Accounting investigation](../spikes/issue-42-review-accounting.md) · [Budget reservations and hard limits](https://github.com/stevdrey/pr-review-orchestrator/issues/28)
 
 ### Live sandbox acceptance
 

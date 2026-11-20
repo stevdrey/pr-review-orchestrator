@@ -22,6 +22,7 @@ import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Result;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
+import io.github.stevdrey.prrevieworchestrator.ports.SandboxInlineFixStore;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -101,6 +102,7 @@ class FeedbackLoopSandboxIntegrationTest {
     @Autowired GitHubReviewNormalizer normalizer;
     @Autowired JdbcReviewStateStore states;
     @Autowired JdbcReviewEvidenceStore evidenceStore;
+    @Autowired SandboxInlineFixStore inlineFixes;
 
     private JdbcWorkQueue queue;
     private JdbcReviewRequestStore requests;
@@ -449,7 +451,7 @@ class FeedbackLoopSandboxIntegrationTest {
         var clean = observeRound(rerun, "R2", Conclusion.NO_FINDINGS);
         assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(clean).verdict(),
                 "a fix claim and a clean response cannot clear retained findings");
-        recordFixtureInlineVerification(firstRound);
+        verifyFixtureInlineFix(firstRound);
         assertEquals(Verdict.ACTION_REQUIRED, outcomes.assess(clean).verdict(), "general fix claim still blocks");
         dispose(firstRound, GeneralFeedback.Action.DISMISS, null);
         var wrongRequest = new Run(PR, repository.fixedSha, rerun.provider(), Stage.BASELINE, firstRound.run().requestId(),
@@ -627,14 +629,42 @@ class FeedbackLoopSandboxIntegrationTest {
                 """.formatted(sha, reviewId, seen, findings ? SandboxGitHub.PRIVATE_TEXT : "", thread);
     }
 
-    private void recordFixtureInlineVerification(Assessment initial) throws IOException, InterruptedException {
+    private void verifyFixtureInlineFix(Assessment initial) throws IOException, InterruptedException {
         assertTrue(repository.verifiesFix(initial.run().headSha(), github.head()));
-        // The approved inline fix verifier does not exist yet. Seed only its exact observation on the disposable DB.
-        assertEquals(1, jdbc.update("""
-                UPDATE findings SET status = 'VERIFIED_FIXED', evidence_sha = ?, verified_at = clock_timestamp(),
-                    disposition_actor = 'fixture-verifier', disposition_reason = 'Sandbox fixture verified the fix'
-                WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT' AND reviewed_sha = ? AND status = 'OPEN'
-                """, repository.fixedSha, initial.snapshotId(), repository.openedSha));
+        var finding = jdbc.queryForObject("""
+                SELECT stable_finding_id FROM findings
+                WHERE evidence_snapshot_id = ? AND source_kind = 'REVIEW_COMMENT'
+                """, UUID.class, initial.snapshotId());
+        var state = current();
+        var verifier = new VerifySandboxInlineFix(PR, repository.fixedSha, authorization, inlineFixes);
+        String originalBlob = repository.blob(repository.openedSha);
+        String correctiveBlob = repository.blob(repository.fixedSha);
+        String actor = "fixture-verifier";
+        String reason = "The committed source now returns the expected value.";
+        assertThrows(IllegalArgumentException.class, () -> new SandboxInlineFix(finding, initial.snapshotId(),
+                state.version(), repository.openedSha, repository.fixedSha, "Example.java",
+                originalBlob, originalBlob, actor, reason));
+        assertThrows(ReviewEvidence.Conflict.class, () -> verifier.verify(new SandboxInlineFix(finding,
+                initial.snapshotId(), state.version() - 1, repository.openedSha, repository.fixedSha, "Example.java",
+                originalBlob, correctiveBlob, actor, reason)));
+        assertThrows(ReviewEvidence.Conflict.class, () -> verifier.verify(new SandboxInlineFix(finding,
+                initial.snapshotId(), state.version(), repository.openedSha, repository.fixedSha, "Unrelated.java",
+                originalBlob, correctiveBlob, actor, reason)));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM findings WHERE status='VERIFIED_FIXED'", Integer.class));
+        var proof = new SandboxInlineFix(finding, initial.snapshotId(), state.version(), repository.openedSha,
+                repository.fixedSha, "Example.java", originalBlob, correctiveBlob, actor, reason);
+        assertTrue(verifier.verify(proof));
+        var recorded = jdbc.queryForMap("""
+                SELECT status, evidence_sha, verified_at FROM findings WHERE stable_finding_id = ?
+                """, finding);
+        assertEquals("VERIFIED_FIXED", recorded.get("status"));
+        assertEquals(repository.fixedSha, recorded.get("evidence_sha"));
+        assertNotNull(recorded.get("verified_at"));
+        assertFalse(verifier.verify(proof));
+        assertEquals(recorded, jdbc.queryForMap("""
+                SELECT status, evidence_sha, verified_at FROM findings WHERE stable_finding_id = ?
+                """, finding));
+        assertEquals(state, current());
     }
 
     private void dispose(Assessment round, GeneralFeedback.Action action, String evidenceSha) {

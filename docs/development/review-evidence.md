@@ -108,4 +108,4 @@ Tests cover metadata provenance and edits, stale/outdated threads, resolution be
 
 On 2026-11-19, the scheduled worker processed two locally signed loopback deliveries, one `pull_request_review` and one `pull_request_review_comment`, against live GitHub evidence from one approved sandbox PR. At the pinned head it persisted one formal review and six open inline findings. The two observations shared stable finding identities. Each exact replay returned `200 DUPLICATE` with the original correlation ID. The sandbox recorded zero review requests, outbound commands, notices and verified fixes.
 
-GitHub-originated delivery of these review events, live authorized dispositions, fix verification after a corrective commit and authenticated provider completion remain to be exercised for issue #23.
+Subsequent sandbox runs verified GitHub-originated review and comment edits with redelivery, one author-authorized general acknowledgment, and [one inline fix against a corrective commit](fix-correlation.md#verify-an-inline-fix-in-the-sandbox). The complete authorized live cycle and authenticated provider completion remain pending for issue #23.
