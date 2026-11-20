@@ -51,6 +51,14 @@ reservations in this store; `orchestrator.codex.max-requests` may lower it to 1â
 This is a conservative emergency ceiling, not the multi-provider monetary ledger.
 Do not deploy a permissive test approval implementation.
 
+## Read-only OAuth and native review evidence
+
+`GitHubSandboxDeviceOAuth` supports a single operator-initiated OAuth device grant for an approved, read-only GitHub App. The operator must authorize the dedicated App in GitHub. Construct the probe explicitly with one installation, repository, PR, expected head and human actor ID. Use the same private operator session ID for `start` and subsequent `poll` calls. The probe honors GitHub's polling interval and expiration, requires a user token from the App's own exchange, and checks the actor, a single selected read-only installation, one accessible repository and the open PR's exact head. The result contains identity and scope only. The operator can revoke the temporary App authorization in GitHub after the probe. [GitHub App device flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token)
+
+On 2026-11-20, one native review request on an authorized private sandbox PR produced two GitHub conversation comments attributed to the Codex GitHub App. GitHub supplied the sender and App metadata. The raw body of the summary includes a versioned `codex-review-state:v1` marker reporting `completed` for the exact commit and reporting no findings. It contains no request receipt ID. GitHub exposes both results as conversation comments and reports zero formal reviews. The sandbox reader normalized both comments as general feedback. The classifier required human review and rejected either comment ID as a completion reference. The public guide describes how to request reviews. An approved contract tying the provider's result to the exact request, stage and SHA remains necessary before using this marker to authorize a transition. [Codex GitHub review guide](https://learn.chatgpt.com/docs/third-party/github)
+
+The initial Device Flow challenge expired. In the retry on 2026-11-20, the operator authorized the read-only App, and the probe completed the live token exchange. It verified the authenticated actor, the sole read-only installation, access to `stevdrey/wave-llm-demo` only, and the open PR #176 at `d001022fcc1cb1d85e646a5511e75d04c9231636`. The temporary authorization was revoked and Device Flow was disabled again. The retry reused the existing review evidence. Authenticated Codex review completion and the resulting end-to-end transition remain unverified. Cost measurement was outside the test.
+
 ## Durable protocol and results
 
 V8 adds `review_requests`: metadata-only UUID, canonical scoped key, actor ID,
