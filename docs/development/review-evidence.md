@@ -2,9 +2,19 @@
 
 ## Implemented boundary
 
-`GitHubReviewNormalizer` converts a complete, authorized GitHub GraphQL response into provider-neutral `ReviewEvidence.Snapshot` data. `IngestReviewEvidence` authorizes the installation/repository inside the PostgreSQL transaction and persists the snapshot, immutable source metadata and conservative inline finding occurrences atomically. The use case is available as an internal Spring bean. No HTTP ingestion endpoint, GitHub API fetcher, automatic polling, event planner or provider command is enabled by this increment. Webhook ingress continues to store routing metadata; approved workers must fetch authoritative review state before using this adapter.
+`GitHubReviewNormalizer` converts a complete, authorized GitHub GraphQL response into provider-neutral `ReviewEvidence.Snapshot` data. `IngestReviewEvidence` authorizes the installation/repository inside the PostgreSQL transaction and persists the snapshot, immutable source metadata and conservative inline finding occurrences atomically. The use case is available as an internal Spring bean. The opt-in [durable sandbox worker](#durable-sandbox-worker) also uses the same persistence logic after fetching authoritative review state.
 
-This implements normalization and durable ingestion, not live webhook-to-review automation. A snapshot cannot advance the PR lifecycle, supply a clean verdict, spend a provider budget or verify a fix. Issue #17 extends this boundary with [general-feedback classification, findings and audited dispositions](general-feedback.md). Non-empty review bodies and PR issue comments now require explicit disposition; they cannot imply a clean verdict.
+Ingestion may invalidate a previously clean projection when new evidence blocks it. A snapshot cannot grant a clean verdict, advance a review stage, spend a provider budget or verify a fix. Issue #17 extends this boundary with [general-feedback classification, findings and audited dispositions](general-feedback.md). Non-empty review bodies and PR issue comments require explicit disposition.
+
+## Durable sandbox worker
+
+Set `orchestrator.sandbox-ci.review-evidence-enabled: true` in the [durable sandbox configuration](ci-and-iteration-policy.md#durable-sandbox-worker). The route defaults to disabled and shares the operator-pinned installation, repository, PR and head with CI. Startup requires the receiver allowlist to contain only the configured ingress scope. The read installation must be authorized for that repository. Keep Codex and author notifications disabled.
+
+Signed `pull_request_review`, `pull_request_review_comment` and `pull_request_review_thread` deliveries wake the worker when their PR and head match the policy. A PR `issue_comment` delivery can wake the same route without an event SHA. The worker checks the authoritative PR before and after the read and accepts only the pinned head on an open, non-draft, same-repository PR. Enable only the necessary [GitHub App event subscriptions](../github/app-setup.md#event-subscription-contract-activate-only-with-verified-ingress) when exercising live webhook delivery.
+
+The worker uses a repository-scoped `Pull requests: read` token. GraphQL provides thread and source metadata. REST supplies the review and inline-comment commit IDs, which are joined to the matching GraphQL records by GitHub database ID. Inline revisions must agree across APIs on body, update time, path and review association. The sandbox reader bounds GraphQL connections at 30 entries each and rejects pagination, partial responses and mismatched evidence through bounded inbox retries. [GitHub review API](https://docs.github.com/en/rest/pulls/reviews) · [GitHub inline-comment API](https://docs.github.com/en/rest/pulls/comments)
+
+The observation uses the inbox UUID and a dedicated evidence-only cycle for the configured PR and SHA. The worker checks both installation scopes again in the fenced transaction. It journals the cycle, snapshot, finding projections and inbox completion together. An exact delivery replay leaves the original inbox row and its correlation ID in place. Distinct deliveries can record fresh snapshots without duplicating stable findings. If the transaction fails, the retry fetches fresh evidence. A local aggregate that has moved to another head prevents the old snapshot from being written.
 
 ## Trusted caller contract
 
@@ -47,11 +57,11 @@ repository(owner: $owner, name: $name) {
 }
 ```
 
-The checked fixture is synthetic, shaped after these fields, and does not demonstrate a live GitHub query. A `null` `commit`, `originalCommit` or `pullRequestReview` (for example after a force-push) is recorded as an unknown SHA/review on that source only; `Source.staleFor` treats it as stale and the PR head is never substituted. Missing fields still reject the whole snapshot. Deleted authors may have a null login. Threads themselves have no reviewed SHA or body; those fields remain null, including for empty threads.
+A `null` `commit`, `originalCommit` or `pullRequestReview` (for example after a force-push) is recorded as an unknown SHA/review on that source only. `Source.staleFor` treats an unknown SHA as stale. Missing fields reject the whole snapshot. Deleted authors may have a null login. Threads themselves have no reviewed SHA or body, including when empty.
 
 ## Identity, provenance and freshness
 
-- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Different observations with the same PR/provider/capture time conflict because their order is ambiguous.
+- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Independent reads with the same PR, provider and capture time conflict because their order is ambiguous. Disjoint rounds from one sandbox read share its capture time and commit together.
 - `review_evidence_sources` retains every supplied review, thread and comment revision: provider node IDs, review/thread/reply relationships, author login, source update time, review state, file/line/original line, severity and SHA-256 of the body. Bodies and private diffs are neither persisted nor logged. A hash detects revisions; it cannot reconstruct deleted text. `github-node:<id>` references remain on finding occurrences. Provider is `github`; the source author preserves reviewer attribution, without claiming Codex billing identity.
 - Each root inline comment is a **candidate** finding with one stable `finding_identities.id`, scoped by installation/repository/PR/provider/source kind/comment ID. Replies and empty threads remain evidence only. General summaries/comments follow the separate issue #17 contract. Severity defaults to `UNKNOWN`; an optional explicit classification map supplies severity by comment node ID. No prose, approval or “looks good” text can set a disposition. Classification is advisory data for future policy.
 - `findings` keeps one occurrence per cycle/source and links it to the stable identity and latest source snapshot for that occurrence. Reusing the same comment across rounds shares identity; edits do not create new findings. New comments, even with identical text or a shared path, remain separate candidates. Semantic correlation of distinct provider comments is deliberately unsupported.
@@ -96,4 +106,13 @@ Focused verification:
 
 Tests cover metadata provenance and edits, stale/outdated threads, resolution before a fix, explicit severity, replies, multiple rounds, out-of-order snapshots, conflicting/concurrent retries, recreated-store persistence, scope/SHA mismatches, revoked authorization, deferred commit rollback, empty threads, missing sources and V5→V6 migration retaining legacy findings. PostgreSQL uses the pinned disposable Testcontainers image. Full build: `./gradlew clean build --offline`.
 
-Live API reads, webhook reconciliation, deployment load, production data retention, semantic prose classification, fix verification and automatic lifecycle integration remain unverified or unimplemented as stated above.
+On 2026-11-19, the scheduled worker processed two locally signed loopback deliveries, one `pull_request_review` and one `pull_request_review_comment`, against live GitHub evidence from one approved sandbox PR. At the pinned head it persisted one formal review and six open inline findings. The two observations shared stable finding identities. Each exact replay returned `200 DUPLICATE` with the original correlation ID. The sandbox recorded zero review requests, outbound commands, notices and verified fixes.
+
+Subsequent sandbox runs verified GitHub-originated review and comment edits with redelivery, one author-authorized general acknowledgment, and [one inline fix against a corrective commit](fix-correlation.md#verify-an-inline-fix-in-the-sandbox). The complete authorized live cycle and authenticated provider completion remain pending for issue #23.
+
+The worker joins GitHub GraphQL `id` to REST `node_id` for reviews and inline
+comments, including when the REST review ID exceeds 32 bits. A current-head
+read can retain prior inline threads. Each such thread and its replies stay
+in the root comment's originating round, with the current head recorded
+separately as the observed SHA. An unchanged refresh preserves a verified
+disposition, while edits reopen the finding. [GitHub global node IDs](https://docs.github.com/en/graphql/guides/using-global-node-ids)

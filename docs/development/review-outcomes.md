@@ -27,6 +27,16 @@ Retained pending findings are read across rounds in the same transaction. Latest
 
 Callers must ingest complete, current authorized API reads. The GitHub normalizer rejects partial/error/paginated reads; no favorable-source selection, invented commit SHA or unparsed body labeled `Feedback.NONE` is permitted. These local checks cannot detect an unobserved remote edit/push or authenticate a provider completion. Live fetching and provider capability verification remain separate integrations.
 
+### PR #35 correlation replay
+
+The [isolated OAuth run](../adr/0007-one-shot-sandbox-codex-authorization.md#observed-result) recorded request `1b416560-e011-4113-a23a-56486497574e` for `BASELINE` and `42017af3b3957157e707c9c6e72c5b44c24051e4`. The durable record links its request UUID to GitHub comment `7184384751`. The Codex App's eyes reaction `484484746` directly acknowledges that comment. [Request](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7184384751)
+
+The Codex App edited summary `7182106453` to report `code_review.status=completed` for the full SHA. A separate Codex receipt `7184425421` gives `42017af3b3`, which GitHub resolves to that commit. Both are conversation comments, and the PR reviews endpoint returned zero formal reviews. The summary was originally created for an earlier review and was edited in place. Its current metadata contains the reviewed SHA, status and finding flags. The receipt marker has an empty payload. Neither comment nor the timeline carries an authenticated reference to the request or a provider run ID that joins acknowledgment to completion. [Summary](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7182106453) · [Receipt](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7184425421) · [Reviewed commit](https://github.com/stevdrey/realtime-voice-lab/commit/42017af3b3957157e707c9c6e72c5b44c24051e4)
+
+The sequence supports an association with the one observed request. The four check runs at that commit include no Codex record, and the commit status endpoint returned no entries. Exact completion correlation for [issue #23](https://github.com/stevdrey/pr-review-orchestrator/issues/23) still needs a provider-authenticated link from the request comment or provider run to the terminal result, bound to the stage and full SHA. The local stage comes from the durable request. A matching SHA, timing and provider login are insufficient to select a request across summary edits or multiple runs on one head.
+
+The local `sandboxPr35SummaryAndReceiptCannotEstablishExactBaselineCompletion` regression uses a reconstruction of those comment shapes. The normalizer retains them as general feedback. The classifier returns `MISSING_COMPLETION` with no completion input, and `MISSING_REVIEW` if either comment ID is supplied as the completion source, with no progress evidence in either case. The fixture isolates correlation from the independent pending-feedback gate. No live state was updated during the replay.
+
 ## Decisions
 
 The result retains the run, aggregate version, a verdict and stable reason code. It is a stage result, not an assertion of full correctness.

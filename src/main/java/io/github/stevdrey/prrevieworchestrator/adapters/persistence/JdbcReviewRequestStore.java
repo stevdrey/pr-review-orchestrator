@@ -20,14 +20,21 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final JdbcReviewStateStore states;
+    private final JdbcSandboxCodexBudget sandboxBudget;
 
     public JdbcReviewRequestStore(JdbcTemplate jdbc, PlatformTransactionManager manager) {
         this(jdbc, manager, new JdbcReviewStateStore(jdbc, manager));
     }
 
     public JdbcReviewRequestStore(JdbcTemplate jdbc, PlatformTransactionManager manager, JdbcReviewStateStore states) {
+        this(jdbc, manager, states, null);
+    }
+
+    public JdbcReviewRequestStore(JdbcTemplate jdbc, PlatformTransactionManager manager, JdbcReviewStateStore states,
+            JdbcSandboxCodexBudget sandboxBudget) {
         this.jdbc = jdbc;
         this.states = states;
+        this.sandboxBudget = sandboxBudget;
         PostgresDeadlines.requireTransactionTimeout(jdbc, "review requests");
         transactions = new TransactionTemplate(manager);
         transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -85,6 +92,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     """, id, request.key(), request.pr().scope().installationId(), request.pr().scope().repositoryId(),
                     request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId,
                     request.headEpoch(), used + 1);
+            if (sandboxBudget != null) sandboxBudget.reserve(request);
             return new Reservation(id, State.RESERVED, true);
         });
         if (reservation == null) throw new ReviewRequestFailure(LIMIT_REACHED);
@@ -117,6 +125,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                         (rs, row) -> State.valueOf(rs.getString(1)), id, request.key());
                 if (states.size() != 1 || states.getFirst() != State.ATTEMPTED) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
                 requireSendPolicy(request, id);
+                if (sandboxBudget != null) sandboxBudget.requireHeld(request);
                 Receipt receipt = effect.get();
                 effectReturned.set(true);
                 if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);

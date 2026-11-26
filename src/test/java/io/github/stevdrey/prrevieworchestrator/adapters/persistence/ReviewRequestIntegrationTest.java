@@ -11,6 +11,7 @@ import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailur
 import static io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure.Code.CI_NOT_PASSED;
 
 import io.github.stevdrey.prrevieworchestrator.adapters.github.*;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget.Terms;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
 import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
@@ -46,6 +47,7 @@ class ReviewRequestIntegrationTest {
         Flyway.configure().dataSource(dataSource).load().migrate();
         jdbc = new JdbcTemplate(dataSource);
         jdbc.execute("TRUNCATE installations CASCADE");
+        jdbc.execute("TRUNCATE sandbox_codex_budget_limits");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true), (202, 2002, true)");
         authorization = new RepositoryAuthorization(Set.of(SCOPE), new JdbcInstallationAuthorization(jdbc));
@@ -182,6 +184,135 @@ class ReviewRequestIntegrationTest {
                 () -> authorization.requireAuthorized(SCOPE), () -> { effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1, true); }));
         assertEquals(0, effects.get());
         assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
+    }
+
+    @Test void withdrawnBudgetBeforePostConsumesThePermitWithoutSending() {
+        var checks = new AtomicInteger();
+        doAnswer(call -> {
+            if (checks.incrementAndGet() == 4) {
+                throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            }
+            return null;
+        }).when(approval).requirePermitted(any());
+        var r = request(HEAD);
+        code(ReviewRequestFailure.Code.POLICY_DENIED, () -> adapter().request(r));
+        assertEquals(NOT_SENT, adapter().request(r));
+        assertEquals(4, checks.get());
+        assertEquals(0, effects.get());
+        assertEquals(1, rows());
+    }
+
+    @Test void operatorCommandRequiresTheSandboxAndConsentingActorAndReusesTheDurableKey() {
+        var operator = new ReviewRequest(PR, HEAD, "BASELINE", "codex", ReviewRequest.Trigger.SANDBOX_OPERATOR, 42, false);
+        code(UNSUPPORTED_TRIGGER, () -> adapter().request(operator));
+        var sandbox = new CodexReviewAdapter(authorization, store(), approval, comments, 42, 1, true);
+        var otherActor = new ReviewRequest(PR, HEAD, "BASELINE", "codex", operator.trigger(), 43, false);
+        code(UNSUPPORTED_TRIGGER, () -> sandbox.request(otherActor));
+        assertEquals(0, rows());
+        assertEquals(COMMENT_CREATED, sandbox.request(operator));
+        assertEquals(DUPLICATE, sandbox.request(operator));
+        assertEquals(DUPLICATE, adapter().request(request(HEAD)));
+        assertEquals(1, rows());
+        assertEquals(1, effects.get());
+    }
+
+    @Test void sandboxBudgetRollsBackTheRequestAndAllCountersOnLocalLimitDenial() {
+        var store = budgetStore(new Terms("fixture_units", 4, 5, 9, 20));
+        var original = request(HEAD);
+        var samePr = new ReviewRequest(PR, HEAD, "DEEP", "codex", ReviewRequest.Trigger.PR_READY, 42, false);
+        var secondPr = budgetRequest(new PullRequestId(SCOPE, 8));
+        var thirdPr = budgetRequest(new PullRequestId(SCOPE, 9));
+
+        assertTrue(reserveBudget(store, original).created());
+        assertFalse(reserveBudget(store, original).created());
+        code(ReviewRequestFailure.Code.POLICY_DENIED, () -> reserveBudget(store, samePr));
+        assertEquals(4, reservedUnits("global"));
+        assertEquals(4, reservedUnits("installation:101"));
+        assertTrue(reserveBudget(store, secondPr).created());
+        code(ReviewRequestFailure.Code.POLICY_DENIED, () -> reserveBudget(store, thirdPr));
+        assertEquals(8, reservedUnits("global"));
+        assertEquals(8, reservedUnits("installation:101"));
+        assertEquals(4, reservedUnits("pr:101:1001:7"));
+        assertEquals(2, rows());
+        assertEquals(2, heldBudgets());
+    }
+
+    @Test void competingInstallationsCannotExceedTheSharedSandboxBudget() throws Exception {
+        var terms = new Terms("fixture_units", 4, 8, 8, 6);
+        var first = request(HEAD);
+        var second = budgetRequest(new PullRequestId(new RepositoryScope(202, 2002), 7));
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var attempts = new ArrayList<Future<Boolean>>();
+            for (var request : List.of(first, second)) {
+                attempts.add(executor.submit(() -> {
+                    start.await();
+                    try {
+                        return reserveBudget(budgetStore(terms), request).created();
+                    } catch (ReviewRequestFailure denied) {
+                        assertEquals(ReviewRequestFailure.Code.POLICY_DENIED, denied.code());
+                        return false;
+                    }
+                }));
+            }
+            start.countDown();
+            assertNotEquals(attempts.get(0).get(10, TimeUnit.SECONDS), attempts.get(1).get(10, TimeUnit.SECONDS));
+        }
+        assertEquals(4, reservedUnits("global"));
+        assertEquals(1, rows());
+        assertEquals(1, heldBudgets());
+    }
+
+    @Test void unknownOutcomeKeepsTheBudgetHeldAndCannotBeSentAgain() {
+        var terms = new Terms("fixture_units", 4, 5, 9, 20);
+        var original = request(HEAD);
+        when(comments.create(eq(original), eq(42L), any())).thenAnswer(call -> {
+            call.getArgument(2, Runnable.class).run();
+            effects.incrementAndGet();
+            throw new ReviewRequestFailure(ReviewRequestFailure.Code.OUTCOME_UNKNOWN);
+        });
+        var adapter = new CodexReviewAdapter(authorization, budgetStore(terms), approval, comments, 42, 1);
+        assertEquals(OUTCOME_UNKNOWN, adapter.request(original));
+        var restarted = new CodexReviewAdapter(authorization, budgetStore(terms), approval, comments, 42, 1);
+        assertEquals(OUTCOME_UNKNOWN, restarted.request(original));
+        assertEquals("ATTEMPTED", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
+        assertEquals(4, reservedUnits("global"));
+        assertEquals(1, effects.get());
+        assertEquals(1, heldBudgets());
+    }
+
+    @Test void aRequestWithoutAMatchingBudgetHoldCannotReachTheEffect() {
+        var original = request(HEAD);
+        var past = reserveBudget(store(), original);
+        var budget = budgetStore(new Terms("fixture_units", 4, 5, 9, 20));
+        code(ReviewRequestFailure.Code.POLICY_DENIED, () -> budget.send(original, past.id(),
+                () -> authorization.requireAuthorized(SCOPE), () -> fail("Missing budget allowed the effect")));
+        assertEquals(NOT_SENT, adapter().request(original));
+        assertEquals(0, heldBudgets());
+    }
+
+    private ReviewRequest budgetRequest(PullRequestId pr) {
+        return new ReviewRequest(pr, HEAD, "BASELINE", "codex", ReviewRequest.Trigger.PR_READY, 42, false);
+    }
+
+    private JdbcReviewRequestStore budgetStore(Terms terms) {
+        var manager = new DataSourceTransactionManager(dataSource);
+        return new JdbcReviewRequestStore(jdbc, manager, new JdbcReviewStateStore(jdbc, manager),
+                new JdbcSandboxCodexBudget(jdbc, terms));
+    }
+
+    private ReviewRequestStore.Reservation reserveBudget(JdbcReviewRequestStore store, ReviewRequest request) {
+        var fixtureAuthorization = new RepositoryAuthorization(Set.of(SCOPE, new RepositoryScope(202, 2002)),
+                new JdbcInstallationAuthorization(jdbc));
+        return store.reserve(request, 42, 6, () -> fixtureAuthorization.requireAuthorized(request.pr().scope()), () -> {});
+    }
+
+    private long reservedUnits(String key) {
+        return jdbc.queryForObject("SELECT reserved FROM sandbox_codex_budget_limits WHERE scope_key = ?", Long.class, key);
+    }
+
+    private int heldBudgets() {
+        return jdbc.queryForObject("SELECT count(*) FROM sandbox_codex_budget_reservations", Integer.class);
     }
 
     @Test void acceptedCommentWithDeferredCommitFailureRetainsConsumedPermit() {

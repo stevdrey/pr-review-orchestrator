@@ -12,13 +12,14 @@ while implementing this adapter.
 `ReviewProvider.request(ReviewRequest)` accepts stable installation/repository/PR,
 full head SHA, provider/stage and verified event metadata. `CodexReviewAdapter`
 supports only `codex` / `BASELINE`, and PR opened, ready, synchronize and reopened
-triggers. Bot senders and **all comment/review events** return `IGNORED`, including
+triggers. The isolated sandbox also supports an explicit `SANDBOX_OPERATOR` trigger
+for the consenting actor. Bot senders and **all comment/review events** return `IGNORED`, including
 the consenting user's own trigger comment and provider replies. This deliberately
 does not implement a comment-based manual-command workflow. Event IDs, senders and
 cycle IDs cannot change the logical request identity.
 
-This is an internal API, with no new public endpoint, scheduler, event planner or
-webhook-to-request wiring. A future caller must authenticate the event, fetch
+The internal API is called by an [opt-in sandbox terminal command](#one-shot-sandbox-trigger).
+A future webhook caller must authenticate the event, fetch
 complete authoritative state, preserve the sender ID/type, and enforce trigger
 eligibility. Never construct trusted policy inputs from comment instructions.
 
@@ -28,10 +29,11 @@ network. Enabling `orchestrator.codex.enabled=true` requires all of:
 - A positive `orchestrator.codex.actor-id` (stable GitHub user ID), paired repository
   authorization and PostgreSQL 17+.
 - An approved `CodexUserCredentials` implementation that owns consented GitHub App
-  user OAuth, encrypted secret storage, refresh/revocation and exact App/installation/
-  repository binding. Grant only selected-repository Pull requests write access
-  (plus mandatory metadata), within the user’s effective repository access. None
-  ships. `/user` verifies the actor and rejects a Bot,
+  user OAuth and exact App/installation/repository binding. Use only selected-repository
+  Pull requests write access (plus mandatory metadata), within the user's effective
+  repository access. An opt-in [in-memory implementation](#sandbox-write-grant-verification-and-dispatch-restriction)
+  is available for a single sandbox target. Persistent production credentials require
+  encrypted storage, refresh and revocation. `/user` verifies the actor and rejects a Bot,
   but does **not** attest whether a token is a PAT or a particular App user token;
   the credential source must establish its provenance. Do not supply PATs or
   installation tokens. Never expose credentials in prompts, logs or persisted rows.
@@ -45,11 +47,142 @@ network. Enabling `orchestrator.codex.enabled=true` requires all of:
 
 The property alone cannot enable the adapter without these beans. Credential and
 approval operations must be bounded so each send transaction completes within eight
-seconds (HTTP itself uses at most three one-second reads and one three-second comment write). The lifetime attempt
+seconds (the comment client uses at most three one-second reads and one three-second
+comment write, and the sandbox credential source adds at most one second of HTTP reads). The lifetime attempt
 cap defaults to six per installation/repository/PR across all SHA/provider/stage
 reservations in this store; `orchestrator.codex.max-requests` may lower it to 1–6.
 This is a conservative emergency ceiling, not the multi-provider monetary ledger.
 Do not deploy a permissive test approval implementation.
+
+## Read-only OAuth and native review evidence
+
+`GitHubSandboxDeviceOAuth` supports a single operator-initiated OAuth device grant for an approved, read-only GitHub App. The operator must authorize the dedicated App in GitHub. Construct the probe explicitly with one installation, repository, PR, expected head and human actor ID. Use the same private operator session ID for `start` and subsequent `poll` calls. The probe honors GitHub's polling interval and expiration, requires a user token from the App's own exchange, and checks the actor, a single selected read-only installation, one accessible repository and the open PR's exact head. The result contains identity and scope only. The operator can revoke the temporary App authorization in GitHub after the probe. [GitHub App device flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token)
+
+On 2026-11-20, one native review request on an authorized private sandbox PR produced two GitHub conversation comments attributed to the Codex GitHub App. GitHub supplied the sender and App metadata. The raw body of the summary includes a versioned `codex-review-state:v1` marker reporting `completed` for the exact commit and reporting no findings. It contains no request receipt ID. GitHub exposes both results as conversation comments and reports zero formal reviews. The sandbox reader normalized both comments as general feedback. The classifier required human review and rejected either comment ID as a completion reference. The public guide describes how to request reviews. An approved contract tying the provider's result to the exact request, stage and SHA remains necessary before using this marker to authorize a transition. [Codex GitHub review guide](https://learn.chatgpt.com/docs/third-party/github)
+
+The initial Device Flow challenge expired. In the retry on 2026-11-20, the operator authorized the read-only App, and the probe completed the live token exchange. It verified the authenticated actor, the sole read-only installation, access to `stevdrey/wave-llm-demo` only, and the open PR #176 at `d001022fcc1cb1d85e646a5511e75d04c9231636`. The temporary authorization was revoked and Device Flow was disabled again. The retry reused the existing review evidence. Authenticated Codex review completion and the resulting end-to-end transition remain unverified. Cost measurement was outside the test.
+
+## Sandbox write-grant verification and dispatch restriction
+
+Use a dedicated private GitHub App installed on a single selected sandbox repository for a write-grant probe. Configure repository permissions `Metadata: read` and `Pull requests: write` and enable Device Flow for the consent window. Instantiate `GitHubSandboxDeviceOAuth` with `Access.PULL_REQUESTS_WRITE` and the expected operator, installation, repository, PR and head. It rejects missing or additional permissions, the wrong operator and an outdated head. The probe performs only OAuth exchanges and verification reads. It returns scope evidence and discards the tokens. Revoke the test authorization and disable Device Flow after verification. [GitHub App Device Flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token) · [GitHub comment permission](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment)
+
+On 2026-11-25 the write probe verified GitHub user `stevdrey`, the dedicated App's only selected installation and repository, and the open PR at `42017af3b3957157e707c9c6e72c5b44c24051e4`. The token was discarded and the operator's grant, App installation and Device Flow were removed after the probe. No comment was created and cost measurement was outside the validation. [Sandbox PR #35](https://github.com/stevdrey/realtime-voice-lab/pull/35)
+
+For an approved sandbox dispatch deployment, `orchestrator.codex.sandbox.enabled` restricts the internal provider to one configured installation, repository, PR, head, lifecycle trigger and observed head epoch, with the consenting operator as both sender and actor. The sandbox allows one durable reservation in the PR lifetime and requires author notifications to be disabled. It rejects off-scope requests before reaching the store, OAuth credential source or budget approval. Keep the writable sandbox isolated from the [read-only CI worker](ci-and-iteration-policy.md#durable-sandbox-worker), which never dispatches external commands.
+
+In an approved deployment, opt in to the Spring-managed `GitHubSandboxUserCredentials` source with `orchestrator.codex.sandbox.oauth.enabled=true` and supply `oauth.client-id` and `oauth.repository` under the sandbox configuration. The source retains the verified user token only in memory. Its local authorization expires after ten minutes or at the earlier GitHub expiration. Lookups revalidate authorization, exact installation permissions and repository access, and clear the grant if it is expired or the verification fails. Shutdown also clears the local grant. The comment adapter separately rechecks the user and current PR head before posting. GitHub-side revocation is still required after the test.
+
+## One-shot sandbox trigger
+
+Use `SANDBOX_OPERATOR` for an already open, explicitly authorized PR. The command starts a fresh Device Flow grant from an interactive terminal. After consent it checks the verified operator, PR and SHA against the configured request, calls `ReviewProvider` once, reports the disposition and clears the local grant. The provider applies live authorization, the durable key and one-request ceiling, lifecycle checks, and the mandatory `CodexApproval` policy. It performs a fresh GitHub head check before any write. A second invocation with the same durable request cannot create a second comment. Preserve the sandbox database and its reservations across invocations.
+
+The example is disabled. It shows the scope of [realtime-voice-lab PR #35](https://github.com/stevdrey/realtime-voice-lab/pull/35) observed on 2026-11-25. Before enabling it, check the current SHA and read the tracked head epoch from the sandbox database. Use the ID of the authorized private App installation in both places and replace the example client ID. The installation used in the previous OAuth probe was removed.
+
+```yaml
+spring:
+  main:
+    web-application-type: none
+orchestrator:
+  github:
+    repositories:
+      101: [1469482362]
+    webhook:
+      enabled: false
+  dispatch:
+    enabled: false
+  codex:
+    enabled: false
+    actor-id: 3165632
+    sandbox:
+      enabled: true
+      one-shot-enabled: false
+      installation-id: 101
+      repository-id: 1469482362
+      pr-number: 35
+      head: 42017af3b3957157e707c9c6e72c5b44c24051e4
+      trigger: SANDBOX_OPERATOR
+      head-epoch: 0 # Example only. Use the epoch for this database's tracked lifecycle.
+      oauth:
+        enabled: false
+        client-id: Iv1.example
+        repository: stevdrey/realtime-voice-lab
+  notifications:
+    enabled: false
+```
+
+After the deployment supplies an approved policy and budget terms, enable Codex, sandbox OAuth and the
+one-shot runner in the isolated config. Set the sandbox database settings and run the
+packaged app in an interactive terminal.
+
+```sh
+java -jar build/libs/pr-review-orchestrator-0.1.0-SNAPSHOT.jar \
+  --spring.config.additional-location=file:/path/to/sandbox.yaml
+```
+
+The terminal is the only place the
+command displays the device code. The web server, webhook, workers and notifications
+must be disabled. The runner does not register a public OAuth endpoint or a webhook-triggered review.
+A successful comment receipt still requires independent review evidence for the actual SHA.
+
+### Sandbox budget reservations
+
+Issue [#28](https://github.com/stevdrey/pr-review-orchestrator/issues/28) adds a
+PostgreSQL reservation to the one-shot path. The deployment supplies
+`JdbcSandboxCodexBudget.Terms` as a trusted bean with one usage unit, a
+provider-verified upper bound for a request, and PR, installation and global
+limits in the same unit. The application ships without those terms and still
+requires a separate approved `CodexApproval` implementation before it can start
+the one-shot runner.
+
+V17 stores the three limits and a hold keyed to the review request. The store
+registers the request and updates all three balances in the same transaction.
+It locks the global, installation and PR rows in that order. Insufficient balance
+or a unit or limit mismatch causes the entire transaction to roll back. A replay
+finds the existing request and acquires no additional hold. The send transaction
+requires a matching hold before it can reach the comment adapter.
+
+All holds remain reserved for the lifetime of this sandbox database, including
+holds with a terminal or unknown send result. The request row supplies the outcome.
+Keep the database and reservations between restarts. This increment uses synthetic
+units in tests and leaves authoritative usage reconciliation, expiry periods,
+release and multi-provider accounting pending.
+
+### Evidence to request from OpenAI
+
+For a GitHub review initiated by an explicitly consented GitHub App user token,
+ask OpenAI to confirm the following:
+
+1. Whether `@codex review` is supported through that credential, what entitlement
+   is required, and how Codex selects the account or workspace whose allowance,
+   credits or billing would be used.
+2. Which supported API, export or written confirmation can associate a GitHub
+   comment ID with the Codex review run, reviewed commit SHA, billed account or
+   workspace, accounting status and usage units. Ask for a redacted sample and
+   the associated reporting delay. Ask how failed, canceled, partial and duplicate
+   runs are reported.
+3. Whether Codex provides a preflight reservation or a hard upper bound per
+   invocation that applies before accepting the job. Ask for the units, scope,
+   adverse-case guarantees and when an uncertain result can safely be settled.
+   If those controls are unavailable, request written confirmation of the limitation.
+
+Use the [prepared Support draft](../spikes/issue-42-provider-confirmation-request.md)
+as background. On [sandbox PR #35](https://github.com/stevdrey/realtime-voice-lab/pull/35),
+the orchestrator used operator-approved GitHub OAuth for one `BASELINE` request,
+`1b416560-e011-4113-a23a-56486497574e`, at SHA
+`42017af3b3957157e707c9c6e72c5b44c24051e4`. GitHub recorded
+[comment 7184384751](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7184384751).
+Codex acknowledged the comment and reported completion at the pinned SHA.
+The [summary](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7182106453)
+and [receipt](https://github.com/stevdrey/realtime-voice-lab/pull/35#issuecomment-7184425421)
+provide no request link or execution ID. The provider-authenticated correlation
+and per-review accounting remain unverified. The Support draft has yet to be
+submitted. [Sandbox authorization](../adr/0007-one-shot-sandbox-codex-authorization.md)
+· [Accounting investigation](https://github.com/stevdrey/pr-review-orchestrator/issues/42)
+
+With that evidence, a trusted `CodexApproval` still needs to recheck consent,
+entitlement, current head and applicable CI, findings, holds and no-progress policy
+before the effect. Verification must include contention, replay and ambiguous
+outcomes. [ADR 0002](../adr/0002-github-app-webhook-trust.md) · [ADR 0004](../adr/0004-deterministic-policy-and-budget-gates.md)
 
 ## Durable protocol and results
 
@@ -148,7 +281,7 @@ ORDER BY iteration;
 Focused verification:
 
 ```sh
-./gradlew test --tests '*ReviewRequestIntegrationTest' --tests '*GitHubCodexCommentsTest' --tests '*CodexReviewConfigurationTest'
+./gradlew test --tests '*ReviewRequestIntegrationTest' --tests '*GitHubCodexCommentsTest' --tests '*GitHubSandboxDeviceOAuthTest' --tests '*CodexReviewConfigurationTest'
 ./gradlew clean build
 ```
 

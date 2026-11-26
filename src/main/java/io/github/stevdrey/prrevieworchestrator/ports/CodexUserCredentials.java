@@ -5,8 +5,8 @@ import java.time.Instant;
 import java.util.Objects;
 
 /** Only explicitly consented GitHub App USER tokens. No PAT or installation-token fallback.
- * The credential source owns OAuth, encrypted storage, refresh, revocation and App-installation
- * binding. It must revalidate consent and exact scope on every call; no implementation is supplied.
+ * The credential source owns OAuth and must revalidate consent and exact scope on every call.
+ * Any persistent credential source must also implement encrypted storage, refresh and revocation.
  */
 public interface CodexUserCredentials {
     Credential current(RepositoryScope scope);

@@ -2,10 +2,10 @@ package io.github.stevdrey.prrevieworchestrator.domain;
 
 import java.util.Objects;
 
-/** Trusted caller supplies verified event metadata, never comment instructions or provider prose. */
+/** Trusted caller supplies verified event or sandbox operator metadata. */
 public record ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
         Trigger trigger, long senderId, boolean bot, long headEpoch) {
-    public enum Trigger { PR_OPENED, PR_READY, PR_SYNCHRONIZE, PR_REOPENED, COMMENT, REVIEW }
+    public enum Trigger { PR_OPENED, PR_READY, PR_SYNCHRONIZE, PR_REOPENED, SANDBOX_OPERATOR, COMMENT, REVIEW }
     /** Epoch 0 denotes the initial visit to this SHA before any same-head confirmation. */
     public ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
             Trigger trigger, long senderId, boolean bot) {

@@ -105,9 +105,13 @@ public class JdbcReviewStateStore implements ReviewStateStore {
 
     @Override
     public PullRequestReview reconcileCi(long expectedVersion, CiEvidence evidence, Runnable authorize) {
+        return locked(evidence.pr(), authorize, () -> reconcileCiLocked(expectedVersion, evidence));
+    }
+
+    PullRequestReview reconcileCiLocked(long expectedVersion, CiEvidence evidence) {
         var command = new ReviewTransition(evidence.id(), expectedVersion, evidence.headSha(),
                 Action.RECONCILE_CI, null, observationGates(evidence.status()));
-        return locked(evidence.pr(), authorize, () -> applyLocked(evidence.pr(), command, null));
+        return applyLocked(evidence.pr(), command, null);
     }
 
     PullRequestReview stopLocked(PullRequestReview current, Intervention intervention) {

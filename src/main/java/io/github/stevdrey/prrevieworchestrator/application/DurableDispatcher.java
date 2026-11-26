@@ -2,6 +2,9 @@ package io.github.stevdrey.prrevieworchestrator.application;
 
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,14 +13,29 @@ public final class DurableDispatcher {
     private static final Logger LOG = LoggerFactory.getLogger(DurableDispatcher.class);
     private final WorkQueue queue;
     private final RepositoryAuthorization authorization;
-    private final EventPlanner planner;
-    private final CommandGateway gateway;
+    private final Predicate<Event> inbox;
+    private final Optional<CommandGateway> gateway;
 
     public DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization,
             EventPlanner planner, CommandGateway gateway) {
+        this(queue, authorization, event -> queue.completeEvent(event, List.copyOf(planner.plan(event)),
+                () -> authorization.requireAuthorized(event.scope())), Optional.of(gateway));
+    }
+
+    /** Run the reconciler on the inbox. This mode never claims external commands. */
+    public DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization, SandboxCiReconciler reconciler) {
+        this(queue, authorization, reconciler::complete);
+    }
+
+    public DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization, Predicate<Event> reconciler) {
+        this(queue, authorization, reconciler, Optional.empty());
+    }
+
+    private DurableDispatcher(WorkQueue queue, RepositoryAuthorization authorization,
+            Predicate<Event> inbox, Optional<CommandGateway> gateway) {
         this.queue = queue;
         this.authorization = authorization;
-        this.planner = planner;
+        this.inbox = inbox;
         this.gateway = gateway;
     }
 
@@ -29,9 +47,7 @@ public final class DurableDispatcher {
             // Installation-level/legacy rows name no repository: an unsupported route, not a denial.
             if (event.scope() == null) throw new Failure(ErrorCode.INVALID_EVENT, false);
             authorization.requireAuthorized(event.scope());
-            // The queue enforces WorkQueue.MAX_INTENTS atomically with completion.
-            var intents = java.util.List.copyOf(planner.plan(event));
-            if (queue.completeEvent(event, intents, () -> authorization.requireAuthorized(event.scope()))) {
+            if (inbox.test(event)) {
                 report(event.lease(), "PROCESSED");
             }
         } catch (RuntimeException failure) {
@@ -41,14 +57,16 @@ public final class DurableDispatcher {
     }
 
     public boolean processCommand() {
+        if (gateway.isEmpty()) return false;
+        var commands = gateway.orElseThrow();
         var claimed = queue.claimCommand();
         if (claimed.isEmpty()) return false;
         Command command = claimed.get();
         var effectAttempted = new java.util.concurrent.atomic.AtomicBoolean();
         try {
             if (queue.executeCommand(command, () -> authorization.requireAuthorized(command.scope()), () -> {
-                if (!gateway.supports(command)) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
-                RemoteState state = gateway.reconcile(command);
+                if (!commands.supports(command)) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
+                RemoteState state = commands.reconcile(command);
                 // A later PR head does not undo a confirmed effect for this command's original SHA/key.
                 if (state.effect() == RemoteEffect.APPLIED) return Outcome.SUCCEEDED;
                 // A stale head forbids new writes, but cannot settle an earlier ambiguous effect.
@@ -57,7 +75,7 @@ public final class DurableDispatcher {
                 // No second authorization query: authorize.run() holds FOR SHARE locks on the
                 // installation/repository rows, so a revocation cannot commit before this transaction ends.
                 effectAttempted.set(true);
-                gateway.execute(command);
+                commands.execute(command);
                 return Outcome.SUCCEEDED;
             })) report(command.lease(), "COMPLETED");
         } catch (RuntimeException failure) {

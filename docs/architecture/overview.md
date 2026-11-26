@@ -48,3 +48,5 @@ Installation/repository boundaries are explicit. Scope tokens by action; never s
 ## Further reading
 
 [Review lifecycle](review-lifecycle.md) · [Domain model](domain-model.md) · [Integration contracts](integration-contracts.md) · [Threat model](../security/threat-model.md) · [ADRs](../adr/README.md)
+
+The [PR #35 sandbox authorization](../adr/0007-one-shot-sandbox-codex-authorization.md) covers one isolated invocation of the existing Codex adapters. It expires with that invocation or a change to the authorized head.

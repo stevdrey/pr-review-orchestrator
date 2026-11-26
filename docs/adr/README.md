@@ -10,6 +10,7 @@ ADRs capture persistent architectural intent. **Accepted** means the decision is
 | [0004](0004-deterministic-policy-and-budget-gates.md) | Hard policy, budget and iteration gates | Accepted |
 | [0005](0005-finding-state-and-head-sha.md) | Findings and head-SHA-specific verdicts | Accepted |
 | [0006](0006-provider-neutral-agents-and-events.md) | Optional adapters for review providers and MCP events | Accepted |
+| [0007](0007-one-shot-sandbox-codex-authorization.md) | One authorized Codex request in the PR #35 sandbox | Accepted. Authorization consumed. |
 
 ## Writing a new ADR
 

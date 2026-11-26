@@ -59,21 +59,27 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
 
     @Override
     public boolean ingest(Snapshot snapshot, Runnable authorize) {
-        String fingerprint = fingerprint(snapshot, true);
         try {
             return Boolean.TRUE.equals(transactions.execute(status -> {
                 try {
                     PostgresDeadlines.apply(jdbc, DEADLINE);
                     authorize.run();
-                    return persist(snapshot, fingerprint);
+                    PostgresLocks.lockPr(jdbc, snapshot.pr());
+                    return ingestLocked(snapshot);
                 } catch (RuntimeException failure) { throw sanitized(failure); }
             }));
         } catch (RuntimeException failure) { throw sanitized(failure); }
     }
 
-    private boolean persist(Snapshot snapshot, String fingerprint) {
+    /** Joins the caller's transaction, which must already hold the PR lock. */
+    boolean ingestLocked(Snapshot snapshot) {
+        return ingestLocked(snapshot, Set.of(snapshot.id()));
+    }
+
+    /** A sandbox read can contain disjoint rounds that share one capture time. */
+    boolean ingestLocked(Snapshot snapshot, Set<UUID> observationIds) {
+        String fingerprint = fingerprint(snapshot, true);
         var pr = snapshot.pr();
-        PostgresLocks.lockPr(jdbc, pr);
         // Cycle locking serializes same-round updates and makes the current projection deterministic.
         var cycles = jdbc.query("""
                 SELECT id FROM review_cycles WHERE id = ? AND installation_id = ? AND repository_id = ?
@@ -99,13 +105,13 @@ public class JdbcReviewEvidenceStore implements ReviewEvidenceStore {
             if (!previous.get("fingerprint").equals(expected)) throw new Conflict();
             return false;
         }
-        // Equal observation times cannot establish ordering; do not silently choose a winner.
-        if (!jdbc.query("""
+        // Independent reads at equal times cannot establish ordering.
+        if (jdbc.query("""
                 SELECT id FROM review_evidence_snapshots WHERE installation_id = ? AND repository_id = ?
                 AND pr_number = ? AND provider = ? AND captured_at = ?
                 """,
                 (rs, row) -> rs.getObject(1, UUID.class), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), snapshot.provider(),
-                Timestamp.from(snapshot.capturedAt())).isEmpty()) {
+                Timestamp.from(snapshot.capturedAt())).stream().anyMatch(id -> !observationIds.contains(id))) {
             throw new Conflict();
         }
         jdbc.update("""

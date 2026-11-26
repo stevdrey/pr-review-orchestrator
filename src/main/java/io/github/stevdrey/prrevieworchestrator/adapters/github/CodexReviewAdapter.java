@@ -15,9 +15,15 @@ public final class CodexReviewAdapter implements ReviewProvider {
     private final GitHubCodexComments comments;
     private final long actorId;
     private final int limit;
+    private final boolean sandboxOperator;
 
     public CodexReviewAdapter(RepositoryAuthorization authorization, ReviewRequestStore store,
             CodexApproval approval, GitHubCodexComments comments, long actorId, int limit) {
+        this(authorization, store, approval, comments, actorId, limit, false);
+    }
+
+    public CodexReviewAdapter(RepositoryAuthorization authorization, ReviewRequestStore store,
+            CodexApproval approval, GitHubCodexComments comments, long actorId, int limit, boolean sandboxOperator) {
         if (actorId <= 0 || limit < 1 || limit > 6) throw new IllegalArgumentException("Invalid Codex policy");
         this.authorization = java.util.Objects.requireNonNull(authorization);
         this.store = java.util.Objects.requireNonNull(store);
@@ -25,6 +31,7 @@ public final class CodexReviewAdapter implements ReviewProvider {
         this.comments = java.util.Objects.requireNonNull(comments);
         this.actorId = actorId;
         this.limit = limit;
+        this.sandboxOperator = sandboxOperator;
     }
 
     @Override public Result request(ReviewRequest request) {
@@ -32,6 +39,10 @@ public final class CodexReviewAdapter implements ReviewProvider {
         if (request.bot() || request.trigger() == ReviewRequest.Trigger.COMMENT
                 || request.trigger() == ReviewRequest.Trigger.REVIEW) return Result.IGNORED;
         if (!request.provider().equals("codex") || !request.stage().equals("BASELINE")) {
+            throw new ReviewRequestFailure(UNSUPPORTED_TRIGGER);
+        }
+        if (request.trigger() == ReviewRequest.Trigger.SANDBOX_OPERATOR
+                && (!sandboxOperator || request.senderId() != actorId)) {
             throw new ReviewRequestFailure(UNSUPPORTED_TRIGGER);
         }
         Runnable authorize = () -> authorization.requireAuthorized(request.pr().scope());

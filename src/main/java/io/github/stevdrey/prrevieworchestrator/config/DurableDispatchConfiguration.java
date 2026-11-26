@@ -1,16 +1,36 @@
 package io.github.stevdrey.prrevieworchestrator.config;
 
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCiInbox;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.PostgresDeadlines;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubAppConfiguration;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubAppJwt;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNormalizer;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxCiReader;
+import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxReviewReader;
 import io.github.stevdrey.prrevieworchestrator.application.DurableDispatcher;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
+import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
+import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler;
+import io.github.stevdrey.prrevieworchestrator.application.SandboxReviewReconciler;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Limits;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
+import java.time.Clock;
 import java.time.Duration;
+import java.util.Map;
+import java.util.Set;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,7 +43,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 @EnableScheduling
 public class DurableDispatchConfiguration {
     @Bean
-    WorkQueue workQueue(JdbcTemplate jdbc, PlatformTransactionManager manager) {
+    JdbcWorkQueue workQueue(JdbcTemplate jdbc, PlatformTransactionManager manager) {
         PostgresDeadlines.requireTransactionTimeout(jdbc, "durable dispatch");
         // 15/30/60/120s retry delays: ~3.75 minutes for transient outages before the 5-attempt ceiling.
         return new JdbcWorkQueue(jdbc, manager,
@@ -31,9 +51,62 @@ public class DurableDispatchConfiguration {
     }
 
     @Bean
+    @ConditionalOnProperty(prefix = "orchestrator.sandbox-ci", name = "enabled", havingValue = "false", matchIfMissing = true)
     DurableDispatcher durableDispatcher(WorkQueue queue, RepositoryAuthorization authorization,
             EventPlanner planner, CommandGateway gateway) {
         return new DurableDispatcher(queue, authorization, planner, gateway);
+    }
+
+    @ConfigurationProperties("orchestrator.sandbox-ci")
+    record SandboxSettings(long installationId, long readInstallationId, long repositoryId,
+            String repository, int prNumber, String head, Set<Long> workflowIds, boolean reviewEvidenceEnabled) {
+        SandboxCiReconciler.Policy policy() {
+            var scope = new RepositoryScope(installationId, repositoryId);
+            var readScope = new RepositoryScope(readInstallationId, repositoryId);
+            return new SandboxCiReconciler.Policy(new PullRequestId(scope, prNumber), readScope, repository, head, workflowIds);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "orchestrator", name = {"dispatch.enabled", "sandbox-ci.enabled"}, havingValue = "true")
+    @EnableConfigurationProperties(SandboxSettings.class)
+    static class SandboxConfiguration {
+        @Bean
+        DurableDispatcher sandboxCiDispatcher(JdbcWorkQueue queue, JdbcTemplate jdbc, JdbcReviewStateStore states,
+                JdbcReviewEvidenceStore evidenceStore, GitHubReviewNormalizer normalizer,
+                ReviewLifecycle lifecycle, RepositoryAuthorization ingressAuthorization, InstallationAuthorization installations,
+                RepositoryAuthorizationConfiguration.Allowlist allowlist, SandboxSettings settings,
+                GitHubAppConfiguration.Settings github, Environment env) {
+            var policy = settings.policy();
+            var ingress = policy.pr().scope();
+            if (env.getProperty("orchestrator.codex.enabled", Boolean.class, false)
+                    || env.getProperty("orchestrator.notifications.enabled", Boolean.class, false)
+                    || !Map.of(ingress.installationId(), Set.of(ingress.repositoryId())).equals(allowlist.repositories())
+                    || github.privateKeyFile() == null) {
+                throw new IllegalStateException("Sandbox CI requires one ingress scope, a read key and disabled outbound effects");
+            }
+            var readAuthorization = new RepositoryAuthorization(Set.of(policy.readScope()), installations);
+            var clock = Clock.systemUTC();
+            var jwt = new GitHubAppJwt(github.clientId(), github.privateKeyFile(), clock);
+            var reader = new GitHubSandboxCiReader(readAuthorization, jwt, clock);
+            var inbox = new JdbcSandboxCiInbox(jdbc, queue, states);
+            var reconciler = new SandboxCiReconciler(policy, queue, ingressAuthorization, lifecycle, reader,
+                    (event, expected, evidence, authorize) -> inbox.reconcile(event, expected, evidence, () -> {
+                        authorize.run();
+                        readAuthorization.requireAuthorized(policy.readScope());
+                    }));
+            if (!settings.reviewEvidenceEnabled()) return new DurableDispatcher(queue, ingressAuthorization, reconciler);
+
+            var reviewReader = new GitHubSandboxReviewReader(readAuthorization, jwt, clock, normalizer);
+            var reviewInbox = new JdbcSandboxReviewInbox(jdbc, queue, states, evidenceStore);
+            var reviews = new SandboxReviewReconciler(policy, queue, ingressAuthorization, reviewReader,
+                    (event, snapshot, authorize) -> reviewInbox.reconcile(event, snapshot, () -> {
+                        authorize.run();
+                        readAuthorization.requireAuthorized(policy.readScope());
+                    }));
+            return new DurableDispatcher(queue, ingressAuthorization,
+                    event -> reviews.handles(event) ? reviews.complete(event) : reconciler.complete(event));
+        }
     }
 
     /** Separate threads so a command holding its bounded transaction never stalls inbox planning. */
