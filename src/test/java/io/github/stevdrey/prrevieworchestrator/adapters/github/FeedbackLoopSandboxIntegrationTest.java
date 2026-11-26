@@ -89,6 +89,58 @@ class FeedbackLoopSandboxIntegrationTest {
         registry.add("orchestrator.github.repositories.101[0]", () -> "1001");
     }
 
+    @Test
+    void retainedInlineThreadStaysInOriginalRoundAcrossFixAndEdits() throws Exception {
+        lifecycle.create(PR, repository.openedSha);
+        reviewEvidence(false, "original inline", repository.openedSha);
+        assertEquals(202, signed("pull_request_review", UUID.randomUUID(),
+                reviewWebhook("submitted", "review", repository.openedSha, 7)).statusCode());
+        assertTrue(reviewWorker().processEvent());
+        var finding = jdbc.queryForObject("SELECT stable_finding_id FROM findings", UUID.class);
+
+        var update = push(repository.fixedSha);
+        assertTrue(fixes.observeSynchronize(update, current(), head()));
+        complete(update);
+        assertTrue(repository.verifiesFix(repository.openedSha, github.head()));
+        var worker = reviewWorker(repository.fixedSha);
+        reviewEvidence(true, "original inline", repository.openedSha);
+        var delivery = UUID.randomUUID();
+        String edited = reviewWebhook("edited", "comment", repository.fixedSha, 7);
+        assertEquals(202, signed("pull_request_review_comment", delivery, edited).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(200, signed("pull_request_review_comment", delivery, edited).statusCode());
+        assertFalse(worker.processEvent());
+        var history = jdbc.queryForMap("""
+                SELECT f.evidence_snapshot_id, f.reviewed_sha, o.observed_head_sha, s.thread_resolved
+                FROM findings f JOIN review_evidence_snapshots o ON o.id = f.evidence_snapshot_id
+                JOIN review_evidence_sources s ON s.snapshot_id = o.id AND s.source_id = f.source_id
+                """);
+        assertEquals(repository.openedSha, history.get("reviewed_sha"));
+        assertEquals(repository.fixedSha, history.get("observed_head_sha"));
+        assertEquals(true, history.get("thread_resolved"));
+        assertEquals(3, count("review_evidence_snapshots"));
+
+        var verifier = new VerifySandboxInlineFix(PR, repository.fixedSha, authorization, inlineFixes);
+        assertTrue(verifier.verify(new SandboxInlineFix(finding, (UUID) history.get("evidence_snapshot_id"),
+                current().version(), repository.openedSha, repository.fixedSha, "Example.java",
+                repository.blob(repository.openedSha), repository.blob(repository.fixedSha),
+                "fixture-verifier", "The committed source now returns the expected value.")));
+        assertEquals(202, signed("pull_request_review_comment", UUID.randomUUID(),
+                reviewWebhook("created", "comment", repository.fixedSha, 7)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals("VERIFIED_FIXED", jdbc.queryForObject("SELECT status FROM findings", String.class));
+
+        reviewEvidence(false, "edited inline", repository.openedSha);
+        assertEquals(202, signed("pull_request_review_comment", UUID.randomUUID(),
+                reviewWebhook("edited", "comment", repository.fixedSha, 7)
+                        .replace("\"comment\":{\"id\":1}", "\"comment\":{\"id\":1,\"updated_at\":\"2026-11-19T12:01:00Z\"}"))
+                .statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals("OPEN", jdbc.queryForObject("SELECT status FROM findings", String.class));
+        assertEquals(finding, jdbc.queryForObject("SELECT stable_finding_id FROM findings", UUID.class));
+        assertThat(github.comments()).isEmpty();
+    }
+
     @LocalServerPort int port;
     @TempDir Path directory;
     @Autowired JdbcTemplate jdbc;
@@ -316,7 +368,7 @@ class FeedbackLoopSandboxIntegrationTest {
         assertTrue(reviewWorker().processEvent());
         assertEquals(3, github.reviewReads());
         assertEquals(3, jdbc.queryForObject("SELECT attempts FROM inbox_events WHERE status='PROCESSED'", Integer.class));
-        assertEquals(1, count("review_evidence_snapshots"));
+        assertEquals(2, count("review_evidence_snapshots"));
         assertEquals(repository.fixedSha, jdbc.queryForObject("""
                 SELECT original_sha FROM review_evidence_sources WHERE source_kind='REVIEW_COMMENT'
                 """, String.class));
@@ -331,8 +383,13 @@ class FeedbackLoopSandboxIntegrationTest {
     }
 
     private DurableDispatcher reviewWorker() {
+        return reviewWorker(repository.openedSha);
+    }
+
+    private DurableDispatcher reviewWorker(String head) {
         var reader = new GitHubSandboxReviewReader(tokens, github.uri(), clock, normalizer);
-        var reviews = new SandboxReviewReconciler(sandboxPolicy(), queue, authorization, reader,
+        var policy = new SandboxCiReconciler.Policy(PR, PR.scope(), SandboxGitHub.REPOSITORY, head, Set.of(21L, 22L));
+        var reviews = new SandboxReviewReconciler(policy, queue, authorization, reader,
                 new JdbcSandboxReviewInbox(jdbc, queue, states, evidenceStore));
         return new DurableDispatcher(queue, authorization, reviews::complete);
     }
@@ -354,22 +411,22 @@ class FeedbackLoopSandboxIntegrationTest {
                     "number":7,"headRefOid":"%s","state":"OPEN","isDraft":false,
                     "comments":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]},
                     "reviews":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"review-1",
-                        "databaseId":1,"state":"COMMENTED","body":"","updatedAt":"2026-11-19T12:00:00Z",
+                        "state":"COMMENTED","body":"","updatedAt":"2026-11-19T12:00:00Z",
                         "author":{"__typename":"User","login":"fixture-reviewer"}}]},
                     "reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"thread-1",
-                        "isResolved":%s,"isOutdated":false,"path":"Fixture.java","line":8,"originalLine":8,
+                        "isResolved":%s,"isOutdated":false,"path":"Example.java","line":8,"originalLine":8,
                         "comments":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"inline-1",
-                            "databaseId":2,"body":"%s","updatedAt":"2026-11-19T12:00:00Z",
+                            "body":"%s","updatedAt":"2026-11-19T12:00:00Z",
                             "author":{"__typename":"User","login":"fixture-reviewer"},
-                            "path":"Fixture.java","line":8,"originalLine":8,
+                            "path":"Example.java","line":8,"originalLine":8,
                             "pullRequestReview":{"id":"review-1"},"replyTo":null}]}}]}
                     }}}}
-                """.formatted(repository.openedSha, resolved, body), """
-                [{"id":1,"state":"COMMENTED","body":"","commit_id":"%s"}]
-                """.formatted(repository.openedSha), """
-                [{"id":2,"body":"%s","updated_at":"2026-11-19T12:00:00Z","path":"Fixture.java",
-                  "pull_request_review_id":1,"commit_id":"%s","original_commit_id":"%s"}]
-                """.formatted(restBody, repository.openedSha, original));
+                """.formatted(github.head(), resolved, body), """
+                [{"id":5932554900,"node_id":"review-1","state":"COMMENTED","body":"","commit_id":"%s"}]
+                """.formatted(original), """
+                [{"id":4595103520,"node_id":"inline-1","body":"%s","updated_at":"2026-11-19T12:00:00Z","path":"Example.java",
+                  "pull_request_review_id":5932554900,"commit_id":"%s","original_commit_id":"%s"}]
+                """.formatted(restBody, github.head(), original));
     }
 
     private Map<String, Object> workflow(long workflow, long sequence, long attempt, String status, String conclusion) {

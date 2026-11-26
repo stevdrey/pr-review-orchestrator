@@ -8,6 +8,7 @@ import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorizati
 import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -36,6 +37,7 @@ class GitHubSandboxDeviceOAuthTest {
     private final AtomicInteger exchanges = new AtomicInteger();
     private final AtomicBoolean authorized = new AtomicBoolean(true);
     private HttpServer server;
+    private URI origin;
     private GitHubSandboxDeviceOAuth oauth;
     private volatile String fault = "";
     private volatile boolean waiting;
@@ -45,10 +47,14 @@ class GitHubSandboxDeviceOAuthTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", this::handle);
         server.start();
-        var origin = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        origin = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        oauth = probe(GitHubSandboxDeviceOAuth.Access.READ_ONLY);
+    }
+
+    private GitHubSandboxDeviceOAuth probe(GitHubSandboxDeviceOAuth.Access access) {
         var auth = new RepositoryAuthorization(Set.of(PR.scope()), ignored -> authorized.get());
-        oauth = new GitHubSandboxDeviceOAuth(auth, clock, "Iv1.fixture", new GitHubSandboxDeviceOAuth.Scope(
-                PR, "sandbox/review-fixture", HEAD, 42), origin, origin);
+        return new GitHubSandboxDeviceOAuth(auth, clock, "Iv1.fixture", new GitHubSandboxDeviceOAuth.Scope(
+                PR, "sandbox/review-fixture", HEAD, 42), access, origin, origin);
     }
 
     @AfterEach
@@ -105,6 +111,68 @@ class GitHubSandboxDeviceOAuthTest {
         assertEquals(0, exchanges.get());
     }
 
+    @Test
+    void verifiesAnExplicitWriteGrantWithoutReturningTheCredential() {
+        fault = "write-permission";
+        var writeProbe = probe(GitHubSandboxDeviceOAuth.Access.PULL_REQUESTS_WRITE);
+        writeProbe.start(operator);
+        clock.advance(5);
+        var result = writeProbe.poll(operator).verified();
+        assertEquals(new GitHubSandboxDeviceOAuth.Result(42, PR, HEAD), result);
+        assertFalse(result.toString().contains(USER_TOKEN));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "write-with-extra-permission"})
+    void rejectsReadOnlyOrBroaderGrantsInWriteMode(String permission) {
+        fault = permission;
+        var writeProbe = probe(GitHubSandboxDeviceOAuth.Access.PULL_REQUESTS_WRITE);
+        writeProbe.start(operator);
+        clock.advance(5);
+        assertThrows(IllegalStateException.class, () -> writeProbe.poll(operator));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"remote-revocation", "local-revocation", "expanded-scope", "close", "expiry"})
+    void dispatchCredentialRequiresFreshConsentAndExactScope(String stop) {
+        fault = "write-permission";
+        var auth = new RepositoryAuthorization(Set.of(PR.scope()), ignored -> authorized.get());
+        var scope = new GitHubSandboxDeviceOAuth.Scope(PR, "sandbox/review-fixture", HEAD, 42);
+        try (var credentials = new GitHubSandboxUserCredentials(auth, clock, "Iv1.fixture", scope, origin)) {
+            assertThrows(ReviewRequestFailure.class, () -> credentials.current(PR.scope()));
+            credentials.start(operator);
+            clock.advance(5);
+            assertThrows(IllegalStateException.class, () -> credentials.poll(UUID.randomUUID()));
+            assertEquals(new GitHubSandboxDeviceOAuth.Result(42, PR, HEAD), credentials.poll(operator).verified());
+            assertThrows(ReviewRequestFailure.class, () -> credentials.current(new RepositoryScope(101, 1002)));
+            var grant = credentials.current(PR.scope());
+            assertEquals(42, grant.actorId());
+            assertEquals(PR.scope(), grant.scope());
+            assertEquals("sandbox/review-fixture", grant.repository());
+            assertEquals(clock.instant().plusSeconds(600), grant.expiresAt());
+            assertEquals(USER_TOKEN, grant.token());
+            assertFalse(grant.toString().contains(USER_TOKEN));
+            switch (stop) {
+                case "remote-revocation" -> fault = stop;
+                case "expanded-scope" -> fault = "write-with-extra-permission";
+                case "local-revocation" -> authorized.set(false);
+                case "close" -> credentials.close();
+                case "expiry" -> clock.advance(570);
+                default -> fail("Unsupported fixture stop");
+            }
+            if (stop.equals("local-revocation")) {
+                assertThrows(AuthorizationDenied.class, () -> credentials.current(PR.scope()));
+            } else {
+                var denied = assertThrows(ReviewRequestFailure.class, () -> credentials.current(PR.scope()));
+                assertEquals(ReviewRequestFailure.Code.ACTOR_DENIED, denied.code());
+                assertFalse(denied.toString().contains(USER_TOKEN));
+            }
+            authorized.set(true);
+            fault = "write-permission";
+            assertThrows(ReviewRequestFailure.class, () -> credentials.current(PR.scope()));
+        }
+    }
+
     private void handle(HttpExchange request) throws IOException {
         try (request) {
             String path = request.getRequestURI().getPath();
@@ -130,10 +198,18 @@ class GitHubSandboxDeviceOAuthTest {
                     && ("Bearer " + USER_TOKEN).equals(request.getRequestHeaders().getFirst("Authorization"))) {
                 switch (path) {
                     case "/user" -> reply(request, "{\"id\":" + (fault.equals("actor") ? 43 : 42) + ",\"type\":\"User\"}");
-                    case "/user/installations" -> reply(request, """
-                            {"total_count":1,"installations":[{"id":101,"repository_selection":"selected","suspended_at":null,
-                            "permissions":{"metadata":"read","pull_requests":"%s"}}]}
-                            """.formatted(fault.equals("write-permission") ? "write" : "read"));
+                    case "/user/installations" -> {
+                        if (fault.equals("remote-revocation")) {
+                            request.sendResponseHeaders(401, -1);
+                            return;
+                        }
+                        String pullRequests = fault.startsWith("write-") ? "write" : "read";
+                        String extra = fault.equals("write-with-extra-permission") ? ",\"actions\":\"read\"" : "";
+                        reply(request, """
+                                {"total_count":1,"installations":[{"id":101,"repository_selection":"selected","suspended_at":null,
+                                "permissions":{"metadata":"read","pull_requests":"%s"%s}}]}
+                                """.formatted(pullRequests, extra));
+                    }
                     case "/user/installations/101/repositories" -> reply(request, """
                             {"total_count":%d,"repositories":[{"id":1001,"full_name":"sandbox/review-fixture"}]}
                             """.formatted(fault.equals("second-repository") ? 2 : 1));

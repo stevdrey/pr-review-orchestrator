@@ -61,7 +61,7 @@ A `null` `commit`, `originalCommit` or `pullRequestReview` (for example after a 
 
 ## Identity, provenance and freshness
 
-- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Different observations with the same PR/provider/capture time conflict because their order is ambiguous.
+- `review_evidence_snapshots` binds each observation to a cycle's installation, repository, PR and head. A length-prefixed canonical fingerprint rejects UUID reuse with changed content. Exact retries return `false`; newly committed observations return `true`. Independent reads with the same PR, provider and capture time conflict because their order is ambiguous. Disjoint rounds from one sandbox read share its capture time and commit together.
 - `review_evidence_sources` retains every supplied review, thread and comment revision: provider node IDs, review/thread/reply relationships, author login, source update time, review state, file/line/original line, severity and SHA-256 of the body. Bodies and private diffs are neither persisted nor logged. A hash detects revisions; it cannot reconstruct deleted text. `github-node:<id>` references remain on finding occurrences. Provider is `github`; the source author preserves reviewer attribution, without claiming Codex billing identity.
 - Each root inline comment is a **candidate** finding with one stable `finding_identities.id`, scoped by installation/repository/PR/provider/source kind/comment ID. Replies and empty threads remain evidence only. General summaries/comments follow the separate issue #17 contract. Severity defaults to `UNKNOWN`; an optional explicit classification map supplies severity by comment node ID. No prose, approval or “looks good” text can set a disposition. Classification is advisory data for future policy.
 - `findings` keeps one occurrence per cycle/source and links it to the stable identity and latest source snapshot for that occurrence. Reusing the same comment across rounds shares identity; edits do not create new findings. New comments, even with identical text or a shared path, remain separate candidates. Semantic correlation of distinct provider comments is deliberately unsupported.
@@ -109,3 +109,10 @@ Tests cover metadata provenance and edits, stale/outdated threads, resolution be
 On 2026-11-19, the scheduled worker processed two locally signed loopback deliveries, one `pull_request_review` and one `pull_request_review_comment`, against live GitHub evidence from one approved sandbox PR. At the pinned head it persisted one formal review and six open inline findings. The two observations shared stable finding identities. Each exact replay returned `200 DUPLICATE` with the original correlation ID. The sandbox recorded zero review requests, outbound commands, notices and verified fixes.
 
 Subsequent sandbox runs verified GitHub-originated review and comment edits with redelivery, one author-authorized general acknowledgment, and [one inline fix against a corrective commit](fix-correlation.md#verify-an-inline-fix-in-the-sandbox). The complete authorized live cycle and authenticated provider completion remain pending for issue #23.
+
+The worker joins GitHub GraphQL `id` to REST `node_id` for reviews and inline
+comments, including when the REST review ID exceeds 32 bits. A current-head
+read can retain prior inline threads. Each such thread and its replies stay
+in the root comment's originating round, with the current head recorded
+separately as the observed SHA. An unchanged refresh preserves a verified
+disposition, while edits reopen the finding. [GitHub global node IDs](https://docs.github.com/en/graphql/guides/using-global-node-ids)

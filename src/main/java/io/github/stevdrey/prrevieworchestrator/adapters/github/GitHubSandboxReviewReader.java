@@ -33,7 +33,7 @@ public final class GitHubSandboxReviewReader implements SandboxReviewReconciler.
                   }
                   reviews(first:30) {
                     totalCount pageInfo { hasNextPage }
-                    nodes { id databaseId state body updatedAt author { __typename login } }
+                    nodes { id state body updatedAt author { __typename login } }
                   }
                   reviewThreads(first:30) {
                     totalCount pageInfo { hasNextPage }
@@ -42,7 +42,7 @@ public final class GitHubSandboxReviewReader implements SandboxReviewReconciler.
                       comments(first:30) {
                         totalCount pageInfo { hasNextPage }
                         nodes {
-                          id databaseId body updatedAt author { __typename login } path line originalLine
+                          id body updatedAt author { __typename login } path line originalLine
                           pullRequestReview { id } replyTo { id }
                         }
                       }
@@ -109,26 +109,26 @@ public final class GitHubSandboxReviewReader implements SandboxReviewReconciler.
         }
     }
 
-    private void joinCommitEvidence(JsonNode pull, Map<Long, JsonNode> restReviews, Map<Long, JsonNode> restComments) {
+    private void joinCommitEvidence(JsonNode pull, Map<String, JsonNode> restReviews, Map<String, JsonNode> restComments) {
         var reviewIds = new HashMap<String, Long>();
         for (var review : complete(pull.path("reviews"))) {
-            long id = positiveId(review.path("databaseId"));
-            var match = restReviews.remove(id);
+            String nodeId = nodeId(review.path("id"));
+            var match = restReviews.remove(nodeId);
             require(match != null && review.path("state").equals(match.path("state"))
                     && review.path("body").equals(match.path("body")));
             setCommit(review, "commit", match, "commit_id");
-            require(reviewIds.putIfAbsent(review.path("id").asString(), id) == null);
+            require(reviewIds.putIfAbsent(nodeId, positiveId(match.path("id"))) == null);
         }
         for (var thread : complete(pull.path("reviewThreads"))) {
             for (var comment : complete(thread.path("comments"))) {
-                var match = restComments.remove(positiveId(comment.path("databaseId")));
+                var match = restComments.remove(nodeId(comment.path("id")));
                 require(match != null && comment.path("body").equals(match.path("body"))
                         && comment.path("updatedAt").equals(match.path("updated_at"))
                         && comment.path("path").equals(match.path("path")));
                 var graphReview = comment.path("pullRequestReview");
                 var restReview = match.path("pull_request_review_id");
                 require(graphReview.isNull() ? restReview.isNull()
-                        : Objects.equals(reviewIds.get(graphReview.path("id").asString()), positiveId(restReview)));
+                        : Objects.equals(reviewIds.get(nodeId(graphReview.path("id"))), positiveId(restReview)));
                 setCommit(comment, "commit", match, "commit_id");
                 setCommit(comment, "originalCommit", match, "original_commit_id");
             }
@@ -136,12 +136,17 @@ public final class GitHubSandboxReviewReader implements SandboxReviewReconciler.
         require(restReviews.isEmpty() && restComments.isEmpty());
     }
 
-    private Map<Long, JsonNode> indexedRestCollection(Policy policy, String path, InstallationToken token, long deadline) {
+    private Map<String, JsonNode> indexedRestCollection(Policy policy, String path, InstallationToken token, long deadline) {
         var items = github.get(policy, path + "?per_page=" + REST_PAGE_LIMIT, token, deadline);
         require(items.isArray() && items.size() < REST_PAGE_LIMIT);
-        var indexed = new HashMap<Long, JsonNode>();
-        for (var item : items) require(indexed.putIfAbsent(positiveId(item.path("id")), item) == null);
+        var indexed = new HashMap<String, JsonNode>();
+        for (var item : items) require(indexed.putIfAbsent(nodeId(item.path("node_id")), item) == null);
         return indexed;
+    }
+
+    private String nodeId(JsonNode id) {
+        require(id.isString() && !id.asString().isBlank());
+        return id.asString();
     }
 
     private JsonNode complete(JsonNode connection) {

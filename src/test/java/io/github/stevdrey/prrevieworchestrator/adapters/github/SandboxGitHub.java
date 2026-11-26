@@ -110,7 +110,8 @@ final class SandboxGitHub implements AutoCloseable {
             } else if (route.equals("POST /graphql") && app && review != null) {
                 var query = json.readTree(exchange.getRequestBody().readAllBytes());
                 if (!query.path("variables").equals(json.valueToTree(Map.of(
-                        "owner", "sandbox", "repo", "review-fixture", "number", 7)))) {
+                        "owner", "sandbox", "repo", "review-fixture", "number", 7)))
+                        || query.path("query").asString().split("\\bdatabaseId\\b", -1).length != 2) {
                     reject(exchange, route);
                     return;
                 }

@@ -16,16 +16,19 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import tools.jackson.databind.JsonNode;
 
-/** One explicit, read-only OAuth probe. Its token is never returned or installed as a dispatch credential. */
+/** One explicit OAuth device grant. The public probe API returns scope evidence only. */
 public final class GitHubSandboxDeviceOAuth {
     private static final URI GITHUB = URI.create("https://github.com/");
     private static final URI API = URI.create("https://api.github.com/");
     private static final URI VERIFICATION = URI.create("https://github.com/login/device");
     private static final Duration DEADLINE = Duration.ofSeconds(3);
     private static final Set<String> READ_PERMISSIONS = Set.of("metadata", "pull_requests", "actions", "checks");
+
+    public enum Access { READ_ONLY, PULL_REQUESTS_WRITE }
 
     public record Scope(PullRequestId pr, String repository, String head, long actorId) {
         public Scope {
@@ -54,6 +57,7 @@ public final class GitHubSandboxDeviceOAuth {
     private final Clock clock;
     private final String clientId;
     private final Scope scope;
+    private final Access access;
     private final URI github;
     private final URI api;
     private final HttpClient http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER)
@@ -62,12 +66,18 @@ public final class GitHubSandboxDeviceOAuth {
     private boolean started;
 
     public GitHubSandboxDeviceOAuth(RepositoryAuthorization authorization, Clock clock, String clientId, Scope scope) {
-        this(authorization, clock, clientId, scope, GITHUB, API);
+        this(authorization, clock, clientId, scope, Access.READ_ONLY);
+    }
+
+    public GitHubSandboxDeviceOAuth(RepositoryAuthorization authorization, Clock clock, String clientId, Scope scope,
+            Access access) {
+        this(authorization, clock, clientId, scope, access, GITHUB, API);
     }
 
     GitHubSandboxDeviceOAuth(RepositoryAuthorization authorization, Clock clock, String clientId, Scope scope,
-            URI github, URI api) {
+            Access access, URI github, URI api) {
         if (clientId == null || !clientId.matches("[A-Za-z0-9.]{8,80}")
+                || access == null
                 || !(GITHUB.equals(github) && API.equals(api) || loopback(github) && loopback(api))) {
             throw new IllegalArgumentException("Invalid GitHub OAuth configuration");
         }
@@ -75,6 +85,7 @@ public final class GitHubSandboxDeviceOAuth {
         this.clock = clock;
         this.clientId = clientId;
         this.scope = scope;
+        this.access = access;
         this.github = github;
         this.api = api;
     }
@@ -96,6 +107,10 @@ public final class GitHubSandboxDeviceOAuth {
     }
 
     public synchronized Progress poll(UUID operatorSession) {
+        return poll(operatorSession, (token, expiry) -> {});
+    }
+
+    synchronized Progress poll(UUID operatorSession, BiConsumer<String, Instant> verifiedGrant) {
         var current = attempt;
         require(current != null && current.operatorSession().equals(operatorSession));
         if (!clock.instant().isBefore(current.expiresAt())) {
@@ -105,6 +120,7 @@ public final class GitHubSandboxDeviceOAuth {
         authorization.requireAuthorized(scope.pr().scope());
         if (clock.instant().isBefore(current.nextPoll())) return new Progress(current.nextPoll(), null);
         attempt = null;
+        var requestedAt = clock.instant();
         var reply = exchange(form(github.resolve("login/oauth/access_token"), Map.of(
                 "client_id", clientId, "device_code", current.deviceCode(),
                 "grant_type", "urn:ietf:params:oauth:grant-type:device_code",
@@ -123,32 +139,22 @@ public final class GitHubSandboxDeviceOAuth {
         }
         require(!reply.has("error") && clock.instant().isBefore(current.expiresAt()));
         String token = reply.path("access_token").asString();
+        long expires = number(reply.path("expires_in"));
         require(token.matches("ghu_[A-Za-z0-9_]{12,512}") && "bearer".equalsIgnoreCase(reply.path("token_type").asString())
                 && reply.path("scope").isString() && reply.path("scope").asString().isEmpty()
-                && number(reply.path("expires_in")) <= 28_800);
-        return new Progress(null, verify(token));
+                && expires <= 28_800);
+        var result = verify(token);
+        var expiresAt = requestedAt.plusSeconds(expires);
+        require(expiresAt.isAfter(clock.instant()));
+        verifiedGrant.accept(token, expiresAt);
+        return new Progress(null, result);
     }
 
     private Result verify(String token) {
         var pr = scope.pr();
         var identity = get("user", token);
         require(number(identity.path("id")) == scope.actorId() && "User".equals(identity.path("type").asString()));
-        var installation = only(get("user/installations?per_page=2", token), "installations");
-        require(number(installation.path("id")) == pr.scope().installationId()
-                && "selected".equals(installation.path("repository_selection").asString())
-                && installation.path("suspended_at").isNull());
-        var permissions = installation.path("permissions");
-        require("read".equals(permissions.path("metadata").asString())
-                && "read".equals(permissions.path("pull_requests").asString()));
-        var names = permissions.propertyNames().iterator();
-        while (names.hasNext()) {
-            String name = names.next();
-            require(READ_PERMISSIONS.contains(name) && "read".equals(permissions.path(name).asString()));
-        }
-        var repository = only(get("user/installations/" + pr.scope().installationId() + "/repositories?per_page=2", token),
-                "repositories");
-        require(number(repository.path("id")) == pr.scope().repositoryId()
-                && scope.repository().equalsIgnoreCase(repository.path("full_name").asString()));
+        verifyInstallationAndRepository(token, DEADLINE);
         var remote = get("repos/" + scope.repository() + "/pulls/" + pr.number(), token);
         require(number(remote.path("number")) == pr.number() && "open".equals(remote.path("state").asString())
                 && remote.path("draft").isBoolean() && !remote.path("draft").asBoolean()
@@ -159,6 +165,30 @@ public final class GitHubSandboxDeviceOAuth {
         return new Result(scope.actorId(), pr, scope.head());
     }
 
+    void verifyInstallationAndRepository(String token, Duration deadline) {
+        var pr = scope.pr();
+        var installation = only(get("user/installations?per_page=2", token, deadline), "installations");
+        require(number(installation.path("id")) == pr.scope().installationId()
+                && "selected".equals(installation.path("repository_selection").asString())
+                && installation.path("suspended_at").isNull());
+        var permissions = installation.path("permissions");
+        require(permissions.isObject() && "read".equals(permissions.path("metadata").asString()));
+        if (access == Access.PULL_REQUESTS_WRITE) {
+            require(permissions.size() == 2 && "write".equals(permissions.path("pull_requests").asString()));
+        } else {
+            require("read".equals(permissions.path("pull_requests").asString()));
+            var names = permissions.propertyNames().iterator();
+            while (names.hasNext()) {
+                String name = names.next();
+                require(READ_PERMISSIONS.contains(name) && "read".equals(permissions.path(name).asString()));
+            }
+        }
+        var repository = only(get("user/installations/" + pr.scope().installationId() + "/repositories?per_page=2", token, deadline),
+                "repositories");
+        require(number(repository.path("id")) == pr.scope().repositoryId()
+                && scope.repository().equalsIgnoreCase(repository.path("full_name").asString()));
+    }
+
     private JsonNode only(JsonNode body, String property) {
         var list = body.path(property);
         require(number(body.path("total_count")) == 1 && list.isArray() && list.size() == 1);
@@ -166,7 +196,11 @@ public final class GitHubSandboxDeviceOAuth {
     }
 
     private JsonNode get(String path, String token) {
-        return exchange(HttpRequest.newBuilder(api.resolve(path)).timeout(DEADLINE)
+        return get(path, token, DEADLINE);
+    }
+
+    private JsonNode get(String path, String token, Duration deadline) {
+        return exchange(HttpRequest.newBuilder(api.resolve(path)).timeout(deadline)
                 .header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2026-03-10")
                 .header("Authorization", "Bearer " + token).GET().build());
     }
@@ -183,7 +217,7 @@ public final class GitHubSandboxDeviceOAuth {
         var task = http.sendAsync(request, info -> info.statusCode() == 200
                 ? new GitHubInstallationTokens.BoundedBody() : HttpResponse.BodySubscribers.replacing(""));
         try {
-            var reply = task.get(DEADLINE.toMillis(), TimeUnit.MILLISECONDS);
+            var reply = task.get(request.timeout().orElseThrow().toMillis(), TimeUnit.MILLISECONDS);
             require(reply.statusCode() == 200 && reply.headers().firstValue("Link").isEmpty());
             var body = GitHubSandboxReadClient.JSON.readTree(reply.body());
             require(body != null && body.isObject());

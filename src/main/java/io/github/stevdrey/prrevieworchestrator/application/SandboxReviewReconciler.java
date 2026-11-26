@@ -2,6 +2,7 @@ package io.github.stevdrey.prrevieworchestrator.application;
 
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler.Policy;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.Snapshot;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
 import java.nio.charset.StandardCharsets;
@@ -40,10 +41,13 @@ public final class SandboxReviewReconciler {
         this.authorization = authorization;
         this.reader = reader;
         this.commit = commit;
-        var pr = policy.pr();
+        cycleId = cycleId(policy.pr(), policy.head());
+    }
+
+    public static UUID cycleId(PullRequestId pr, String head) {
         String cycleKey = STAGE + "/" + pr.scope().installationId() + "/" + pr.scope().repositoryId()
-                + "/" + pr.number() + "/" + policy.head();
-        cycleId = UUID.nameUUIDFromBytes(cycleKey.getBytes(StandardCharsets.UTF_8));
+                + "/" + pr.number() + "/" + head;
+        return UUID.nameUUIDFromBytes(cycleKey.getBytes(StandardCharsets.UTF_8));
     }
 
     public boolean handles(Event event) {

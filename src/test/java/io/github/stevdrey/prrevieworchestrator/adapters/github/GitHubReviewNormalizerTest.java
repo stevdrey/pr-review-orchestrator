@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.json.JsonMapper;
 
 class GitHubReviewNormalizerTest {
     static final String HEAD = "a".repeat(40);
@@ -179,6 +180,59 @@ class GitHubReviewNormalizerTest {
         assertEquals(ReviewOutcome.Verdict.UNKNOWN,
                 classifier.classify(run, 2, completion, staleSnapshot, ReviewOutcome.PendingFindings.CLEAR).verdict());
     }
+
+    @Test
+    void sandboxPr35SummaryAndReceiptCannotEstablishExactBaselineCompletion() {
+        var pr = new PullRequestId(new RepositoryScope(186026285, 1469482362), 35);
+        var head = "42017af3b3957157e707c9c6e72c5b44c24051e4";
+        var bot = "chatgpt-codex-connector[bot]";
+        var summaryId = "7182106453";
+        var receiptId = "7184425421";
+        var comments = List.of(
+                Map.of("id", "7184384751", "author", Map.of("login", "stevdrey"),
+                        "updatedAt", "2026-11-26T06:23:35Z", "body", "@codex review"),
+                Map.of("id", summaryId, "author", Map.of("login", bot),
+                        "updatedAt", "2026-11-26T06:26:07Z", "body", """
+                            <!-- codex-review-state:v1
+                            {"code_review":{"commit_sha":"%s","status":"completed",
+                            "has_any_findings":false,"has_unresolved_findings":false}}
+                            -->
+                            """.formatted(head)),
+                Map.of("id", receiptId, "author", Map.of("login", bot),
+                        "updatedAt", "2026-11-26T06:26:05Z", "body",
+                        "<!-- codex-review-receipt:v1 -->\n**Reviewed commit:** `42017af3b3`"));
+        var json = JsonMapper.builder().build();
+        var response = """
+                {"data":{"repository":{"databaseId":1469482362,"pullRequest":{
+                    "number":35,"headRefOid":"%s",
+                    "reviews":{"pageInfo":{"hasNextPage":false},"nodes":[]},
+                    "reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[]},
+                    "comments":{"pageInfo":{"hasNextPage":false},"nodes":%s}}}}}
+                """.formatted(head, json.writeValueAsString(comments));
+        var cycleId = UUID.randomUUID();
+        var snapshot = normalizer.normalize(UUID.randomUUID(), cycleId, pr, head,
+                Instant.parse("2026-11-26T06:30:00Z"), response.getBytes(StandardCharsets.UTF_8));
+        var run = new ReviewOutcome.Run(pr, head, "codex", ReviewOutcome.Stage.BASELINE,
+                UUID.fromString("1b416560-e011-4113-a23a-56486497574e"), cycleId, "github", bot);
+        var classifier = new ReviewOutcomeClassifier();
+        var uncorrelated = classifier.classify(run, 0, null, snapshot, ReviewOutcome.PendingFindings.CLEAR);
+        assertEquals(ReviewOutcome.Reason.MISSING_COMPLETION, uncorrelated.reason());
+        assertEquals(ReviewOutcome.Verdict.UNKNOWN, uncorrelated.verdict());
+        for (String id : List.of(summaryId, receiptId)) {
+            var comment = source(snapshot, id);
+            assertEquals(Kind.ISSUE_COMMENT, comment.kind());
+            assertEquals(Feedback.NEEDS_HUMAN, comment.feedback());
+            assertNull(comment.reviewedSha());
+            assertNull(comment.replyToId());
+            var claimed = new ReviewOutcome.Completion(run, id, ReviewOutcome.Status.COMPLETED,
+                    ReviewOutcome.Conclusion.NO_FINDINGS);
+            var result = classifier.classify(run, 0, claimed, snapshot, ReviewOutcome.PendingFindings.CLEAR);
+            assertEquals(ReviewOutcome.Reason.MISSING_REVIEW, result.reason());
+            assertEquals(ReviewOutcome.Verdict.UNKNOWN, result.verdict());
+            assertTrue(classifier.progressEvidence(run, claimed, snapshot, Set.of(), Set.of()).isEmpty());
+        }
+    }
+
     private Source source(Snapshot s, String id) {
         return s.sources().stream().filter(source -> source.id().equals(id)).findFirst().orElseThrow();
     }
