@@ -29,7 +29,11 @@ final class SandboxRepository {
     }
 
     boolean changed(String base, String head) throws IOException, InterruptedException {
-        return !git("rev-parse", base + "^{tree}").equals(git("rev-parse", head + "^{tree}"));
+        return !tree(base).equals(tree(head));
+    }
+
+    String tree(String sha) throws IOException, InterruptedException {
+        return git("rev-parse", sha + "^{tree}");
     }
 
     boolean verifiesFix(String base, String head) throws IOException, InterruptedException {

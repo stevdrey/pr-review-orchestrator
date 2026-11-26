@@ -36,6 +36,7 @@ final class SandboxGitHub implements AutoCloseable {
     private final Instant tokenExpiry;
     private volatile String head;
     private volatile boolean rejectCommentReceipt;
+    private volatile Map<String, String> trees = Map.of();
     private volatile List<Map<String, Object>> workflowRuns = List.of();
     private final AtomicInteger actionReads = new AtomicInteger();
     private final AtomicInteger reviewReads = new AtomicInteger();
@@ -73,6 +74,10 @@ final class SandboxGitHub implements AutoCloseable {
         rejectCommentReceipt = true;
     }
 
+    void trees(Map<String, String> trees) {
+        this.trees = Map.copyOf(trees);
+    }
+
     void workflowRuns(List<Map<String, Object>> runs) {
         workflowRuns = List.copyOf(runs);
     }
@@ -99,6 +104,10 @@ final class SandboxGitHub implements AutoCloseable {
                 send(exchange, 200, Map.of("number", 7, "state", "open", "draft", false, "locked", false,
                         "head", Map.of("sha", head, "repo", Map.of("id", 1001)), "base", Map.of("repo", Map.of("id", 1001)),
                         "user", Map.of("id", 52, "type", "User", "login", "fixture-author"), "body", PRIVATE_TEXT));
+            } else if (route.startsWith("GET /repos/" + REPOSITORY + "/git/commits/") && app
+                    && trees.containsKey(path.substring(path.lastIndexOf('/') + 1))) {
+                String sha = path.substring(path.lastIndexOf('/') + 1);
+                send(exchange, 200, Map.of("sha", sha, "tree", Map.of("sha", trees.get(sha))));
             } else if (route.equals("GET /repos/" + REPOSITORY + "/actions/runs") && app) {
                 if (!("head_sha=" + head + "&event=pull_request&per_page=100").equals(exchange.getRequestURI().getQuery())) {
                     reject(exchange, route);
@@ -142,7 +151,7 @@ final class SandboxGitHub implements AutoCloseable {
                 var permissions = scope.path("permissions");
                 if (!scope.path("repository_ids").equals(json.valueToTree(List.of(1001)))
                         || !Set.of(NOTICE_PERMISSIONS, GitHubReadOperation.PULL_REQUESTS.permissions(),
-                                GitHubReadOperation.WORKFLOWS.permissions()).stream()
+                                GitHubReadOperation.WORKFLOWS.permissions(), GitHubReadOperation.CONTENTS.permissions()).stream()
                                 .anyMatch(expected -> permissions.equals(json.valueToTree(expected)))) {
                     reject(exchange, route);
                     return;

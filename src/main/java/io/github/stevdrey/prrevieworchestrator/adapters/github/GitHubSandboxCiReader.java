@@ -1,9 +1,12 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.github;
 
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
-import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler;
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler.Policy;
+import io.github.stevdrey.prrevieworchestrator.application.SandboxReviewPlanning;
 import io.github.stevdrey.prrevieworchestrator.domain.CiEvidence;
+import io.github.stevdrey.prrevieworchestrator.domain.CommitSha;
+import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Comparison;
+import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Head;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.ErrorCode;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Failure;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
@@ -21,7 +24,7 @@ import java.util.stream.Collectors;
 import tools.jackson.databind.JsonNode;
 
 /** Scoped GitHub reads for the sandbox worker. Only fully observed policy dependencies can pass. */
-public final class GitHubSandboxCiReader implements SandboxCiReconciler.Reader {
+public final class GitHubSandboxCiReader implements SandboxReviewPlanning.Reader {
     private static final int PAGE_LIMIT = 100;
     private final GitHubInstallationTokens tokens;
     private final GitHubSandboxReadClient github;
@@ -34,6 +37,38 @@ public final class GitHubSandboxCiReader implements SandboxCiReconciler.Reader {
     GitHubSandboxCiReader(GitHubInstallationTokens tokens, URI api) {
         this.tokens = tokens;
         this.github = new GitHubSandboxReadClient(api, tokens);
+    }
+
+    @Override
+    public Optional<Head> readHead(Policy policy) {
+        var deadline = github.observationDeadline();
+        var token = issue(policy, GitHubReadOperation.PULL_REQUESTS);
+        try {
+            return github.readHead(policy, token, deadline);
+        } finally {
+            tokens.revoke(token);
+        }
+    }
+
+    @Override
+    public Comparison compare(Policy policy, String baseSha) {
+        var deadline = github.observationDeadline();
+        var token = issue(policy, GitHubReadOperation.CONTENTS);
+        try {
+            String base = treeSha(policy, baseSha, token, deadline);
+            String head = treeSha(policy, policy.head(), token, deadline);
+            return new Comparison(baseSha, policy.head(), !base.equals(head));
+        } finally {
+            tokens.revoke(token);
+        }
+    }
+
+    private String treeSha(Policy policy, String sha, InstallationToken token, long deadline) {
+        CommitSha.require(sha);
+        var commit = github.get(policy, "repos/" + policy.repository() + "/git/commits/" + sha, token, deadline);
+        String tree = commit.path("tree").path("sha").asString();
+        if (!sha.equals(commit.path("sha").asString()) || !CommitSha.isValid(tree)) throw unavailable();
+        return tree;
     }
 
     @Override

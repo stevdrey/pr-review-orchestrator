@@ -4,6 +4,8 @@ import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
 import java.time.Duration;
+import java.time.Instant;
+import java.sql.Timestamp;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -120,16 +122,36 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     /** The local write shares the inbox claim transaction. It must use the same transaction manager. */
     boolean completeLocalEvent(Event event, Runnable authorize, Runnable localWrite) {
-        return transaction(() -> {
-            if (!lock(event.lease())) return false;
-            authorize.run();
+        return withEvent(event, authorize, () -> {
             localWrite.run();
-            finish(event.lease(), "PROCESSED", null);
+            finishEvent(event);
             return true;
+        }).orElse(false);
+    }
+
+    <T> Optional<T> withEvent(Event event, Runnable authorize, Supplier<T> operation) {
+        return transaction(() -> {
+            if (!lock(event.lease())) return Optional.empty();
+            authorize.run();
+            return Optional.of(operation.get());
         });
     }
 
-    private void enqueue(Event event, Intent intent) {
+    void finishEvent(Event event) {
+        finish(event.lease(), "PROCESSED", null);
+    }
+
+    void deferEvent(Event event, Instant retryAt) {
+        var lease = event.lease();
+        jdbc.update("""
+                UPDATE inbox_events SET status = 'PENDING', available_at = ?, locked_by = NULL,
+                    locked_until = NULL, lease_token = NULL, last_error_code = NULL
+                WHERE id = ?
+                """, Timestamp.from(retryAt), lease.id());
+        journal(lease, "RETRY", null);
+    }
+
+    void enqueue(Event event, Intent intent) {
         var scope = event.scope();
         UUID cycle = UUID.randomUUID();
         jdbc.update("""

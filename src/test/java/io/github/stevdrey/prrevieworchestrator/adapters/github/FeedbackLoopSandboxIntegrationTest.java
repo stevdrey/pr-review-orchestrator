@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcAuthorNoticeStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcFixCorrelationStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewPlanning;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRequestStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
@@ -15,10 +17,15 @@ import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxR
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Command;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.RemoteEffect;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.RemoteState;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
+import io.github.stevdrey.prrevieworchestrator.ports.CommandGateway;
+import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Result;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
@@ -44,6 +51,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.AfterAll;
@@ -148,6 +158,7 @@ class FeedbackLoopSandboxIntegrationTest {
     @Autowired RepositoryAuthorization authorization;
     @Autowired ReviewLifecycle lifecycle;
     @Autowired CorrelateFixes fixes;
+    @Autowired JdbcFixCorrelationStore fixStore;
     @Autowired DisposeGeneralFeedback feedback;
     @Autowired IngestReviewEvidence evidence;
     @Autowired AssessReviewOutcome outcomes;
@@ -176,6 +187,9 @@ class FeedbackLoopSandboxIntegrationTest {
         requests = new JdbcReviewRequestStore(jdbc, transactions, states);
         repository = new SandboxRepository(directory);
         github = new SandboxGitHub(repository.openedSha, clock.instant().plus(TOKEN_LIFETIME));
+        github.trees(Map.of(repository.openedSha, repository.tree(repository.openedSha),
+                repository.fixedSha, repository.tree(repository.fixedSha),
+                repository.followUpSha, repository.tree(repository.followUpSha)));
         webhookClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
 
         var keys = KeyPairGenerator.getInstance("RSA");
@@ -269,6 +283,210 @@ class FeedbackLoopSandboxIntegrationTest {
         assertEquals(1, count("pr_review_transitions"));
         assertEquals(2, jdbc.queryForObject("SELECT attempts FROM inbox_events WHERE status='PROCESSED'", Integer.class));
         assertEquals(0, count("outbox_commands"));
+    }
+
+    @Test
+    void signedPushesCoalesceAndConcurrentCiEventsPlanOneIntentForTheLatestHead() throws Exception {
+        var round = startRemediation();
+        var worker = planningWorker((pr, intent) -> true, 6);
+        String first = repository.fixedSha;
+        String latest = repository.followUpSha;
+        check(repository.openedSha, Ci.PASSED);
+        github.push(first);
+        var delivery = UUID.randomUUID();
+        String push = pullWebhook("synchronize", first);
+        assertEquals(202, signed("pull_request", delivery, push).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(first, current().headSha());
+        assertEquals(Ci.UNKNOWN, current().ci());
+        assertEquals(200, signed("pull_request", delivery, push).statusCode());
+        assertFalse(worker.processEvent(), "assessment is durably deferred during the quiet period");
+
+        github.push(latest);
+        String latestPush = pullWebhook("synchronize", latest);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), latestPush).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(latest, current().headSha());
+        var current = current();
+        String delayed = prEnvelope("synchronize", first, ",\"number\":7,\"before\":\""
+                + repository.openedSha + "\"");
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), delayed).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(current, current());
+        assertEquals(0, count("outbox_commands"));
+
+        dispose(round, GeneralFeedback.Action.CLAIM_FIXED, latest);
+        successfulWorkflows();
+        jdbc.update("UPDATE inbox_events SET available_at=clock_timestamp() WHERE status='PENDING' AND head_sha=?", first);
+        assertTrue(worker.processEvent(), "the superseded assessment completes without comparing trees or planning");
+        assertEquals(0, count("outbox_commands"));
+        agePlanning();
+        assertEquals(202, signed("workflow_run", UUID.randomUUID(), ciWebhook("workflow_run", latest, 30)).statusCode());
+        // The due synchronize delivery and the CI event target the same SHA on independent workers.
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            var one = workers.submit(worker::processEvent);
+            var two = workers.submit(planningWorker((pr, intent) -> true, 6)::processEvent);
+            assertTrue(one.get(20, TimeUnit.SECONDS));
+            assertTrue(two.get(20, TimeUnit.SECONDS));
+        }
+        drainPlanning(worker);
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(1, count("outbox_commands"));
+        assertEquals(1, count("fix_review_candidates"));
+        assertEquals(1, count("review_requests"), "only the initial fixture reservation exists");
+        assertEquals(Map.of("expected_head_sha", latest, "stage", "BASELINE",
+                "target_provider", "codex", "command_type", "REQUEST_REVIEW"), jdbc.queryForMap("""
+                SELECT o.expected_head_sha, c.stage, o.target_provider, o.command_type
+                FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
+                """));
+        assertFalse(worker.processCommand(), "the sandbox planner never dispatches");
+
+        var stub = new CommandGateway() {
+            private final Set<String> effects = new HashSet<>();
+
+            @Override public boolean supports(Command command) { return command.intent().type().equals("REQUEST_REVIEW"); }
+
+            @Override public RemoteState reconcile(Command command) {
+                var effect = effects.contains(command.key()) ? RemoteEffect.APPLIED : RemoteEffect.ABSENT;
+                return new RemoteState(github.head(), effect);
+            }
+
+            @Override public void execute(Command command) { assertTrue(effects.add(command.key())); }
+        };
+        var stubDispatcher = new DurableDispatcher(queue, authorization, event -> List.of(), stub);
+        assertTrue(stubDispatcher.processCommand());
+        assertFalse(stubDispatcher.processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void currentCiAndDispositionsMustPassBeforeBudgetCanPermitAnIntent() throws Exception {
+        var round = startRemediation();
+        var permit = new AtomicBoolean();
+        var worker = planningWorker((pr, intent) -> permit.get(), 6);
+        String head = repository.fixedSha;
+        github.push(head);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("synchronize", head)).statusCode());
+        assertTrue(worker.processEvent());
+        agePlanning();
+        successfulWorkflows();
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(0, count("outbox_commands"), "general feedback has no disposition");
+
+        dispose(round, GeneralFeedback.Action.CLAIM_FIXED, head);
+        permit.set(true);
+        github.workflowRuns(List.of(workflow(21, 1, 1, "completed", "failure"),
+                workflow(22, 1, 1, "completed", "success")));
+        assertEquals(202, signed("workflow_run", UUID.randomUUID(), ciWebhook("workflow_run", head, 31)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.FAILED, current().ci());
+        assertEquals(0, count("outbox_commands"), "fresh failure supersedes the earlier passing CI");
+        assertEquals(202, signed("workflow_run", UUID.randomUUID(),
+                ciWebhook("workflow_run", repository.openedSha, 32)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.FAILED, current().ci());
+        assertEquals(0, count("outbox_commands"));
+
+        successfulWorkflows();
+        step(PAUSE, OPEN);
+        assertEquals(202, signed("workflow_run", UUID.randomUUID(), ciWebhook("workflow_run", head, 33)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(PAUSED, current().state());
+        assertEquals(0, count("outbox_commands"));
+        step(RESUME, OPEN);
+
+        permit.set(false);
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 34)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(0, count("outbox_commands"), "the budget gate denies this exact intent");
+        permit.set(true);
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 35)).statusCode());
+        assertTrue(planningWorker((pr, intent) -> permit.get(), 1).processEvent());
+        assertEquals(PAUSED, current().state());
+        assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, current().intervention());
+        assertEquals(0, count("outbox_commands"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void synchronizeInvalidatesCleanEvidenceAndReadinessFromTheEarlierHead() throws Exception {
+        openReview();
+        step(BASELINE_CLEAN, OPEN);
+        step(DEEP_CLEAN, OPEN);
+        check(repository.openedSha, Ci.PASSED);
+        step(MARK_READY_FOR_HUMAN, OPEN);
+        assertEquals(READY_FOR_HUMAN, current().state());
+
+        github.push(repository.fixedSha);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(),
+                pullWebhook("synchronize", repository.fixedSha)).statusCode());
+        var worker = planningWorker((pr, intent) -> true, 6);
+        assertTrue(worker.processEvent());
+        var next = current();
+        assertEquals(repository.fixedSha, next.headSha());
+        assertEquals(WAITING_FOR_REVIEW, next.state());
+        assertEquals(Ci.UNKNOWN, next.ci());
+        assertNull(next.baselineCleanSha());
+        assertNull(next.deepCleanSha());
+        assertEquals(0, count("outbox_commands"), "a new head alone does not establish remediation");
+        assertFalse(worker.processEvent());
+    }
+
+    @Test
+    void rejectedOrRevokedScopeCannotAdvanceTheTrackedHead() throws Exception {
+        startRemediation();
+        var worker = planningWorker((pr, intent) -> true, 6);
+        var before = current();
+        github.push(repository.fixedSha);
+        String push = pullWebhook("synchronize", repository.fixedSha);
+        assertEquals(403, signed("pull_request", UUID.randomUUID(), push.replace(
+                "\"id\":1001", "\"id\":2002")).statusCode());
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), push).statusCode());
+        jdbc.update("UPDATE installation_repositories SET enabled=false");
+        assertTrue(worker.processEvent());
+        assertEquals("AUTHORIZATION_DENIED", jdbc.queryForObject("""
+                SELECT last_error_code FROM inbox_events WHERE status='DEAD'
+                """, String.class));
+        jdbc.update("UPDATE installation_repositories SET enabled=true");
+        assertEquals(before, current());
+        assertEquals(0, count("outbox_commands"));
+    }
+
+    private Assessment startRemediation() throws Exception {
+        var first = openReview();
+        requests.reserve(first, 42, 6, this::authorize, () -> {});
+        var round = observeRound(first, "R1", Conclusion.FINDINGS);
+        step(BLOCKING_FINDINGS, BLOCKED);
+        step(AWAIT_FIX, OPEN);
+        return round;
+    }
+
+    private DurableDispatcher planningWorker(ReviewIntentPolicy policy, int limit) {
+        var reader = new GitHubSandboxCiReader(tokens, github.uri());
+        var planner = new SandboxReviewPlanning(sandboxPolicy(), queue, authorization, authorization, lifecycle,
+                reader, new JdbcSandboxReviewPlanning(jdbc, queue, states, fixStore, policy, limit));
+        return new DurableDispatcher(queue, authorization, planner::complete);
+    }
+
+    private void successfulWorkflows() {
+        github.workflowRuns(List.of(workflow(21, 2, 1, "completed", "success"),
+                workflow(22, 2, 1, "completed", "success")));
+    }
+
+    private void agePlanning() {
+        ageSynchronize();
+        jdbc.update("UPDATE inbox_events SET available_at=clock_timestamp() WHERE status='PENDING'");
+    }
+
+    private void drainPlanning(DurableDispatcher worker) {
+        for (int i = 0; i < 5; i++) {
+            jdbc.update("UPDATE inbox_events SET available_at=clock_timestamp() WHERE status='PENDING'");
+            if (!worker.processEvent()) break;
+        }
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM inbox_events WHERE status <> 'PROCESSED'", Integer.class));
     }
 
     private DurableDispatcher ciWorker() {
@@ -432,7 +650,7 @@ class FeedbackLoopSandboxIntegrationTest {
     private Map<String, Object> workflow(long workflow, long sequence, long attempt, String status, String conclusion) {
         var repo = Map.of("id", 1001);
         return Map.of("workflow_id", workflow, "id", workflow * 100 + sequence, "run_number", sequence,
-                "run_attempt", attempt, "head_sha", repository.openedSha, "event", "pull_request", "repository", repo,
+                "run_attempt", attempt, "head_sha", github.head(), "event", "pull_request", "repository", repo,
                 "status", status, "conclusion", conclusion,
                 "pull_requests", List.of(Map.of("number", 7, "base", Map.of("repo", repo))));
     }
