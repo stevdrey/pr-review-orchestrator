@@ -20,6 +20,7 @@ import issue_24_tunnel_server as tunnel
 EVENT_NAME = "spike.sample"
 SIGNING_TIME = 1795737600
 KEY = bytes(range(32))  # Public test vector, never a credential.
+EXPECTED_SIGNATURE = "v1,qHO0scQ6Pz3yEJ5mbso0XKDQrMB6qQXm9a5l3V9uwE8="
 SCHEMA = {
     "type": "object",
     "properties": {"sample": {"type": "string"}},
@@ -182,7 +183,7 @@ class ContractProbe(unittest.TestCase):
 
     def test_known_signature_and_modified_body(self):
         body, headers = signed_post("evt-001", self.event(), "test-subscription")
-        self.assertEqual("v1,qHO0scQ6Pz3yEJ5mbso0XKDQrMB6qQXm9a5l3V9uwE8=", headers["webhook-signature"])
+        self.assertEqual(EXPECTED_SIGNATURE, headers["webhook-signature"])
         self.assertEqual(401, self.post(body + b" ", headers)[0])
         self.assertEqual({}, self.callback.received)
 
@@ -197,6 +198,44 @@ class ContractProbe(unittest.TestCase):
         self.assertIn("error", self.subscribe(destination))
         self.assertEqual(0, self.callback.challenges)
         self.assertEqual([], self.publish(self.event()))
+
+
+class PostCallbackTest(unittest.TestCase):
+    def test_post_callback_sends_known_signed_bytes(self):
+        host = "chatgpt.com"
+        address = "8.8.8.8"  # Mocked public DNS answer. The test never connects to it.
+        path = "/synthetic-callback?fixture=1"
+        expected_body = (b'{"eventId":"evt-001","name":"spike.sample","timestamp":"2026-11-27T00:00:00Z",'
+                         b'"data":{"sample":"alpha"},"cursor":null}')
+        expected_headers = {
+            "Content-Type": "application/json",
+            "webhook-id": "evt-001",
+            "webhook-timestamp": str(SIGNING_TIME),
+            "webhook-signature": EXPECTED_SIGNATURE,
+            "X-MCP-Subscription-Id": "test-subscription",
+        }
+
+        with (patch.object(tunnel.time, "time", return_value=SIGNING_TIME),
+              patch.object(tunnel.socket, "getaddrinfo", return_value=[
+                  (tunnel.socket.AF_INET, tunnel.socket.SOCK_STREAM, 0, "", (address, 443))
+              ]),
+              patch.object(tunnel.socket, "create_connection") as dial,
+              patch.object(tunnel.ssl, "create_default_context") as tls,
+              patch.object(tunnel.http.client, "HTTPSConnection") as https):
+            connection = https.return_value
+            connection.getresponse.return_value.status = 204
+
+            self.assertEqual((204, b""), tunnel.post_callback(
+                f"https://{host}{path}", KEY, "test-subscription", "evt-001", json.loads(expected_body)
+            ))
+
+            dial.assert_called_once_with((address, 443), timeout=5)
+            tls.return_value.wrap_socket.assert_called_once_with(
+                dial.return_value.__enter__.return_value, server_hostname=host
+            )
+            https.assert_called_once_with(host, timeout=5)
+            connection.request.assert_called_once_with("POST", path, expected_body, expected_headers)
+            connection.close.assert_called_once_with()
 
 
 class TunnelServerProbe(unittest.TestCase):
