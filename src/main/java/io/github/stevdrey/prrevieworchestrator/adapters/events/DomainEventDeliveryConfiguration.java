@@ -47,10 +47,13 @@ class DomainEventDeliveryConfiguration {
     record Properties(Map<UUID, URI> callbacks, Path signingKeyDirectory) {}
 
     record Ticks(DeliverDomainEvents worker) {
+        /** Drain up to this many deliveries per tick; stop at an empty queue or the first failure. */
+        static final int MAX_PER_TICK = 16;
+
         @Scheduled(fixedDelay = 1000, scheduler = "domainEventScheduler")
         void tick() {
             try {
-                worker.processNext();
+                for (int i = 0; i < MAX_PER_TICK && worker.processNext(); i++) { }
             } catch (RuntimeException ignored) {
                 LoggerFactory.getLogger(Ticks.class).warn("PR domain event delivery failed; see pr_event_deliveries");
             }

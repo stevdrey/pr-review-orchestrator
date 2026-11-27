@@ -31,6 +31,7 @@ public final class JdbcDomainEventQueue implements DomainEventQueue {
 
     public JdbcDomainEventQueue(JdbcTemplate jdbc, PlatformTransactionManager manager) {
         this.jdbc = jdbc;
+        PostgresDeadlines.requireTransactionTimeout(jdbc, "domain events");
         transactions = new TransactionTemplate(manager);
         transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         transactions.setTimeout(Math.toIntExact(TRANSACTION_DEADLINE.toSeconds()));
@@ -108,12 +109,17 @@ public final class JdbcDomainEventQueue implements DomainEventQueue {
             settle(claim, "CANCELLED", "REVOKED");
             return;
         }
+        // A failed authority query aborts the transaction; the savepoint keeps the outcome recordable.
+        jdbc.execute("SAVEPOINT pr_event_authorization");
         try {
             authorize.accept(scope);
+            jdbc.execute("RELEASE SAVEPOINT pr_event_authorization");
         } catch (AuthorizationDenied ignored) {
+            jdbc.execute("RELEASE SAVEPOINT pr_event_authorization");
             settle(claim, "CANCELLED", "AUTHORIZATION_DENIED");
             return;
         } catch (AuthorizationUnavailable ignored) {
+            jdbc.execute("ROLLBACK TO SAVEPOINT pr_event_authorization");
             retry(claim, "AUTHORIZATION_UNAVAILABLE");
             return;
         }
@@ -126,6 +132,7 @@ public final class JdbcDomainEventQueue implements DomainEventQueue {
             case ACKNOWLEDGED -> settle(claim, "DELIVERED", "ACKNOWLEDGED");
             case REJECTED -> settle(claim, "DEAD", "REJECTED");
             case RETRY -> retry(claim, "RETRY");
+            case MISCONFIGURED -> retry(claim, "CONFIGURATION_MISSING");
         }
     }
 

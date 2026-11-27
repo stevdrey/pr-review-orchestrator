@@ -5,7 +5,8 @@ import java.util.UUID;
 
 @FunctionalInterface
 public interface DomainEventPublisher {
-    enum Outcome { ACKNOWLEDGED, RETRY, REJECTED }
+    /** {@code MISCONFIGURED} is retryable, but the cause is local callback or key configuration. */
+    enum Outcome { ACKNOWLEDGED, RETRY, REJECTED, MISCONFIGURED }
 
     /**
      * Publish within the worker's deadline. Use (subscriptionId, eventId) as the same idempotency

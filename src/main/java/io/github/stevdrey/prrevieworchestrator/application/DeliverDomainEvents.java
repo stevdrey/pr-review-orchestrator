@@ -15,7 +15,10 @@ public final class DeliverDomainEvents {
         this.publisher = publisher;
     }
 
-    public void processNext() {
-        queue.claim().ifPresent(claim -> queue.deliver(claim, authorization::requireAuthorized, publisher));
+    /** Returns false when no delivery was claimed. */
+    public boolean processNext() {
+        var claim = queue.claim();
+        claim.ifPresent(next -> queue.deliver(next, authorization::requireAuthorized, publisher));
+        return claim.isPresent();
     }
 }

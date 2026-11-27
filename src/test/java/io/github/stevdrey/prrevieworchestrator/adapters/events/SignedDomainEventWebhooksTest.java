@@ -120,12 +120,12 @@ class SignedDomainEventWebhooksTest {
     void missingKeyOrUnregisteredDestinationCannotSend() throws Exception {
         var http = mock(HttpClient.class);
         try (var publisher = publisher(http, FIRST_TRY)) {
-            assertEquals(RETRY, publisher.publish(SUBSCRIPTION, fingerprint(), EVENT));
+            assertEquals(MISCONFIGURED, publisher.publish(SUBSCRIPTION, fingerprint(), EVENT));
             Files.write(keys.resolve(SUBSCRIPTION.toString()), new byte[65]);
-            assertEquals(RETRY, publisher.publish(SUBSCRIPTION, fingerprint(), EVENT));
+            assertEquals(MISCONFIGURED, publisher.publish(SUBSCRIPTION, fingerprint(), EVENT));
             Files.write(keys.resolve(SUBSCRIPTION.toString()), new byte[32]);
-            assertEquals(RETRY, publisher.publish(SUBSCRIPTION, "0".repeat(64), EVENT));
-            assertEquals(RETRY, publisher.publish(UUID.randomUUID(), fingerprint(), EVENT));
+            assertEquals(MISCONFIGURED, publisher.publish(SUBSCRIPTION, "0".repeat(64), EVENT));
+            assertEquals(MISCONFIGURED, publisher.publish(UUID.randomUUID(), fingerprint(), EVENT));
             verify(http, never()).sendAsync(any(), any());
         }
     }

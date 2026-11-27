@@ -336,10 +336,21 @@ class JdbcDomainEventQueueIntegrationTest {
         queue.deliver(first, unavailable::requireAuthorized, (id, fingerprint, event) -> fail("authority unavailable"));
         assertDelivery("PENDING", 1, "AUTHORIZATION_UNAVAILABLE");
         expire();
+        // A failing authority query aborts the transaction; the outcome must still be recorded.
+        var sqlFailure = queue.claim().orElseThrow();
+        var failingSql = new RepositoryAuthorization(Set.of(SCOPE),
+                scope -> jdbc.queryForObject("SELECT 1 / 0", Integer.class) == 1);
+        queue.deliver(sqlFailure, failingSql::requireAuthorized, (id, fingerprint, event) -> fail("query failed"));
+        assertDelivery("PENDING", 2, "AUTHORIZATION_UNAVAILABLE");
+        expire();
+        var misconfigured = queue.claim().orElseThrow();
+        queue.deliver(misconfigured, authorization::requireAuthorized, (id, fingerprint, event) -> MISCONFIGURED);
+        assertDelivery("PENDING", 3, "CONFIGURATION_MISSING");
+        expire();
         var retry = queue.claim().orElseThrow();
         jdbc.update("UPDATE installation_repositories SET enabled = false WHERE repository_id = 1001");
         queue.deliver(retry, authorization::requireAuthorized, (id, fingerprint, event) -> fail("repository disabled"));
-        assertDelivery("CANCELLED", 2, "AUTHORIZATION_DENIED");
+        assertDelivery("CANCELLED", 4, "AUTHORIZATION_DENIED");
     }
 
     @Test

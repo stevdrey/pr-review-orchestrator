@@ -45,7 +45,7 @@ CREATE TABLE pr_event_deliveries (
     attempts integer NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 5),
     available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     last_outcome text CHECK (last_outcome IN ('IN_FLIGHT', 'ACKNOWLEDGED', 'RETRY', 'REJECTED',
-        'REVOKED', 'AUTHORIZATION_DENIED', 'AUTHORIZATION_UNAVAILABLE', 'LEASE_EXPIRED')),
+        'REVOKED', 'AUTHORIZATION_DENIED', 'AUTHORIZATION_UNAVAILABLE', 'LEASE_EXPIRED', 'CONFIGURATION_MISSING')),
     PRIMARY KEY (subscription_id, event_id)
 );
 CREATE INDEX pr_event_deliveries_pending_idx ON pr_event_deliveries (available_at, event_id, subscription_id)

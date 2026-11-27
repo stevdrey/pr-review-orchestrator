@@ -59,13 +59,13 @@ final class SignedDomainEventWebhooks implements DomainEventPublisher, AutoClose
     public Outcome publish(UUID subscriptionId, String callbackFingerprint, PrDomainEvent event) {
         long started = System.nanoTime();
         var destination = destinations.get(subscriptionId);
-        if (destination == null || !destination.fingerprint().equals(callbackFingerprint)) return Outcome.RETRY;
+        if (destination == null || !destination.fingerprint().equals(callbackFingerprint)) return Outcome.MISCONFIGURED;
         Path keyFile = signingKeyDirectory.resolve(subscriptionId.toString());
-        if (!Files.isRegularFile(keyFile)) return Outcome.RETRY;
+        if (!Files.isRegularFile(keyFile)) return Outcome.MISCONFIGURED;
         try (var source = Files.newInputStream(keyFile)) {
             byte[] key = source.readNBytes(65);
             try {
-                if (key.length < 32 || key.length > 64) return Outcome.RETRY;
+                if (key.length < 32 || key.length > 64) return Outcome.MISCONFIGURED;
                 return post(destination.uri(), subscriptionId, event, key, started);
             } finally {
                 Arrays.fill(key, (byte) 0);
