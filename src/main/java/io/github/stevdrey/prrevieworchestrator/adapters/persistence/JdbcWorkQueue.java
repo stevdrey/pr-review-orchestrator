@@ -3,6 +3,7 @@ package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REVIEW_ASSESSMENT_EVENT;
 
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
 import java.time.Duration;
@@ -143,18 +144,24 @@ public final class JdbcWorkQueue implements WorkQueue {
         finish(event.lease(), "PROCESSED", null);
     }
 
-    /** Schedule at most one assessment per source delivery in its fenced completion transaction. */
-    void scheduleReviewAssessment(Event event, Instant availableAt) {
+    /**
+     * Schedule at most one assessment per PR head and quiet-period deadline in the fenced completion
+     * transaction. The synchronize and CI wake-ups in the same quiet period share it; the first keeps its correlation.
+     */
+    void scheduleReviewAssessment(Event event, PullRequestId pr, String headSha, Instant availableAt) {
         // Ingress only accepts UUID delivery IDs. An internal row has no event_action, so the
         // signed payload fingerprint continues to deduplicate only the original delivery.
+        String key = "review-assessment:" + pr.scope().installationId() + ":" + pr.scope().repositoryId() + ":"
+                + pr.number() + ":" + headSha + ":" + availableAt;
         jdbc.update("""
                 INSERT INTO inbox_events (id, delivery_id, event_type, installation_id, repository_id,
                     pr_number, head_sha, payload_sha256, correlation_id, verified_at, max_attempts, available_at)
-                SELECT ?, 'review-assessment:' || id::text, ?, installation_id, repository_id,
-                    pr_number, head_sha, payload_sha256, correlation_id, verified_at, max_attempts, ?
-                FROM inbox_events WHERE id = ?
+                SELECT ?, ?, ?, installation_id, repository_id,
+                    ?, ?, payload_sha256, correlation_id, verified_at, max_attempts, ?
+                FROM inbox_events WHERE id = ? AND (installation_id, repository_id) = (?, ?)
                 ON CONFLICT (delivery_id) DO NOTHING
-                """, UUID.randomUUID(), REVIEW_ASSESSMENT_EVENT, Timestamp.from(availableAt), event.lease().id());
+                """, UUID.randomUUID(), key, REVIEW_ASSESSMENT_EVENT, pr.number(), headSha, Timestamp.from(availableAt),
+                event.lease().id(), pr.scope().installationId(), pr.scope().repositoryId());
     }
 
     void enqueue(Event event, Intent intent) {

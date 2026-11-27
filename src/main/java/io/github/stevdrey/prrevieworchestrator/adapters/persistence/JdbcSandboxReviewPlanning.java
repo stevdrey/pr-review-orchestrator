@@ -11,6 +11,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Intent;
 import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Assessment;
 import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Comparison;
 import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Head;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.Intervention;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewConflict;
@@ -46,9 +47,15 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         return queue.<Preparation>withEvent(event, authorize, () -> {
             var pr = head.pr();
             PostgresLocks.lockPr(jdbc, pr);
-            if (!expected.equals(states.load(pr, false))) throw new ReviewConflict(ReviewConflict.Code.STALE_VERSION);
             boolean sync = SandboxReviewPlanning.isSynchronize(event);
-            var current = expected.orElse(null);
+            var loaded = states.load(pr, false);
+            // A synchronize only loses to a newer head observation; unrelated writes must not exhaust its retries.
+            if (sync ? loaded.isPresent() != expected.isPresent()
+                    || expected.isPresent() && headObservedAfter(pr, expected.orElseThrow().version())
+                    : !expected.equals(loaded)) {
+                throw new ReviewConflict(ReviewConflict.Code.STALE_VERSION);
+            }
+            var current = loaded.orElse(null);
             if (sync) {
                 if (current == null) {
                     states.createLocked(pr, head.sha());
@@ -69,16 +76,17 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
             if (decision.status() == WAITING_FOR_PUSHES) {
                 // If a due assessment sees a newer quiet-period deadline, the newer
                 // synchronize observation already scheduled its own assessment.
-                if (!SandboxReviewPlanning.isAssessment(event)) queue.scheduleReviewAssessment(event, decision.retryAt());
+                if (!SandboxReviewPlanning.isAssessment(event)) {
+                    queue.scheduleReviewAssessment(event, pr, head.sha(), decision.retryAt());
+                }
                 queue.finishEvent(event);
                 return PROCESSED;
             }
             if (decision.status() == COMPARISON_REQUIRED) {
                 return new Preparation.Ready(current.version(), decision.baseSha());
             }
-            if (!sync) return new Preparation.Ready(current.version(), null);
-            queue.finishEvent(event);
-            return PROCESSED;
+            // An accepted synchronize also reads current-head CI: CI deliveries that beat it were superseded.
+            return new Preparation.Ready(current.version(), null);
         }).orElse(LEASE_LOST);
     }
 
@@ -116,9 +124,11 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         if (duplicate) return;
 
         // Count issued intents conservatively until a reservation for that same target already occupies a slot.
+        // CANCELLED is only recorded after reconcile proved no effect; DEAD may have landed, so it still counts.
         long planned = jdbc.queryForObject("""
                 SELECT count(*) FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
                 WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ? AND o.command_type = ?
+                  AND o.status <> 'CANCELLED'
                   AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE
                     (r.installation_id, r.repository_id, r.pr_number, r.head_sha, r.stage, r.provider) =
                     (c.installation_id, c.repository_id, c.pr_number, o.expected_head_sha, c.stage, o.target_provider))
@@ -128,6 +138,14 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         } else if (policy.permits(pr, intent)) {
             queue.enqueue(event, intent);
         }
+    }
+
+    private boolean headObservedAfter(PullRequestId pr, long version) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM pr_review_transitions
+                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                        AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD') AND resulting_version > ?)
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), version));
     }
 
     private void requireEventHead(Event event, Head head) {

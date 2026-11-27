@@ -54,8 +54,9 @@ public class DurableDispatchConfiguration {
         PostgresDeadlines.requireTransactionTimeout(jdbc, "durable dispatch");
         boolean reviewPlanning = env.getProperty("orchestrator.sandbox-ci.enabled", Boolean.class, false)
                 && env.getProperty("orchestrator.sandbox-ci.synchronize-enabled", Boolean.class, false);
-        // A planning claim spans separate bounded PR, Git object and CI reads.
-        var lease = Duration.ofSeconds(reviewPlanning ? 90 : 30);
+        // A planning claim spans 3 bounded observations (20s each), 2 queue transactions (10s each) and
+        // 4 token issues plus 4 revocations (10s each): 160s worst case, plus a 20s margin.
+        var lease = Duration.ofSeconds(reviewPlanning ? 180 : 30);
         // 15/30/60/120s retry delays: ~3.75 minutes for transient outages before the 5-attempt ceiling.
         return new JdbcWorkQueue(jdbc, manager, new Limits(lease, Duration.ofSeconds(15), Duration.ofMinutes(5)));
     }
