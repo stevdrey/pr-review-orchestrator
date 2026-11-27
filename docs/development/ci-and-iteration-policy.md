@@ -43,7 +43,7 @@ orchestrator:
       secret-file: /run/secrets/sandbox-webhook
 ```
 
-The mode requires both enablement flags and an allowlist with exactly one installation/repository pair. It refuses startup with Codex or author notification delivery enabled and never claims external commands. The configured SHA and workflow IDs are an operator-supplied sandbox policy. Testing a different head requires a fresh sandbox configuration and database. This mode accepts only same-repository PRs.
+The read-only mode requires both enablement flags and an allowlist with exactly one installation/repository pair. It refuses startup with Codex or author notification delivery enabled and leaves external commands pending. [Planned Codex dispatch](synchronize-review-planning.md#opt-in-dispatch-to-codex) is a separate opt-in for synchronize planning. The configured SHA and workflow IDs are an operator-supplied sandbox policy. Testing a different head requires a fresh sandbox configuration and database. This mode accepts only same-repository PRs.
 
 #### Local replay for realtime-voice-lab PR #36
 

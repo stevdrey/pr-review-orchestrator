@@ -22,24 +22,37 @@ import org.springframework.transaction.support.TransactionTemplate;
 public final class JdbcWorkQueue implements WorkQueue {
     /** Every queue transaction, including any gateway call inside executeCommand, finishes within this. */
     private static final Duration DEADLINE = Duration.ofSeconds(10);
+    // Three independent 8s request transactions, including the send, plus bounded cleanup and queue overhead.
+    private static final Duration PLANNED_REVIEW_DEADLINE = Duration.ofSeconds(40);
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
+    private final TransactionTemplate plannedReviews;
     private final Limits limits;
     private final String worker = UUID.randomUUID().toString();
 
     public JdbcWorkQueue(JdbcTemplate jdbc, PlatformTransactionManager manager, Limits limits) {
         this.jdbc = jdbc;
         this.limits = limits;
-        transactions = new TransactionTemplate(manager);
-        transactions.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-        transactions.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
+        transactions = transactions(manager, DEADLINE);
+        plannedReviews = transactions(manager, PLANNED_REVIEW_DEADLINE);
+    }
+
+    private TransactionTemplate transactions(PlatformTransactionManager manager, Duration deadline) {
+        var template = new TransactionTemplate(manager);
+        template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        template.setTimeout(Math.toIntExact(deadline.toSeconds()));
+        return template;
     }
 
     private <T> T transaction(Supplier<T> operation) {
-        return transactions.execute(status -> {
+        return transaction(transactions, DEADLINE, operation);
+    }
+
+    private <T> T transaction(TransactionTemplate template, Duration deadline, Supplier<T> operation) {
+        return template.execute(status -> {
             try {
-                PostgresDeadlines.apply(jdbc, DEADLINE);
-                jdbc.execute("SET LOCAL statement_timeout = '" + DEADLINE.minusSeconds(1).toMillis() + "ms'");
+                PostgresDeadlines.apply(jdbc, deadline);
+                jdbc.execute("SET LOCAL statement_timeout = '" + deadline.minusSeconds(1).toMillis() + "ms'");
                 return operation.get();
             } catch (RuntimeException failure) {
                 // Spring may log the callback exception during rollback (including rollback failure).
@@ -52,7 +65,7 @@ public final class JdbcWorkQueue implements WorkQueue {
     @Override
     public Optional<Event> claimEvent() {
         return transaction(() -> {
-            var lease = claim(Queue.INBOX);
+            var lease = claim(Queue.INBOX, "");
             if (lease.isEmpty()) return Optional.empty();
             return Optional.of(jdbc.queryForObject("SELECT * FROM inbox_events WHERE id = ?", (rs, row) -> {
                 Long repository = rs.getObject("repository_id", Long.class);
@@ -66,8 +79,21 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     @Override
     public Optional<Command> claimCommand() {
+        return claimCommand(" AND planned_head_epoch IS NULL");
+    }
+
+    @Override
+    public Optional<Command> claimPlannedReview(PullRequestId pr) {
+        return claimCommand("""
+                AND planned_head_epoch IS NOT NULL AND (installation_id, repository_id) = (?, ?)
+                AND EXISTS (SELECT 1 FROM review_cycles c WHERE c.id = outbox_commands.review_cycle_id
+                    AND c.pr_number = ?)
+                """, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
+    }
+
+    private Optional<Command> claimCommand(String filter, Object... args) {
         return transaction(() -> {
-            var lease = claim(Queue.OUTBOX);
+            var lease = claim(Queue.OUTBOX, filter, args);
             if (lease.isEmpty()) return Optional.empty();
             try {
                 Command command = jdbc.queryForObject("""
@@ -77,7 +103,7 @@ public final class JdbcWorkQueue implements WorkQueue {
                         new RepositoryScope(rs.getLong("installation_id"), rs.getLong("repository_id")),
                         new Intent(rs.getInt("pr_number"), rs.getString("expected_head_sha"),
                                 rs.getString("stage"), rs.getString("target_provider"), rs.getString("command_type")),
-                        rs.getString("command_key")), lease.get().id());
+                        rs.getString("command_key"), rs.getObject("planned_head_epoch", Long.class)), lease.get().id());
                 if (!command.intent().key(command.scope()).equals(command.key())) {
                     throw new IllegalArgumentException("Invalid command identity");
                 }
@@ -89,22 +115,24 @@ public final class JdbcWorkQueue implements WorkQueue {
         });
     }
 
-    private Optional<Lease> claim(Queue queue) {
+    private Optional<Lease> claim(Queue queue, String filter, Object... args) {
         String table = table(queue);
         // Bounded recovery, including crashes during the final allowed attempt. Never reset attempts.
         var exhausted = jdbc.query("SELECT id, correlation_id, attempts FROM " + table + """
                  WHERE attempts >= max_attempts AND (status = 'PENDING' OR
                     (status = 'PROCESSING' AND locked_until <= clock_timestamp()))
+                """ + filter + """
                  ORDER BY available_at, id LIMIT 32 FOR UPDATE SKIP LOCKED
                 """, (rs, row) -> new Lease(queue, rs.getObject("id", UUID.class), null,
-                rs.getObject("correlation_id", UUID.class), rs.getInt("attempts")));
+                rs.getObject("correlation_id", UUID.class), rs.getInt("attempts")), args);
         for (Lease lease : exhausted) finish(lease, "DEAD", ErrorCode.LEASE_EXHAUSTED);
         var candidates = jdbc.query("SELECT id, correlation_id, attempts FROM " + table + """
                  WHERE attempts < max_attempts AND ((status = 'PENDING' AND available_at <= clock_timestamp())
                     OR (status = 'PROCESSING' AND locked_until <= clock_timestamp()))
+                """ + filter + """
                  ORDER BY available_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
                 """, (rs, row) -> new Lease(queue, rs.getObject("id", UUID.class), UUID.randomUUID(),
-                rs.getObject("correlation_id", UUID.class), rs.getInt("attempts") + 1));
+                rs.getObject("correlation_id", UUID.class), rs.getInt("attempts") + 1), args);
         if (candidates.isEmpty()) return Optional.empty();
         Lease lease = candidates.getFirst();
         jdbc.update("UPDATE " + table + """
@@ -119,7 +147,7 @@ public final class JdbcWorkQueue implements WorkQueue {
     public boolean completeEvent(Event event, List<Intent> intents, Runnable authorize) {
         if (intents.size() > MAX_INTENTS) throw new Failure(ErrorCode.INVALID_EVENT, false);
         return completeLocalEvent(event, authorize, () -> {
-            for (Intent intent : intents) enqueue(event, intent);
+            for (Intent intent : intents) enqueue(event, intent, null);
         });
     }
 
@@ -164,7 +192,7 @@ public final class JdbcWorkQueue implements WorkQueue {
                 event.lease().id(), pr.scope().installationId(), pr.scope().repositoryId());
     }
 
-    void enqueue(Event event, Intent intent) {
+    void enqueue(Event event, Intent intent, Long plannedHeadEpoch) {
         var scope = event.scope();
         UUID cycle = UUID.randomUUID();
         jdbc.update("""
@@ -180,20 +208,33 @@ public final class JdbcWorkQueue implements WorkQueue {
                 intent.expectedHeadSha(), intent.stage(), intent.provider());
         jdbc.update("""
                 INSERT INTO outbox_commands (id, command_key, review_cycle_id, installation_id, repository_id,
-                    expected_head_sha, command_type, target_provider, correlation_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (command_key) DO NOTHING
+                    expected_head_sha, command_type, target_provider, correlation_id, planned_head_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (command_key) DO NOTHING
                 """, UUID.randomUUID(), intent.key(scope), cycle, scope.installationId(), scope.repositoryId(),
-                intent.expectedHeadSha(), intent.type(), intent.provider(), event.lease().correlationId());
+                intent.expectedHeadSha(), intent.type(), intent.provider(), event.lease().correlationId(), plannedHeadEpoch);
     }
 
     @Override
     public boolean executeCommand(Command command, Runnable authorize, Supplier<Outcome> operation) {
+        if (command.plannedHeadEpoch() != null) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
         return transaction(() -> {
             if (!lock(command.lease())) return false;
             authorize.run();
             // Holding the row lock prevents another worker stealing the lease during a bounded API call.
             Outcome outcome = java.util.Objects.requireNonNull(operation.get());
             finish(command.lease(), outcome.name(), null);
+            return true;
+        });
+    }
+
+    @Override
+    public boolean executePlannedReview(Command command, Supplier<Outcome> operation) {
+        if (command.plannedHeadEpoch() == null) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
+        return transaction(plannedReviews, PLANNED_REVIEW_DEADLINE, () -> {
+            // Allow the request's foreign-key check to take KEY SHARE without releasing the claim fence.
+            if (!lock(command.lease(), "FOR NO KEY UPDATE")) return false;
+            // Independent request transactions own the authorization and PR locks for the POST.
+            finish(command.lease(), java.util.Objects.requireNonNull(operation.get()).name(), null);
             return true;
         });
     }
@@ -219,11 +260,15 @@ public final class JdbcWorkQueue implements WorkQueue {
     }
 
     private boolean lock(Lease lease) {
+        return lock(lease, "FOR UPDATE");
+    }
+
+    private boolean lock(Lease lease, String lockClause) {
         if (lease.token() == null) return false;
         boolean acquired = !jdbc.queryForList("SELECT id FROM " + table(lease.queue()) + """
                  WHERE id = ? AND status = 'PROCESSING' AND lease_token = ?
-                 AND locked_until > clock_timestamp() FOR UPDATE
-                """, UUID.class, lease.id(), lease.token()).isEmpty();
+                 AND locked_until > clock_timestamp()
+                """ + lockClause, UUID.class, lease.id(), lease.token()).isEmpty();
         // A predicate can be evaluated before waiting for a row lock. Recheck the DB clock after
         // acquiring it so a rolled-back competing transaction cannot let an expired owner proceed.
         return acquired && Boolean.TRUE.equals(jdbc.queryForObject("SELECT locked_until > clock_timestamp() FROM "

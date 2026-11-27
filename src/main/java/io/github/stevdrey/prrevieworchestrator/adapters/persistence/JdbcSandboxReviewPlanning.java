@@ -2,6 +2,7 @@ package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
 import static io.github.stevdrey.prrevieworchestrator.application.SandboxReviewPlanning.Preparation.Finished.*;
 import static io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Status.*;
+import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REQUEST_REVIEW;
 
 import io.github.stevdrey.prrevieworchestrator.application.SandboxReviewPlanning;
 import io.github.stevdrey.prrevieworchestrator.application.SandboxReviewPlanning.Preparation;
@@ -22,7 +23,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 /** Reuse the lifecycle and correlation rules within the fenced inbox transaction. */
 public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Commit {
-    private static final String REQUEST_REVIEW = "REQUEST_REVIEW";
     private final JdbcTemplate jdbc;
     private final JdbcWorkQueue queue;
     private final JdbcReviewStateStore states;
@@ -107,11 +107,13 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
             if (current.ci() != Ci.PASSED || comparison == null) return;
 
             var decision = fixes.assessLocked(pr, new Assessment(head, current.version(), false, comparison));
-            if (decision.status() == ELIGIBLE || decision.status() == ALREADY_ELIGIBLE) plan(event, current);
+            if (decision.status() == ELIGIBLE || decision.status() == ALREADY_ELIGIBLE) {
+                plan(event, current, decision.headEpoch());
+            }
         });
     }
 
-    private void plan(Event event, PullRequestReview current) {
+    private void plan(Event event, PullRequestReview current, long headEpoch) {
         var pr = current.pr();
         var intent = new Intent(pr.number(), current.headSha(), "BASELINE", "codex", REQUEST_REVIEW);
         boolean duplicate = Boolean.TRUE.equals(jdbc.queryForObject("""
@@ -136,7 +138,7 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         if (JdbcReviewRequestStore.usedIterations(jdbc, pr) + planned >= limit) {
             states.stopLocked(current, Intervention.ITERATION_LIMIT);
         } else if (policy.permits(pr, intent)) {
-            queue.enqueue(event, intent);
+            queue.enqueue(event, intent, headEpoch);
         }
     }
 

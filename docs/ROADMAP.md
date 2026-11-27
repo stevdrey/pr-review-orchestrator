@@ -24,6 +24,8 @@ Issue #23 adds [local sandbox feedback-loop acceptance coverage and live prerequ
 
 Issue #72 adds [durable sandbox re-review planning](development/synchronize-review-planning.md) from signed synchronize and CI deliveries, using authoritative PR reads, quiet-period coalescing and a deduplicated outbox intent for the eligible head.
 
+Issue #74 connects [planned sandbox intents to the Codex request adapter](development/synchronize-review-planning.md#opt-in-dispatch-to-codex) and adds [exact terminal-attempt correlation](development/review-outcomes.md#authenticated-codex-completion) for an approved source. Local tests use a loopback GitHub and a signed completion fixture. Live dispatch stays disabled by default, and native completion for the exact request remains unverified.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |

@@ -14,6 +14,7 @@ import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNorma
 import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxCiReader;
 import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubSandboxReviewReader;
 import io.github.stevdrey.prrevieworchestrator.application.DurableDispatcher;
+import io.github.stevdrey.prrevieworchestrator.application.DispatchPlannedCodexReview;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
 import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler;
@@ -71,7 +72,7 @@ public class DurableDispatchConfiguration {
     @ConfigurationProperties("orchestrator.sandbox-ci")
     record SandboxSettings(long installationId, long readInstallationId, long repositoryId,
             String repository, int prNumber, String head, Set<Long> workflowIds, boolean reviewEvidenceEnabled,
-            boolean synchronizeEnabled) {
+            boolean synchronizeEnabled, boolean codexDispatchEnabled) {
         SandboxCiReconciler.Policy policy() {
             var scope = new RepositoryScope(installationId, repositoryId);
             var readScope = new RepositoryScope(readInstallationId, repositoryId);
@@ -92,11 +93,13 @@ public class DurableDispatchConfiguration {
                 @Value("${orchestrator.codex.max-requests:6}") int reviewLimit) {
             var policy = settings.policy();
             var ingress = policy.pr().scope();
-            if (env.getProperty("orchestrator.codex.enabled", Boolean.class, false)
+            boolean codexEnabled = env.getProperty("orchestrator.codex.enabled", Boolean.class, false);
+            if (codexEnabled != settings.codexDispatchEnabled()
+                    || settings.codexDispatchEnabled() && !settings.synchronizeEnabled()
                     || env.getProperty("orchestrator.notifications.enabled", Boolean.class, false)
                     || !Map.of(ingress.installationId(), Set.of(ingress.repositoryId())).equals(allowlist.repositories())
                     || github.privateKeyFile() == null) {
-                throw new IllegalStateException("Sandbox CI requires one ingress scope, a read key and disabled outbound effects");
+                throw new IllegalStateException("Sandbox CI requires one ingress scope, a read key and explicit dispatch opt-in");
             }
             var readAuthorization = new RepositoryAuthorization(Set.of(policy.readScope()), installations);
             var clock = Clock.systemUTC();
@@ -129,6 +132,12 @@ public class DurableDispatchConfiguration {
             return new DurableDispatcher(queue, ingressAuthorization,
                     event -> reviews.handles(event) ? reviews.complete(event) : reconcileRemaining.test(event));
         }
+        @Bean
+        @ConditionalOnProperty(prefix = "orchestrator.sandbox-ci", name = "codex-dispatch-enabled", havingValue = "true")
+        DispatchPlannedCodexReview plannedCodexDispatch(JdbcWorkQueue queue, ReviewProvider provider,
+                SandboxSettings settings, @Value("${orchestrator.codex.actor-id}") long actorId) {
+            return new DispatchPlannedCodexReview(queue, provider, settings.policy().pr(), actorId);
+        }
     }
 
     /** Separate threads so a command holding its bounded transaction never stalls inbox planning. */
@@ -141,11 +150,19 @@ public class DurableDispatchConfiguration {
     }
 
     @Bean
-    Ticks durableDispatchTicks(DurableDispatcher dispatcher) { return new Ticks(dispatcher); }
+    Ticks durableDispatchTicks(DurableDispatcher dispatcher, ObjectProvider<DispatchPlannedCodexReview> planned) {
+        var worker = planned.getIfAvailable();
+        return new Ticks(dispatcher, worker == null ? dispatcher::processCommand : worker::processCommand);
+    }
 
     public static final class Ticks {
         private final DurableDispatcher dispatcher;
-        Ticks(DurableDispatcher dispatcher) { this.dispatcher = dispatcher; }
+        private final java.util.function.BooleanSupplier processCommand;
+
+        Ticks(DurableDispatcher dispatcher, java.util.function.BooleanSupplier processCommand) {
+            this.dispatcher = dispatcher;
+            this.processCommand = processCommand;
+        }
 
         /** Drain up to this many items per queue per tick; bounded pressure without one-per-second latency. */
         static final int MAX_PER_TICK = 16;
@@ -154,7 +171,7 @@ public class DurableDispatchConfiguration {
         public void inboxTick() { drain(dispatcher::processEvent); }
 
         @Scheduled(fixedDelay = 1000)
-        public void outboxTick() { drain(dispatcher::processCommand); }
+        public void outboxTick() { drain(processCommand); }
 
         private void drain(java.util.function.BooleanSupplier step) {
             // Stop at an empty queue or the first failure (one WARN per tick); never leak driver diagnostics.

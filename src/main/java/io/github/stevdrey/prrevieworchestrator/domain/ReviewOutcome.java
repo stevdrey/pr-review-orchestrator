@@ -1,5 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.domain;
 
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -37,11 +39,36 @@ public final class ReviewOutcome {
         }
     }
 
+    /** The provider's exact trigger, terminal attempt and result revision. */
+    public record CodexProvenance(PullRequestId pr, long commentId, String reviewedSha, Stage stage,
+            String executionId, String attemptId, Instant terminalAt, String bodySha256, Instant sourceUpdatedAt) {
+        public CodexProvenance {
+            Objects.requireNonNull(pr);
+            Objects.requireNonNull(stage);
+            CommitSha.require(reviewedSha);
+            for (String id : new String[] {executionId, attemptId}) {
+                if (id == null || !id.matches("[A-Za-z0-9_:/.-]{1,255}")) {
+                    throw new IllegalArgumentException("Invalid provider execution identity");
+                }
+            }
+            if (commentId <= 0 || bodySha256 == null || !bodySha256.matches("[a-f0-9]{64}")) {
+                throw new IllegalArgumentException("Invalid Codex provenance");
+            }
+            terminalAt = Objects.requireNonNull(terminalAt).truncatedTo(ChronoUnit.MICROS);
+            sourceUpdatedAt = Objects.requireNonNull(sourceUpdatedAt).truncatedTo(ChronoUnit.MICROS);
+        }
+    }
+
     /**
      * Only an approved adapter with an independently verified completion contract may supply
      * NO_FINDINGS. A comment receipt, approval state or textual LGTM is UNSTRUCTURED/UNKNOWN.
      */
-    public record Completion(Run run, String reviewId, Status status, Conclusion conclusion) {
+    public record Completion(Run run, String reviewId, Status status, Conclusion conclusion,
+            CodexProvenance codexProvenance) {
+        public Completion(Run run, String reviewId, Status status, Conclusion conclusion) {
+            this(run, reviewId, status, conclusion, null);
+        }
+
         public Completion {
             Objects.requireNonNull(run); Objects.requireNonNull(status); Objects.requireNonNull(conclusion);
             if (reviewId != null && (reviewId.isBlank() || reviewId.length() > 1024)) {

@@ -99,6 +99,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
         java.util.Objects.requireNonNull(command);
         return locked(pr, authorize, () -> switch (command.action()) {
             case RECONCILE_CI, STOP_ITERATION_LIMIT, STOP_NO_PROGRESS -> throw new ReviewConflict(GUARD_REJECTED);
+            case RESUME -> reconcilePlannedStartLocked(applyLocked(pr, command, null), null);
             default -> applyLocked(pr, command, null);
         });
     }
@@ -124,6 +125,32 @@ public class JdbcReviewStateStore implements ReviewStateStore {
         var action = intervention == Intervention.ITERATION_LIMIT ? Action.STOP_ITERATION_LIMIT : Action.STOP_NO_PROGRESS;
         return applyLocked(current.pr(), new ReviewTransition(transitionId, current.version(), current.headSha(),
                 action, null, observationGates(Ci.UNKNOWN)), null);
+    }
+
+    /**
+     * Reconcile a committed receipt for the current visit. A dispatch retry is restricted to its
+     * command, while an authorized resume can recover the current receipt without the outbox worker.
+     */
+    PullRequestReview reconcilePlannedStartLocked(PullRequestReview current, UUID plannedCommandId) {
+        if (current.state() != State.WAITING_FOR_REVIEW) return current;
+        var pr = current.pr();
+        long epoch = JdbcFixCorrelationStore.headEpoch(jdbc, pr, current.headSha());
+        var receipt = jdbc.query("""
+                SELECT r.id FROM review_requests r
+                WHERE (r.installation_id, r.repository_id, r.pr_number, r.head_sha, r.head_epoch) = (?, ?, ?, ?, ?)
+                    AND r.stage = 'BASELINE' AND r.provider = 'codex'
+                    AND r.planned_command_id IS NOT NULL
+                    AND (CAST(? AS uuid) IS NULL OR r.planned_command_id = ?)
+                    AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
+                    AND NOT EXISTS (SELECT 1 FROM pr_review_transitions t
+                        WHERE (t.installation_id, t.repository_id, t.pr_number, t.transition_id)
+                            = (r.installation_id, r.repository_id, r.pr_number, r.id))
+                """, (rs, row) -> rs.getObject(1, UUID.class), pr.scope().installationId(), pr.scope().repositoryId(),
+                pr.number(), current.headSha(), epoch, plannedCommandId, plannedCommandId);
+        if (receipt.isEmpty()) return current;
+        var gates = new ReviewTransition.Gates(true, false, false, true, true, current.ci());
+        return applyLocked(pr, new ReviewTransition(receipt.getFirst(), current.version(), current.headSha(),
+                Action.START_REVIEW, null, gates), null);
     }
 
     private static ReviewTransition.Gates observationGates(Ci ci) {
@@ -163,6 +190,9 @@ public class JdbcReviewStateStore implements ReviewStateStore {
                 && (command.action() == Action.MARK_READY_FOR_HUMAN || command.action() == Action.RESUME);
         if (evidenceGuard != null) {
             evidenceGuard.run();
+        } else if (command.action() == Action.BASELINE_CLEAN
+                && JdbcReviewRequestStore.plannedBaseline(jdbc, pr, current.headSha()).isPresent()) {
+            throw new ReviewConflict(GUARD_REJECTED);
         } else if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
                 || command.action() == ReviewTransition.Action.DEEP_CLEAN
                 || ready)

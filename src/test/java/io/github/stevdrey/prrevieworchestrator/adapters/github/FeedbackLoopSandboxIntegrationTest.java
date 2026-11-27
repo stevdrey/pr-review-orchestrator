@@ -10,21 +10,21 @@ import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcAuthorNo
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcFixCorrelationStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewPlanning;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRequestStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewOutcomeStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCiInbox;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget.Terms;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
-import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Command;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
-import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.RemoteEffect;
-import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.RemoteState;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
-import io.github.stevdrey.prrevieworchestrator.ports.CommandGateway;
+import io.github.stevdrey.prrevieworchestrator.ports.CodexCompletionSource.TerminalAttempt;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Result;
@@ -39,6 +39,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
@@ -49,11 +50,13 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.AfterAll;
@@ -68,6 +71,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -85,6 +90,7 @@ class FeedbackLoopSandboxIntegrationTest {
     private static final ReviewTransition.Gates OPEN = new ReviewTransition.Gates(true, false, false, true, false, Ci.UNKNOWN);
     private static final ReviewTransition.Gates BLOCKED = new ReviewTransition.Gates(true, false, false, true, true, Ci.UNKNOWN);
     private static final Duration TOKEN_LIFETIME = Duration.ofHours(1);
+    private static final Terms BUDGET_TERMS = new Terms("fixture_units", 2, 2, 8, 16);
 
     @Container
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer(DockerImageName.parse(Objects.requireNonNull(
@@ -179,7 +185,7 @@ class FeedbackLoopSandboxIntegrationTest {
 
     @BeforeEach
     void openSandbox() throws Exception {
-        jdbc.execute("TRUNCATE installations, inbox_events CASCADE");
+        jdbc.execute("TRUNCATE installations, inbox_events, sandbox_codex_budget_limits CASCADE");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
         var limits = new DurableWork.Limits(Duration.ofSeconds(30), Duration.ofSeconds(1), Duration.ofSeconds(10));
@@ -341,23 +347,514 @@ class FeedbackLoopSandboxIntegrationTest {
                 """));
         assertFalse(worker.processCommand(), "the sandbox planner never dispatches");
 
-        var stub = new CommandGateway() {
-            private final Set<String> effects = new HashSet<>();
-
-            @Override public boolean supports(Command command) { return command.intent().type().equals("REQUEST_REVIEW"); }
-
-            @Override public RemoteState reconcile(Command command) {
-                var effect = effects.contains(command.key()) ? RemoteEffect.APPLIED : RemoteEffect.ABSENT;
-                return new RemoteState(github.head(), effect);
-            }
-
-            @Override public void execute(Command command) { assertTrue(effects.add(command.key())); }
-        };
-        var stubDispatcher = new DurableDispatcher(queue, authorization, event -> List.of(), stub);
-        assertTrue(stubDispatcher.processCommand());
-        assertFalse(stubDispatcher.processCommand());
+        var approvals = new FixtureBudget(1);
+        var dispatch = plannedDispatch(approvals);
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            var one = workers.submit(dispatch::processCommand);
+            var two = workers.submit(plannedDispatch(approvals)::processCommand);
+            assertNotEquals(one.get(10, TimeUnit.SECONDS), two.get(10, TimeUnit.SECONDS));
+        }
+        assertEquals(REVIEWING, current().state());
         assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        replayPlannedCommand();
+        assertTrue(plannedDispatch(new FixtureBudget(0)).processCommand());
+        assertFalse(dispatch.processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertThat(github.comments()).containsExactly(new SandboxGitHub.Comment(9001, latest, "@codex review"));
+        assertEquals(2, count("review_requests"));
+        assertEquals(Map.of("head_sha", latest, "stage", "BASELINE", "comment_id", 9001L, "head_epoch", 0L,
+                        "state", "COMMENT_CREATED"), jdbc.queryForMap("""
+                SELECT r.head_sha, r.stage, r.comment_id, r.head_epoch, r.state
+                FROM review_requests r JOIN outbox_commands o ON o.id = r.planned_command_id
+                """));
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM pr_review_transitions t JOIN review_requests r ON r.id = t.transition_id
+                WHERE t.action = 'START_REVIEW' AND r.planned_command_id IS NOT NULL
+                """, Integer.class));
+    }
+
+    @Test
+    void plannedReceiptReconcilesAfterConcurrentPauseAndResume() throws Exception {
+        planCorrectiveReview();
+        dispatchAndPauseAfterReceipt();
+        var paused = current();
+        assertEquals(PAUSED, paused.state());
+        assertEquals(WAITING_FOR_REVIEW, paused.resumeState());
+        UUID request = assertPlannedReceipt();
+        assertEquals(0, plannedStarts(request));
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertSingleBudgetHold(repository.fixedSha);
+
+        var resume = transition(RESUME, OPEN);
+        assertEquals(REVIEWING, lifecycle.apply(PR, resume).state());
+        assertEquals(1, plannedStarts(request));
+        assertEquals(ReviewConflict.Code.DUPLICATE_TRANSITION,
+                assertThrows(ReviewConflict.class, () -> lifecycle.apply(PR, resume)).code());
+        replayPlannedCommand();
+        assertTrue(plannedDispatch(new FixtureBudget(0), budgetedRequests()).processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals(REVIEWING, current().state());
+        assertEquals(request, assertPlannedReceipt());
+        assertEquals(1, plannedStarts(request));
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedReceiptFromEarlierVisitDoesNotStartAfterResume() throws Exception {
+        planCorrectiveReview();
+        dispatchAndPauseAfterReceipt();
+        assertEquals(PAUSED, current().state());
+        UUID request = assertPlannedReceipt();
+
+        var sameHead = enqueue("pull_request", "synchronize", repository.fixedSha,
+                prEnvelope("synchronize", repository.fixedSha, ",\"number\":7,\"before\":\"" + repository.fixedSha + "\""));
+        assertFalse(fixes.observeSynchronize(sameHead, current(), head()));
+        complete(sameHead);
+        assertEquals(PAUSED, current().state());
+        assertEquals(WAITING_FOR_REVIEW, lifecycle.apply(PR, transition(RESUME, OPEN)).state());
+        assertEquals(0, plannedStarts(request));
+        assertEquals(request, assertPlannedReceipt());
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedReceiptSurvivesStartReviewCommitFailure() throws Exception {
+        planCorrectiveReview();
+        jdbc.execute("""
+                CREATE FUNCTION reject_planned_start() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN IF NEW.action = 'START_REVIEW' THEN RAISE EXCEPTION 'fixture commit failure'; END IF;
+                RETURN NEW; END; $$
+                """);
+        jdbc.execute("""
+                CREATE CONSTRAINT TRIGGER reject_planned_start AFTER INSERT ON pr_review_transitions
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_planned_start()
+                """);
+        try {
+            assertTrue(plannedDispatch(new FixtureBudget(1), budgetedRequests()).processCommand());
+        } finally {
+            jdbc.execute("DROP TRIGGER reject_planned_start ON pr_review_transitions");
+            jdbc.execute("DROP FUNCTION reject_planned_start()");
+        }
+        UUID request = assertPlannedReceipt();
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+        assertEquals(0, plannedStarts(request));
+        assertEquals(Map.of("status", "PENDING", "last_error_code", "INTERNAL_ERROR"),
+                jdbc.queryForMap("SELECT status, last_error_code FROM outbox_commands"));
+        assertSingleBudgetHold(repository.fixedSha);
+
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp()");
+        assertTrue(plannedDispatch(new FixtureBudget(0), budgetedRequests()).processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals(REVIEWING, current().state());
+        assertEquals(request, assertPlannedReceipt());
+        assertEquals(1, plannedStarts(request));
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedReceiptSurvivesOutboxCommitFailureAndReconcilesWithoutAnotherPost() throws Exception {
+        planCorrectiveReview();
+        jdbc.execute("""
+                CREATE FUNCTION reject_planned_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN IF NEW.outcome = 'SUCCEEDED' THEN RAISE EXCEPTION 'fixture commit failure'; END IF;
+                RETURN NEW; END; $$
+                """);
+        jdbc.execute("""
+                CREATE CONSTRAINT TRIGGER reject_planned_completion AFTER INSERT ON queue_transitions
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_planned_completion()
+                """);
+        try {
+            assertTrue(plannedDispatch(new FixtureBudget(1), budgetedRequests()).processCommand());
+        } finally {
+            jdbc.execute("DROP TRIGGER reject_planned_completion ON queue_transitions");
+            jdbc.execute("DROP FUNCTION reject_planned_completion()");
+        }
+        assertEquals("PENDING", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("REMOTE_UNCERTAIN", jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
+        assertEquals(9001L, jdbc.queryForObject("""
+                SELECT comment_id FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, Long.class));
+        assertEquals(REVIEWING, current().state());
+        assertSingleBudgetHold(repository.fixedSha);
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp()");
+        assertTrue(plannedDispatch(new FixtureBudget(0), budgetedRequests()).processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertPlannedReceipt();
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedDispatchChecksRemoteHeadAndNeverReusesAnUnsentPermit() throws Exception {
+        planCorrectiveReview();
+        github.push(repository.followUpSha); // GitHub is already ahead of the local journal.
+        var dispatch = plannedDispatch(new FixtureBudget(1));
+        assertTrue(dispatch.processCommand());
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("NOT_SENT", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        github.push(repository.fixedSha);
+        replayPlannedCommand();
+        assertTrue(dispatch.processCommand());
         assertThat(github.comments()).isEmpty();
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+    }
+
+    @Test
+    void plannedDispatchRejectsAnEarlierVisitEvenAfterReturningToItsSha() throws Exception {
+        planCorrectiveReview();
+        advance(repository.followUpSha);
+        github.push(repository.fixedSha);
+        var returned = enqueue("pull_request", "synchronize", repository.fixedSha,
+                prEnvelope("synchronize", repository.fixedSha, ",\"number\":7,\"before\":\"" + repository.followUpSha + "\""));
+        assertTrue(fixes.observeSynchronize(returned, current(), head()));
+        complete(returned);
+        check(repository.fixedSha, Ci.PASSED);
+        assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals(1, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void plannedDispatchRejectsPolicyRevokedAfterClaimAndBeforePost() throws Exception {
+        planCorrectiveReview();
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        var dispatch = plannedDispatch(request -> {
+            if (checks.incrementAndGet() == 4) {
+                throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            }
+        });
+        assertTrue(dispatch.processCommand());
+        assertEquals(4, checks.get());
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("NOT_SENT", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void plannedDispatchRejectsRevokedRepositoryWithoutAReservation() throws Exception {
+        planCorrectiveReview();
+        jdbc.update("UPDATE installation_repositories SET enabled = false");
+        assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertNull(jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
+        assertEquals(1, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void plannedDispatchStopsAtExhaustedPersistentBudgetDespiteApproval() throws Exception {
+        var store = budgetedRequests();
+        planCorrectiveReview(store);
+        assertSingleBudgetHold(repository.openedSha);
+        var approved = new AtomicBoolean();
+        assertTrue(plannedDispatch(request -> approved.set(true), store).processCommand());
+
+        assertTrue(approved.get(), "the approval gate allowed the planned send");
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals(1, count("review_requests"));
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+        assertThat(github.comments()).isEmpty();
+        assertSingleBudgetHold(repository.openedSha);
+    }
+
+    @Test
+    void plannedDispatchRetriesATransientReadBeforePost() throws Exception {
+        planCorrectiveReview();
+        github.failNextPullReads(1);
+        var dispatch = plannedDispatch(new FixtureBudget(1), budgetedRequests());
+        assertTrue(dispatch.processCommand());
+        assertEquals(Map.of("status", "PENDING", "last_error_code", "REMOTE_UNAVAILABLE"),
+                jdbc.queryForMap("SELECT status, last_error_code FROM outbox_commands"));
+        assertEquals("RESERVED", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertThat(github.comments()).isEmpty();
+        String requestKey = jdbc.queryForObject("""
+                SELECT request_key FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class);
+        assertSingleBudgetHold(repository.fixedSha);
+
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp()");
+        assertTrue(plannedDispatch(new FixtureBudget(1), budgetedRequests()).processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("COMMENT_CREATED", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertThat(github.comments()).containsExactly(new SandboxGitHub.Comment(9001, repository.fixedSha, "@codex review"));
+        assertEquals(REVIEWING, current().state());
+        assertEquals(requestKey, jdbc.queryForObject("""
+                SELECT request_key FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertEquals(2, count("review_requests"));
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedDispatchRetainsAnAmbiguousPostWithoutRetryingIt() throws Exception {
+        planCorrectiveReview();
+        github.rejectCommentReceipt();
+        var dispatch = plannedDispatch(new FixtureBudget(1), budgetedRequests());
+        assertTrue(dispatch.processCommand());
+        assertEquals("DEAD", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("REMOTE_UNCERTAIN", jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
+        assertEquals("ATTEMPTED", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertNull(jdbc.queryForObject("""
+                SELECT comment_id FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, Long.class));
+        assertSingleBudgetHold(repository.fixedSha);
+        replayPlannedCommand();
+        assertTrue(plannedDispatch(new FixtureBudget(1), budgetedRequests()).processCommand());
+        assertFalse(dispatch.processCommand());
+        assertEquals("REMOTE_UNCERTAIN", jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
+        assertThat(github.comments()).containsExactly(new SandboxGitHub.Comment(9001, repository.fixedSha, "@codex review"));
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+        assertEquals(2, count("review_requests"));
+        assertSingleBudgetHold(repository.fixedSha);
+    }
+
+    @Test
+    void plannedCompletionRequiresAuthenticatedExactAttemptAndCurrentRevision() throws Exception {
+        var initial = planCorrectiveReview();
+        assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
+        verifyFixtureInlineFix(initial);
+        dispose(initial, GeneralFeedback.Action.DISMISS, null);
+        var run = jdbc.queryForObject("""
+                SELECT r.id, r.head_sha, o.review_cycle_id FROM review_requests r
+                JOIN outbox_commands o ON o.id = r.planned_command_id
+                """, (rs, row) -> new Run(PR, rs.getString("head_sha"), "codex", Stage.BASELINE,
+                rs.getObject("id", UUID.class), rs.getObject("review_cycle_id", UUID.class), "github", "fixture-reviewer"));
+
+        var original = ingestCompletion(run, "");
+        var signed = new AtomicReference<SignedAttempt>();
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var source = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, states), authorization,
+                Optional.of((pr, commentId) -> {
+                    assertEquals(PR, pr);
+                    assertEquals(9001L, commentId);
+                    reads.incrementAndGet();
+                    return Optional.ofNullable(signed.get())
+                            .filter(envelope -> MessageDigest.isEqual(envelope.signature(), signAttempt(envelope.attempt())))
+                            .map(SignedAttempt::attempt);
+                }));
+        long version = current().version();
+        assertEquals(Verdict.UNKNOWN, outcomes.assessCodex(run, version, original.id()).verdict());
+        var unlinked = new Assessment(run, version, new Completion(run, "R2", Status.COMPLETED, Conclusion.NO_FINDINGS),
+                original.id());
+        assertEquals(Verdict.UNKNOWN, outcomes.assess(unlinked).verdict());
+        assertEquals(ReviewConflict.Code.GUARD_REJECTED,
+                assertThrows(ReviewConflict.class, () -> step(BASELINE_CLEAN, OPEN)).code());
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, original.id()).verdict());
+
+        var authenticatedOriginal = attempt(original, 9001, Stage.BASELINE, run.headSha(), "attempt-1");
+        signed.set(new SignedAttempt(authenticatedOriginal, new byte[32]));
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, original.id()).verdict());
+        signed.set(SignedAttempt.authentic(authenticatedOriginal));
+        assertEquals(Verdict.CLEAN_FOR_SHA, source.assessCodex(run, version, original.id()).verdict());
+
+        // Same source ID, different body revision. A previously valid signed record cannot clear the edited source.
+        var edited = ingestCompletion(run, "   ");
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, original.id()).verdict());
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, edited.id()).verdict());
+        assertEquals(ReviewConflict.Code.GUARD_REJECTED, assertThrows(ReviewConflict.class,
+                () -> source.recordCodexClean(run, version, edited.id(), UUID.randomUUID(), OPEN)).code());
+
+        signed.set(SignedAttempt.authentic(attempt(edited, 9001, Stage.DEEP, run.headSha(), "attempt-1")));
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, edited.id()).verdict());
+        signed.set(SignedAttempt.authentic(attempt(edited, 9001, Stage.BASELINE, repository.openedSha, "attempt-1")));
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, edited.id()).verdict());
+        signed.set(SignedAttempt.authentic(attempt(edited, 9002, Stage.BASELINE, run.headSha(), "attempt-2")));
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(run, version, edited.id()).verdict());
+        assertTrue(reads.get() > 0);
+        assertEquals(0, count("review_clean_evidence"));
+
+        signed.set(SignedAttempt.authentic(attempt(edited, 9001, Stage.BASELINE, run.headSha(), "attempt-1")));
+        UUID transition = UUID.randomUUID();
+        assertEquals(DEEP_REVIEW, source.recordCodexClean(run, version, edited.id(), transition, OPEN).state());
+        assertEquals(ReviewConflict.Code.DUPLICATE_TRANSITION, assertThrows(ReviewConflict.class,
+                () -> source.recordCodexClean(run, version, edited.id(), transition, OPEN)).code());
+        signed.set(SignedAttempt.authentic(attempt(edited, 9001, Stage.BASELINE, run.headSha(), "attempt-other")));
+        assertEquals(ReviewConflict.Code.TRANSITION_ID_REUSED, assertThrows(ReviewConflict.class,
+                () -> source.recordCodexClean(run, version, edited.id(), transition, OPEN)).code());
+        assertEquals(Map.of("trigger_comment_id", 9001L, "provider_execution_id", "fixture-execution",
+                        "provider_attempt_id", "attempt-1", "stage", "BASELINE", "head_sha", repository.fixedSha),
+                jdbc.queryForMap("""
+                    SELECT trigger_comment_id, provider_execution_id, provider_attempt_id, stage, head_sha
+                    FROM review_clean_evidence
+                    """));
+    }
+
+    @Test
+    void twoRequestsForTheSameHeadRequireTheirOwnCommentAndAttempt() throws Exception {
+        var initial = planCorrectiveReview();
+        assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
+        var oldRequest = jdbc.queryForObject("SELECT id FROM review_requests WHERE planned_command_id IS NOT NULL", UUID.class);
+
+        // A new same-head observation opens another durable request epoch for a separately authorized request.
+        var sameHead = enqueue("pull_request", "synchronize", repository.fixedSha,
+                prEnvelope("synchronize", repository.fixedSha, ",\"number\":7,\"before\":\"" + repository.fixedSha + "\""));
+        assertFalse(fixes.observeSynchronize(sameHead, current(), head()));
+        complete(sameHead);
+        check(repository.fixedSha, Ci.PASSED);
+        verifyFixtureInlineFix(initial);
+        dispose(initial, GeneralFeedback.Action.DISMISS, null);
+        long epoch = jdbc.queryForObject("""
+                SELECT max(resulting_version) FROM pr_review_transitions WHERE action = 'CONFIRM_HEAD'
+                """, Long.class);
+        assertTrue(epoch > 0);
+        var secondRequest = baseline(repository.fixedSha, ReviewRequest.Trigger.PR_SYNCHRONIZE, epoch);
+        step(START_REVIEW, OPEN);
+        assertEquals(Result.COMMENT_CREATED, codex(new FixtureBudget(1), 6).request(secondRequest));
+        assertThat(github.comments()).extracting(SandboxGitHub.Comment::id).containsExactly(9001L, 9002L);
+        var second = observeRound(secondRequest, "R3", Conclusion.NO_FINDINGS);
+
+        var snapshot = ingestCompletion(second.run(), "");
+        var observedComment = new java.util.concurrent.atomic.AtomicLong();
+        var attempt = new AtomicReference<>(attempt(snapshot, 9001, Stage.BASELINE, repository.fixedSha, "attempt-1"));
+        var source = new AssessReviewOutcome(new JdbcReviewOutcomeStore(jdbc, states), authorization,
+                Optional.of((pr, commentId) -> {
+                    assertEquals(PR, pr);
+                    observedComment.set(commentId);
+                    return Optional.of(attempt.get());
+                }));
+        long version = current().version();
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(second.run(), version, snapshot.id()).verdict());
+        assertEquals(9002, observedComment.get());
+
+        var current = second.run();
+        var oldRun = new Run(PR, current.headSha(), current.provider(), current.stage(),
+                oldRequest, current.cycleId(), current.evidenceProvider(), current.reviewer());
+        assertEquals(Verdict.UNKNOWN, source.assessCodex(oldRun, version, snapshot.id()).verdict());
+        attempt.set(attempt(snapshot, 9002, Stage.BASELINE, repository.fixedSha, "attempt-2"));
+        assertEquals(Verdict.CLEAN_FOR_SHA, source.assessCodex(current, version, snapshot.id()).verdict());
+        assertEquals(0, count("review_clean_evidence"));
+    }
+
+    private Assessment planCorrectiveReview() throws Exception {
+        return planCorrectiveReview(requests);
+    }
+
+    private Assessment planCorrectiveReview(JdbcReviewRequestStore initialRequests) throws Exception {
+        var initial = startRemediation(initialRequests);
+        var worker = planningWorker((pr, intent) -> true, 6);
+        github.push(repository.fixedSha);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("synchronize", github.head())).statusCode());
+        assertTrue(worker.processEvent());
+        dispose(initial, GeneralFeedback.Action.CLAIM_FIXED, github.head());
+        successfulWorkflows();
+        agePlanning();
+        assertTrue(worker.processEvent());
+        assertEquals(1, count("outbox_commands"));
+        assertEquals(Ci.PASSED, current().ci());
+        return initial;
+    }
+
+    private DispatchPlannedCodexReview plannedDispatch(CodexApproval approval) {
+        return new DispatchPlannedCodexReview(queue, codex(approval, 6, CodexReviewAdapter.Mode.PLANNED), PR, 42);
+    }
+
+    private DispatchPlannedCodexReview plannedDispatch(CodexApproval approval, JdbcReviewRequestStore store) {
+        return plannedDispatch(approval, store, () -> {});
+    }
+
+    private DispatchPlannedCodexReview plannedDispatch(CodexApproval approval, JdbcReviewRequestStore store,
+            Runnable onCredentialLookup) {
+        return new DispatchPlannedCodexReview(queue,
+                codex(approval, 6, CodexReviewAdapter.Mode.PLANNED, store, onCredentialLookup), PR, 42);
+    }
+
+    private void dispatchAndPauseAfterReceipt() {
+        var dispatch = plannedDispatch(new FixtureBudget(1), budgetedRequests(), () ->
+                TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                    @Override
+                    public void afterCommit() {
+                        // The receipt is durable and the send transaction has released the PR lock.
+                        step(PAUSE, OPEN);
+                    }
+                }));
+        assertTrue(dispatch.processCommand());
+    }
+
+    private JdbcReviewRequestStore budgetedRequests() {
+        return new JdbcReviewRequestStore(jdbc, transactions, states, new JdbcSandboxCodexBudget(jdbc, BUDGET_TERMS));
+    }
+
+    private void assertSingleBudgetHold(String head) {
+        assertEquals(List.of(Map.of("head_sha", head, "usage_unit", BUDGET_TERMS.usageUnit(),
+                "units", BUDGET_TERMS.maxPerRequest())), jdbc.queryForList("""
+                SELECT r.head_sha, b.usage_unit, b.units FROM sandbox_codex_budget_reservations b
+                JOIN review_requests r USING (request_key)
+                """));
+        long held = BUDGET_TERMS.maxPerRequest();
+        assertThat(jdbc.queryForList("SELECT scope_key, reserved FROM sandbox_codex_budget_limits"))
+                .containsExactlyInAnyOrder(Map.of("scope_key", "global", "reserved", held),
+                        Map.of("scope_key", "installation:101", "reserved", held),
+                        Map.of("scope_key", "pr:101:1001:7", "reserved", held));
+    }
+
+    private UUID assertPlannedReceipt() {
+        assertThat(github.comments()).containsExactly(new SandboxGitHub.Comment(9001, repository.fixedSha, "@codex review"));
+        assertEquals(2, count("review_requests"));
+        return jdbc.queryForObject("""
+                SELECT id FROM review_requests WHERE planned_command_id IS NOT NULL
+                    AND state = 'COMMENT_CREATED' AND comment_id = 9001 AND iteration = 2
+                """, UUID.class);
+    }
+
+    private int plannedStarts(UUID request) {
+        return jdbc.queryForObject("""
+                SELECT count(*) FROM pr_review_transitions WHERE transition_id = ? AND action = 'START_REVIEW'
+                """, Integer.class, request);
+    }
+
+    private void replayPlannedCommand() {
+        // Simulate recovery of the queue after the independent durable request transaction has committed.
+        jdbc.update("""
+                UPDATE outbox_commands SET status='PROCESSING', completed_at=NULL,
+                    locked_until=clock_timestamp() - interval '1 second',
+                    locked_by='restarted-fixture', lease_token=?
+                """, UUID.randomUUID());
+    }
+
+    private ReviewEvidence.Snapshot ingestCompletion(Run run, String body) {
+        var seen = jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+        String sourceId = "R2";
+        var source = new ReviewEvidence.Source(sourceId, ReviewEvidence.Kind.REVIEW, sourceId, null, null,
+                run.reviewer(), run.headSha(), null, Sha256.hex(body.getBytes(StandardCharsets.UTF_8)),
+                seen, "COMMENTED", null, null, null, null, null, ReviewEvidence.Severity.UNKNOWN,
+                ReviewEvidence.Feedback.NONE);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), run.cycleId(), PR, run.evidenceProvider(),
+                run.headSha(), github.head(), seen, List.of(source));
+        assertTrue(evidence.ingest(snapshot));
+        return snapshot;
+    }
+
+    private TerminalAttempt attempt(ReviewEvidence.Snapshot snapshot, long commentId, Stage stage, String sha, String attemptId) {
+        var source = snapshot.sources().getFirst();
+        var provenance = new CodexProvenance(PR, commentId, sha, stage, "fixture-execution", attemptId,
+                snapshot.capturedAt(), source.bodySha256(), source.updatedAt());
+        return new TerminalAttempt(provenance, source.id(), source.author(), Status.COMPLETED, Conclusion.NO_FINDINGS);
+    }
+
+    private record SignedAttempt(TerminalAttempt attempt, byte[] signature) {
+        static SignedAttempt authentic(TerminalAttempt attempt) {
+            return new SignedAttempt(attempt, signAttempt(attempt));
+        }
+    }
+
+    private static byte[] signAttempt(TerminalAttempt attempt) {
+        try {
+            var mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec("provider-attestation-fixture".getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            return mac.doFinal(attempt.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (java.security.GeneralSecurityException failure) {
+            throw new AssertionError(failure);
+        }
     }
 
     @Test
@@ -512,8 +1009,12 @@ class FeedbackLoopSandboxIntegrationTest {
     }
 
     private Assessment startRemediation() throws Exception {
+        return startRemediation(requests);
+    }
+
+    private Assessment startRemediation(JdbcReviewRequestStore initialRequests) throws Exception {
         var first = openReview();
-        requests.reserve(first, 42, 6, this::authorize, () -> {});
+        initialRequests.reserve(first, 42, 6, this::authorize, () -> {});
         var round = observeRound(first, "R1", Conclusion.FINDINGS);
         step(BLOCKING_FINDINGS, BLOCKED);
         step(AWAIT_FIX, OPEN);
@@ -1084,10 +1585,22 @@ class FeedbackLoopSandboxIntegrationTest {
     }
 
     private CodexReviewAdapter codex(CodexApproval approval, int limit) {
+        return codex(approval, limit, CodexReviewAdapter.Mode.STANDARD);
+    }
+
+    private CodexReviewAdapter codex(CodexApproval approval, int limit, CodexReviewAdapter.Mode mode) {
+        return codex(approval, limit, mode, requests, () -> {});
+    }
+
+    private CodexReviewAdapter codex(CodexApproval approval, int limit, CodexReviewAdapter.Mode mode,
+            JdbcReviewRequestStore store, Runnable onCredentialLookup) {
         var credential = new Credential(PR.scope(), 42, SandboxGitHub.REPOSITORY, SandboxGitHub.USER_TOKEN,
                 clock.instant().plus(TOKEN_LIFETIME));
-        var client = new GitHubCodexComments(scope -> credential, clock, github.uri());
-        return new CodexReviewAdapter(authorization, requests, approval, client, 42, limit);
+        var client = new GitHubCodexComments(scope -> {
+            onCredentialLookup.run();
+            return credential;
+        }, clock, github.uri());
+        return new CodexReviewAdapter(authorization, store, approval, client, 42, limit, mode);
     }
 
     private static final class FixtureBudget implements CodexApproval {

@@ -94,7 +94,7 @@ public final class DurableDispatcher {
         if (queue.fail(lease, safe.code(), safe.retryable())) report(lease, safe.code().name());
     }
 
-    private static void report(Lease lease, String outcome) {
+    static void report(Lease lease, String outcome) {
         LOG.info("queue={} work_id={} correlation_id={} attempt={} outcome={}",
                 lease.queue(), lease.id(), lease.correlationId(), lease.attempt(), outcome);
     }
