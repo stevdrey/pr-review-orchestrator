@@ -33,6 +33,8 @@ While the monitors were active, both `sample=other` control events had zero targ
 | Work web | `05:52:17.436` | `05:53:13.752` → `05:53:14.500` | `05:56:05.677` | `05:56:20.663`, zero targets |
 | Dot | `05:54:22.102` | `05:54:44.898` → `05:54:45.530` | `05:55:39.755` | `05:56:20.663`, zero targets |
 
+The `work` and `dot` post-stop checks were entered back-to-back, so both zero-target emissions log at the same millisecond.
+
 The test plugin was uninstalled, the publisher and tunnel client were stopped, and the Platform tunnel configuration remains available for reuse. The runtime key was configured with a one-day expiration. Work desktop, production OAuth, restart recovery, callback retry policy under service failure, and other workspace entitlements remain outside this live test.
 
 ## Documented wire contract
@@ -101,7 +103,7 @@ When #25 introduces domain events, record a redacted transition and its stable I
 python3 -B docs/spikes/tests/test_issue_24_mcp_events.py -v
 ```
 
-Eight tests passed using Python 3.15.2 and the standard library. Five use in-process JSON-RPC and a signed loopback callback to cover discovery, the verification challenge, repeat subscriptions, owner-scoped removal, filtering, receipt, no sends after unsubscribe, redelivery deduplication, and rejection of tampered bytes. Two exercise the tunnel server over MCP HTTP with simulated callbacks and check that it rejects unauthorized hosts and nonpublic DNS results. A separate test runs the real `post_callback` with a simulated HTTPS transport and checks the exact body, headers and signature against a fixed vector. OAuth, external TLS and callbacks, key rotation, persistence, and client actions are outside these local checks.
+Eight tests passed using Python 3.15.2 and the standard library. Five run against an in-process reference model of the contract, defined in the test file rather than the tunnel fixture, with a signed loopback callback. They model discovery, the verification challenge, repeat subscriptions, owner-scoped removal, filtering, receipt, no sends after unsubscribe, receiver-side redelivery deduplication, and rejection of tampered bytes. The tunnel fixture itself has no principal scoping or deduplication. Two exercise the tunnel server over MCP HTTP with simulated callbacks and check that it rejects unauthorized hosts and nonpublic DNS results. A separate test runs the real `post_callback` with a simulated HTTPS transport and checks the exact body, headers and signature against a fixed vector. OAuth, external TLS and callbacks, key rotation, persistence, and client actions are outside these local checks.
 
 `./gradlew --offline clean build` passed 370 Java tests with zero failures, errors or skips. The spike uses a separate Python fixture and introduces no Java dependency or runtime wiring.
 
@@ -115,26 +117,29 @@ From the repository root, start the loopback fixture. Leave this terminal open f
 python3 -B docs/spikes/tests/issue_24_tunnel_server.py --port 8765
 ```
 
-It only exposes the `spike.sample` event with `work`, `dot` and `other` filters. Type one of those values in the server terminal to emit a fresh synthetic ID. `quit` stops the server and drops its in-memory subscriptions. The HTTP interface has no event-emission endpoint, repository access or write tools. Use it with a private, single-operator test tunnel. This fixture relies on private tunnel access plus the callback challenge and caps subscriptions at 30 minutes. Use end-user authorization and durable state for any repository-scoped adapter.
+It only exposes the `spike.sample` event with `work`, `dot` and `other` filters. Type one of those values in the server terminal to emit a fresh synthetic ID. `quit` stops the server and drops its in-memory subscriptions. The HTTP interface has no event-emission endpoint, repository access or write tools. Use it with a private, single-operator test tunnel. This fixture relies on private tunnel access plus the callback challenge and caps subscriptions at 30 minutes. A refresh with a replacement secret switches to the new key immediately; the fixture does not keep the previous key or send dual signatures during an overlap. Use end-user authorization and durable state for any repository-scoped adapter.
 
 Use the [official `tunnel-client` release](https://github.com/openai/tunnel-client/releases/latest). In a separate local Bash terminal, set `CONTROL_PLANE_TUNNEL_ID` to the test tunnel ID from Platform, then enter the restricted runtime key without printing it. Generate and run an isolated profile using that terminal.
 
 ```bash
-read -r -s -p 'Tunnel runtime key: ' CONTROL_PLANE_API_KEY
-printf '\n'
-export CONTROL_PLANE_API_KEY
-spike_profile_dir=$(mktemp -d "${TMPDIR:-/tmp}/issue-24-mcp-profile.XXXXXXXX")
-tunnel-client init --sample sample_mcp_remote_no_auth --profile issue-24-synthetic \
-  --profile-dir "$spike_profile_dir" \
-  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" --mcp-server-url http://127.0.0.1:8765/mcp \
-  --health-listen-addr 127.0.0.1:0
-tunnel-client doctor --profile issue-24-synthetic --profile-dir "$spike_profile_dir" --explain
-tunnel_health_file=$(mktemp "${TMPDIR:-/tmp}/issue-24-mcp-health.XXXXXXXX")
-printf 'Health URL file %s\n' "$tunnel_health_file"
-tunnel-client run --profile issue-24-synthetic --profile-dir "$spike_profile_dir" --health.url-file "$tunnel_health_file"
-rm -f "$tunnel_health_file"
-unset CONTROL_PLANE_API_KEY
+(
+  read -r -s -p 'Tunnel runtime key: ' CONTROL_PLANE_API_KEY
+  printf '\n'
+  export CONTROL_PLANE_API_KEY
+  spike_profile_dir=$(mktemp -d "${TMPDIR:-/tmp}/issue-24-mcp-profile.XXXXXXXX")
+  tunnel_health_file=$(mktemp "${TMPDIR:-/tmp}/issue-24-mcp-health.XXXXXXXX")
+  trap 'rm -rf "$spike_profile_dir" "$tunnel_health_file"' EXIT
+  tunnel-client init --sample sample_mcp_remote_no_auth --profile issue-24-synthetic \
+    --profile-dir "$spike_profile_dir" \
+    --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" --mcp-server-url http://127.0.0.1:8765/mcp \
+    --health-listen-addr 127.0.0.1:0
+  tunnel-client doctor --profile issue-24-synthetic --profile-dir "$spike_profile_dir" --explain
+  printf 'Health URL file %s\n' "$tunnel_health_file"
+  tunnel-client run --profile issue-24-synthetic --profile-dir "$spike_profile_dir" --health.url-file "$tunnel_health_file"
+)
 ```
+
+The subshell keeps the runtime key out of the calling shell. When the client stops, including on Ctrl-C, its exit trap deletes the profile directory and the health URL file.
 
 The runtime key needs **Tunnels Read + Use**. Creating a tunnel requires **Tunnels Read + Manage**. Confirm the target ChatGPT workspace is associated with the tunnel and use the approved client-network scope. [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 

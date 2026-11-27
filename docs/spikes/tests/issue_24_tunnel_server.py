@@ -5,7 +5,7 @@ import base64
 from datetime import datetime, timezone
 import hmac
 import http.client
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import re
@@ -133,25 +133,34 @@ class Probe:
                          subscription=removed[0] if removed else None)
                 return {}
 
-            requested_ttl = params.get("ttlMs")
-            ttl = TTL_SECONDS
-            if requested_ttl is not None:
-                if type(requested_ttl) is not int or requested_ttl <= 0:
-                    raise ValueError("invalid_ttl")
-                ttl = min(ttl, requested_ttl / 1000)
+        requested_ttl = params.get("ttlMs")
+        ttl = TTL_SECONDS
+        if requested_ttl is not None:
+            if type(requested_ttl) is not int or requested_ttl <= 0:
+                raise ValueError("invalid_ttl")
+            ttl = min(ttl, requested_ttl / 1000)
+        secret = destination["secret"]
+        if not secret.startswith("whsec_"):
+            raise ValueError("invalid_secret")
+        key = base64.b64decode(secret[6:], validate=True)
+        if not 24 <= len(key) <= 64:
+            raise ValueError("invalid_secret")
+
+        with self.lock:
             self.purge_expired()
             previous = self.subscriptions.get(identity)
             if previous is None and len(self.subscriptions) >= MAX_SUBSCRIPTIONS:
                 raise RpcError(-32000, "subscription_limit")
-            secret = destination["secret"]
-            if not secret.startswith("whsec_"):
-                raise ValueError("invalid_secret")
-            key = base64.b64decode(secret[6:], validate=True)
-            if not 24 <= len(key) <= 64:
-                raise ValueError("invalid_secret")
             sub_id = previous[0] if previous else "sub_" + uuid4().hex
-            if previous is None or not hmac.compare_digest(previous[1], key):
-                self.verify(url, key, sub_id)
+            needs_verification = previous is None or not hmac.compare_digest(previous[1], key)
+        # Dial the callback without the lock so slow receivers cannot stall other RPCs or deliveries.
+        if needs_verification:
+            self.verify(url, key, sub_id)
+
+        with self.lock:
+            self.purge_expired()
+            if identity not in self.subscriptions and len(self.subscriptions) >= MAX_SUBSCRIPTIONS:
+                raise RpcError(-32000, "subscription_limit")
             expires = time.time() + ttl
             self.subscriptions[identity] = (sub_id, key, expires)
             evidence("subscribe", sample=sample, subscription=sub_id, refreshed=previous is not None)
@@ -188,14 +197,17 @@ class Probe:
             matches = [(url, sub) for (filter_sample, url), sub in self.subscriptions.items()
                        if filter_sample == sample]
             evidence("emit", sample=sample, sample_id=sample_id, event=event_id, targets=len(matches))
-            for url, (sub_id, key, expires) in matches:
-                if expires <= time.time():
-                    continue
-                try:
-                    status, _ = post_callback(url, key, sub_id, event_id, event)
-                    evidence("delivery", subscription=sub_id, event=event_id, status=status)
-                except (OSError, ValueError, http.client.HTTPException):
-                    evidence("delivery_failed", subscription=sub_id, event=event_id)
+        for url, (sub_id, _, _) in matches:
+            # Recheck under the lock so an unsubscribe or refresh during earlier sends is honored.
+            with self.lock:
+                current = self.subscriptions.get((sample, url))
+            if current is None or current[0] != sub_id or current[2] <= time.time():
+                continue
+            try:
+                status, _ = post_callback(url, current[1], sub_id, event_id, event)
+                evidence("delivery", subscription=sub_id, event=event_id, status=status)
+            except (OSError, ValueError, http.client.HTTPException):
+                evidence("delivery_failed", subscription=sub_id, event=event_id)
 
 
 class McpHandler(BaseHTTPRequestHandler):
@@ -245,7 +257,7 @@ class McpHandler(BaseHTTPRequestHandler):
             return
         except RpcError as error:
             code, reason = error.code, error.reason
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
             code, reason = -32602, "invalid_request"
         evidence("rpc_error", code=code, reason=reason)
         message = "CallbackEndpointError" if code == -32015 else reason
@@ -257,7 +269,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=0, help="Loopback port (0 selects an ephemeral port)")
     args = parser.parse_args()
-    with HTTPServer(("127.0.0.1", args.port), McpHandler) as server:
+    with ThreadingHTTPServer(("127.0.0.1", args.port), McpHandler) as server:
         server.probe = Probe()
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()
