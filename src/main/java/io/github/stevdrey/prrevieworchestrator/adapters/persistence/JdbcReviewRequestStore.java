@@ -67,7 +67,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 // A planned retry reconciles START_REVIEW from a receipt committed by an earlier attempt.
                 if (request.plannedCommandId() != null && (found.state() == State.COMMENT_CREATED
                         || found.state() == State.COMMENT_CREATED_HEAD_UNCONFIRMED)) {
-                    startPlannedReview(request, found.id());
+                    startPlannedReview(request);
                 }
                 return found;
             }
@@ -164,7 +164,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             transaction(() -> {
                 PostgresLocks.lockPr(jdbc, request.pr());
                 guards.run();
-                startPlannedReview(request, id);
+                startPlannedReview(request);
                 return null;
             });
         } catch (RuntimeException failure) {
@@ -182,23 +182,9 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         };
     }
 
-    /** Caller holds the PR lock in an authorized transaction. Idempotent and closed for a later state or visit. */
-    private void startPlannedReview(ReviewRequest request, UUID id) {
-        var pr = request.pr();
-        boolean started = Boolean.TRUE.equals(jdbc.queryForObject("""
-                SELECT EXISTS (SELECT 1 FROM pr_review_transitions
-                    WHERE (installation_id, repository_id, pr_number, transition_id) = (?, ?, ?, ?))
-                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), id));
-        if (started) return;
-        var current = states.load(pr, false).orElse(null);
-        if (current == null || current.state() != PullRequestReview.State.WAITING_FOR_REVIEW
-                || !current.headSha().equals(request.headSha())
-                || request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, pr, request.headSha())) {
-            return;
-        }
-        var gates = new ReviewTransition.Gates(true, false, false, true, true, current.ci());
-        states.applyLocked(pr, new ReviewTransition(id, current.version(), request.headSha(),
-                ReviewTransition.Action.START_REVIEW, null, gates), null);
+    private void startPlannedReview(ReviewRequest request) {
+        states.load(request.pr(), false)
+                .ifPresent(current -> states.reconcilePlannedStartLocked(current, request.plannedCommandId()));
     }
 
     /** Best effort: if this fails the row stays ATTEMPTED and a retry reports OUTCOME_UNKNOWN. */
