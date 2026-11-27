@@ -10,6 +10,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence.*;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewOutcomeStore;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -18,6 +19,8 @@ import org.springframework.stereotype.Repository;
 /** Correlation and clean commit share the same serialized, authorized PR transaction. */
 @Repository
 public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
+    /** Tolerance between provider and local clocks; exact comment/attempt/SHA/revision binding is the proof. */
+    private static final Duration PROVIDER_CLOCK_SKEW = Duration.ofSeconds(30);
     private final JdbcTemplate jdbc;
     private final JdbcReviewStateStore states;
     private final ReviewOutcomeClassifier classifier = new ReviewOutcomeClassifier();
@@ -176,7 +179,8 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         var run = assessment.run();
         if (!"codex".equals(run.provider()) || !run.pr().equals(proof.pr()) || !run.headSha().equals(proof.reviewedSha())
                 || run.stage() != proof.stage() || request.commentId() != proof.commentId()
-                || proof.terminalAt().isBefore(request.createdAt()) || proof.terminalAt().isAfter(snapshot.capturedAt())) {
+                || proof.terminalAt().isBefore(request.createdAt().minus(PROVIDER_CLOCK_SKEW))
+                || proof.terminalAt().isAfter(snapshot.capturedAt().plus(PROVIDER_CLOCK_SKEW))) {
             return false;
         }
 

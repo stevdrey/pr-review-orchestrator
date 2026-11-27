@@ -9,6 +9,7 @@ import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNorma
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcFixCorrelationStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget;
 import io.github.stevdrey.prrevieworchestrator.config.CodexReviewConfiguration;
 import io.github.stevdrey.prrevieworchestrator.config.DurableDispatchConfiguration;
 import io.github.stevdrey.prrevieworchestrator.config.RepositoryAuthorizationConfiguration.Allowlist;
@@ -86,7 +87,9 @@ class DurableDispatchConfigurationTest {
                 .withBean(CodexApproval.class, () -> mock(CodexApproval.class))
                 .withBean(CodexUserCredentials.class, () -> mock(CodexUserCredentials.class));
         planned.run(app -> assertThat(app).hasFailed());
-        planned.withBean(ReviewIntentPolicy.class, () -> mock(ReviewIntentPolicy.class))
+        var policy = planned.withBean(ReviewIntentPolicy.class, () -> mock(ReviewIntentPolicy.class));
+        policy.run(app -> assertThat(app).hasFailed()); // Planned dispatch requires local hard budget terms.
+        policy.withBean(JdbcSandboxCodexBudget.Terms.class, () -> new JdbcSandboxCodexBudget.Terms("fixture", 1, 1, 1, 1))
                 .run(app -> assertThat(app).hasNotFailed().hasSingleBean(DispatchPlannedCodexReview.class));
     }
 

@@ -454,9 +454,33 @@ class FeedbackLoopSandboxIntegrationTest {
         planCorrectiveReview();
         jdbc.update("UPDATE installation_repositories SET enabled = false");
         assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
-        assertEquals("AUTHORIZATION_DENIED", jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertNull(jdbc.queryForObject("SELECT last_error_code FROM outbox_commands", String.class));
         assertEquals(1, count("review_requests"));
         assertThat(github.comments()).isEmpty();
+    }
+
+    @Test
+    void plannedDispatchRetriesATransientReadBeforePost() throws Exception {
+        planCorrectiveReview();
+        github.failNextPullReads(1);
+        var dispatch = plannedDispatch(new FixtureBudget(1));
+        assertTrue(dispatch.processCommand());
+        assertEquals(Map.of("status", "PENDING", "last_error_code", "REMOTE_UNAVAILABLE"),
+                jdbc.queryForMap("SELECT status, last_error_code FROM outbox_commands"));
+        assertEquals("RESERVED", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertThat(github.comments()).isEmpty();
+
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp()");
+        assertTrue(dispatch.processCommand());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands", String.class));
+        assertEquals("COMMENT_CREATED", jdbc.queryForObject("""
+                SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, String.class));
+        assertThat(github.comments()).containsExactly(new SandboxGitHub.Comment(9001, repository.fixedSha, "@codex review"));
+        assertEquals(REVIEWING, current().state());
     }
 
     @Test

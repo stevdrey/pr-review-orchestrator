@@ -53,7 +53,9 @@ public final class CodexReviewAdapter implements ReviewProvider {
         Runnable authorize = () -> authorization.requireAuthorized(request.pr().scope());
         Runnable approve = () -> approval.requirePermitted(request);
         var reserved = store.reserve(request, actorId, limit, authorize, approve);
-        if (!reserved.created()) return switch (reserved.state()) {
+        // The fenced planned worker resumes its own unsent permit; the atomic RESERVED claim prevents a double send.
+        boolean resume = mode == Mode.PLANNED && reserved.state() == ReviewRequestStore.State.RESERVED;
+        if (!reserved.created() && !resume) return switch (reserved.state()) {
             case RESERVED -> Result.PENDING;
             case ATTEMPTED -> Result.OUTCOME_UNKNOWN;
             case NOT_SENT -> Result.NOT_SENT;

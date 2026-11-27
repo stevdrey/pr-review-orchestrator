@@ -62,7 +62,15 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     """, (rs, row) -> new Reservation(rs.getObject("id", UUID.class),
                     State.valueOf(rs.getString("state")), false), request.key());
             // The caller authorizes duplicate reads; only a new reservation needs policy/budget approval.
-            if (!existing.isEmpty()) return existing.getFirst();
+            if (!existing.isEmpty()) {
+                var found = existing.getFirst();
+                // A planned retry reconciles START_REVIEW from a receipt committed by an earlier attempt.
+                if (request.plannedCommandId() != null && (found.state() == State.COMMENT_CREATED
+                        || found.state() == State.COMMENT_CREATED_HEAD_UNCONFIRMED)) {
+                    startPlannedReview(request, found.id());
+                }
+                return found;
+            }
             var current = requireCurrentVisit(request);
             // A V13 match preserves deduplication. Only the epoch in the original key authorizes a send.
             var reconciled = jdbc.query("""
@@ -110,7 +118,9 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             });
         } catch (RuntimeException failure) {
             // Another holder may own a non-RESERVED row; only our own still-RESERVED row is provably unsent.
-            if (!(failure instanceof ReviewRequestFailure known && known.code() == OUTCOME_UNKNOWN)) {
+            // A transient planned failure leaves the rolled-back row RESERVED for the fenced worker to resume.
+            if (!(failure instanceof ReviewRequestFailure known && known.code() == OUTCOME_UNKNOWN)
+                    && !resumable(request, failure)) {
                 markNotSent(request, id, State.RESERVED);
             }
             throw failure;
@@ -125,7 +135,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 if (requestStates.size() != 1 || requestStates.getFirst() != State.ATTEMPTED) {
                     throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
                 }
-                var current = requireSendPolicy(request, id);
+                requireSendPolicy(request, id);
                 if (sandboxBudget != null) sandboxBudget.requireHeld(request);
                 Receipt receipt = effect.get();
                 effectReturned.set(true);
@@ -133,11 +143,6 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 jdbc.update("UPDATE review_requests SET state = ?, comment_id = ?, completed_at = clock_timestamp() WHERE id = ?",
                         (receipt.headConfirmed() ? State.COMMENT_CREATED : State.COMMENT_CREATED_HEAD_UNCONFIRMED).name(),
                         receipt.commentId(), id);
-                if (request.plannedCommandId() != null) {
-                    var gates = new ReviewTransition.Gates(true, false, false, true, true, current.ci());
-                    states.applyLocked(request.pr(), new ReviewTransition(id, current.version(), request.headSha(),
-                            ReviewTransition.Action.START_REVIEW, null, gates), null);
-                }
                 return null;
             });
         } catch (RuntimeException failure) {
@@ -145,8 +150,66 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             if (effectReturned.get() || failure instanceof ReviewRequestFailure known && known.code() == OUTCOME_UNKNOWN) {
                 throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
             }
-            markNotSent(request, id, State.ATTEMPTED);
+            // The effect never returned, so a transient planned failure provably posted nothing.
+            if (resumable(request, failure)) {
+                restoreReserved(request, id);
+            } else {
+                markNotSent(request, id, State.ATTEMPTED);
+            }
             throw failure;
+        }
+        if (request.plannedCommandId() == null) return;
+        // The receipt is committed first; a failure here is reconciled by the retry's reserve().
+        try {
+            transaction(() -> {
+                PostgresLocks.lockPr(jdbc, request.pr());
+                guards.run();
+                startPlannedReview(request, id);
+                return null;
+            });
+        } catch (RuntimeException failure) {
+            throw new ReviewRequestFailure(STORE_UNAVAILABLE);
+        }
+    }
+
+    /** Only the fenced planned worker resumes a permit; standard callers keep the NOT_SENT tombstone. */
+    private static boolean resumable(ReviewRequest request, RuntimeException failure) {
+        if (request.plannedCommandId() == null) return false;
+        if (failure instanceof AuthorizationUnavailable) return true;
+        return failure instanceof ReviewRequestFailure known && switch (known.code()) {
+            case REMOTE_UNAVAILABLE, STORE_UNAVAILABLE, PR_NOT_READY, CI_NOT_PASSED, CAPABILITY_UNVERIFIED -> true;
+            default -> false;
+        };
+    }
+
+    /** Caller holds the PR lock in an authorized transaction. Idempotent and closed for a later state or visit. */
+    private void startPlannedReview(ReviewRequest request, UUID id) {
+        var pr = request.pr();
+        boolean started = Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM pr_review_transitions
+                    WHERE (installation_id, repository_id, pr_number, transition_id) = (?, ?, ?, ?))
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), id));
+        if (started) return;
+        var current = states.load(pr, false).orElse(null);
+        if (current == null || current.state() != PullRequestReview.State.WAITING_FOR_REVIEW
+                || !current.headSha().equals(request.headSha())
+                || request.headEpoch() != JdbcFixCorrelationStore.headEpoch(jdbc, pr, request.headSha())) {
+            return;
+        }
+        var gates = new ReviewTransition.Gates(true, false, false, true, true, current.ci());
+        states.applyLocked(pr, new ReviewTransition(id, current.version(), request.headSha(),
+                ReviewTransition.Action.START_REVIEW, null, gates), null);
+    }
+
+    /** Best effort: if this fails the row stays ATTEMPTED and a retry reports OUTCOME_UNKNOWN. */
+    private void restoreReserved(ReviewRequest request, UUID id) {
+        try {
+            transaction(() -> jdbc.update("""
+                    UPDATE review_requests SET state = 'RESERVED'
+                    WHERE id = ? AND request_key = ? AND state = 'ATTEMPTED'
+                    """, id, request.key()));
+        } catch (RuntimeException ignored) {
+            // Keep the original failure; an ATTEMPTED row is never reused as a permit.
         }
     }
 

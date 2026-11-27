@@ -2,6 +2,8 @@ package io.github.stevdrey.prrevieworchestrator.application;
 
 import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationUnavailable;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequest;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure;
@@ -64,14 +66,20 @@ public final class DispatchPlannedCodexReview {
                 case OUTCOME_UNKNOWN -> throw new Failure(ErrorCode.REMOTE_UNCERTAIN, false);
             };
         } catch (ReviewRequestFailure failure) {
+            // Transient codes leave the permit RESERVED in the store, so a bounded retry can still send it.
             return switch (failure.code()) {
-                case STALE_HEAD, PR_NOT_READY, POLICY_DENIED, CI_NOT_PASSED, LIMIT_REACHED,
-                     HUMAN_INTERVENTION_REQUIRED, ACTOR_DENIED, CAPABILITY_UNVERIFIED -> Outcome.CANCELLED;
-                case REMOTE_UNAVAILABLE -> throw new Failure(ErrorCode.REMOTE_UNAVAILABLE, true);
+                case STALE_HEAD, POLICY_DENIED, LIMIT_REACHED, HUMAN_INTERVENTION_REQUIRED, ACTOR_DENIED -> Outcome.CANCELLED;
+                case REMOTE_UNAVAILABLE, PR_NOT_READY, CAPABILITY_UNVERIFIED ->
+                        throw new Failure(ErrorCode.REMOTE_UNAVAILABLE, true);
                 case OUTCOME_UNKNOWN -> throw new Failure(ErrorCode.REMOTE_UNCERTAIN, false);
-                case STORE_UNAVAILABLE -> throw new Failure(ErrorCode.INTERNAL_ERROR, true);
+                case STORE_UNAVAILABLE, CI_NOT_PASSED -> throw new Failure(ErrorCode.INTERNAL_ERROR, true);
                 case DISABLED, UNSUPPORTED_TRIGGER -> throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
             };
+        } catch (AuthorizationDenied denied) {
+            // A denied scope posts nothing; any receipt from an earlier attempt still occupies its iteration slot.
+            return Outcome.CANCELLED;
+        } catch (AuthorizationUnavailable unavailable) {
+            throw new Failure(ErrorCode.AUTHORIZATION_UNAVAILABLE, true);
         }
     }
 }

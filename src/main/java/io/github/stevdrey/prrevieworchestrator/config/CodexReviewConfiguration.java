@@ -102,7 +102,7 @@ public class CodexReviewConfiguration {
         if (oneShot && !sandbox.enabled()) throw new IllegalArgumentException("One-shot review requires sandbox mode");
         if (env.getProperty("orchestrator.sandbox-ci.codex-dispatch-enabled", Boolean.class, false)) {
             return plannedProvider(jdbc, manager, states, authorization, approval, credentials, sandbox,
-                    intentPolicy.getObject(), env, actorId, limit);
+                    intentPolicy.getObject(), budgetTerms.getObject(), env, actorId, limit);
         }
         var budget = oneShot ? new JdbcSandboxCodexBudget(jdbc, budgetTerms.getObject()) : null;
         var adapter = new CodexReviewAdapter(authorization, new JdbcReviewRequestStore(jdbc, manager, states, budget), approval,
@@ -118,7 +118,7 @@ public class CodexReviewConfiguration {
     private ReviewProvider plannedProvider(JdbcTemplate jdbc, PlatformTransactionManager manager,
             JdbcReviewStateStore states, RepositoryAuthorization authorization, CodexApproval approval,
             CodexUserCredentials credentials, SandboxSettings sandbox, ReviewIntentPolicy policy,
-            Environment env, long actorId, int limit) {
+            JdbcSandboxCodexBudget.Terms budgetTerms, Environment env, long actorId, int limit) {
         if (sandbox.enabled() || !env.getProperty("orchestrator.dispatch.enabled", Boolean.class, false)
                 || !env.getProperty("orchestrator.sandbox-ci.enabled", Boolean.class, false)
                 || !env.getProperty("orchestrator.sandbox-ci.synchronize-enabled", Boolean.class, false)) {
@@ -133,7 +133,9 @@ public class CodexReviewConfiguration {
             if (!policy.permits(pr, intent)) throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
             approval.requirePermitted(request);
         };
-        var adapter = new CodexReviewAdapter(authorization, new JdbcReviewRequestStore(jdbc, manager, states),
+        // Local hard budget reservations are held under the PR lock, independent of the injected approval.
+        var budget = new JdbcSandboxCodexBudget(jdbc, budgetTerms);
+        var adapter = new CodexReviewAdapter(authorization, new JdbcReviewRequestStore(jdbc, manager, states, budget),
                 plannedApproval, new GitHubCodexComments(credentials, Clock.systemUTC()), actorId, limit, CodexReviewAdapter.Mode.PLANNED);
         return request -> {
             if (!request.pr().equals(pr) || request.trigger() != ReviewRequest.Trigger.PLANNED_REREVIEW) {
