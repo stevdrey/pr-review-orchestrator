@@ -71,6 +71,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [CI reconciliation, iteration limits and human intervention](docs/development/ci-and-iteration-policy.md)
 - [Durable re-review planning from synchronize events](docs/development/synchronize-review-planning.md)
 - [Opt-in GitHub PR author notifications](docs/development/author-notifications.md)
+- [Durable PR domain events and signed webhook delivery](docs/development/domain-events.md)
 - [Security and trust model](docs/security/threat-model.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Codex attribution spike and test protocol](docs/spikes/issue-14-codex-attribution.md)

@@ -315,6 +315,13 @@ class GeneralFeedbackIntegrationTest {
         assertEquals(current().version(), jdbc.queryForObject("""
                 SELECT state_version FROM author_notifications WHERE state = 'ACTION_REQUIRED' AND head_sha = ?
                 """, Long.class, HEAD));
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM pr_domain_events e
+                JOIN pr_review_transitions t USING (installation_id, repository_id, pr_number, transition_id)
+                WHERE e.installation_id = ? AND e.repository_id = ? AND e.pr_number = ?
+                    AND t.action = 'BLOCKING_FINDINGS' AND t.resulting_version = ? AND t.resulting_head_sha = ?
+                """, Integer.class, PR.scope().installationId(), PR.scope().repositoryId(), PR.number(),
+                current().version(), HEAD));
         assertNull(current().baselineCleanSha());
         // A separate PR can already have both clean stage verdicts when feedback is first observed.
         jdbc.execute("TRUNCATE review_evidence_snapshots, finding_identities CASCADE");
@@ -388,7 +395,7 @@ class GeneralFeedbackIntegrationTest {
                         baseline_clean_sha, deep_clean_sha) VALUES (101, 1001, 8, ?, 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD);
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(12, migration.migrate().migrationsExecuted);
+            assertEquals(13, migration.migrate().migrationsExecuted);
             assertEquals("NEEDS_HUMAN", scoped.queryForObject("SELECT feedback FROM review_evidence_sources", String.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM findings WHERE source_kind = 'REVIEW' AND thread_id IS NULL", Integer.class));
             assertEquals("ACTION_REQUIRED", scoped.queryForObject("SELECT state FROM pr_review_states WHERE pr_number = 7", String.class));
@@ -452,7 +459,7 @@ class GeneralFeedbackIntegrationTest {
                         """, observation.id(), HEAD, revision.bodySha256(), java.sql.Timestamp.from(revision.updatedAt()));
             }
             var migration = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(12, migration.migrate().migrationsExecuted);
+            assertEquals(13, migration.migrate().migrationsExecuted);
             assertEquals(observations.size(), scoped.queryForObject("SELECT count(*) FROM review_evidence_sources", Integer.class));
             assertEquals(1, scoped.queryForObject("SELECT count(*) FROM finding_identities", Integer.class));
             assertEquals(2, scoped.queryForObject("SELECT count(*) FROM findings", Integer.class));

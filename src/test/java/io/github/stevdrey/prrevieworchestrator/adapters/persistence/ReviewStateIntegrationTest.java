@@ -1320,7 +1320,7 @@ class ReviewStateIntegrationTest {
                            (101, 1001, 8, ?, 'PAUSED', 'READY_FOR_HUMAN', ?, ?)
                     """, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD);
             var latest = Flyway.configure().dataSource(dataSource).schemas(schema).defaultSchema(schema).load();
-            assertEquals(5, latest.migrate().migrationsExecuted);
+            assertEquals(6, latest.migrate().migrationsExecuted);
             assertEquals("DEEP_REVIEW", jdbc.queryForObject(
                     "SELECT state FROM ci_upgrade_fixture.pr_review_states WHERE pr_number = 7", String.class));
             assertEquals(Map.of("state", "PAUSED", "resume_state", "DEEP_REVIEW", "ci_status", "UNKNOWN", "deep_clean_sha", HEAD),
@@ -1380,7 +1380,7 @@ class ReviewStateIntegrationTest {
                     """, requestId, snapshot.id(), "2".repeat(64));
 
             var latest = Flyway.configure().dataSource(scoped).schemas(schema).load();
-            assertEquals(4, latest.migrate().migrationsExecuted);
+            assertEquals(5, latest.migrate().migrationsExecuted);
             var fixed = stateStore.find(FIRST, () -> {}).orElseThrow();
             assertEquals(Ci.UNKNOWN, fixed.ci());
             assertEquals(NEXT, fixed.headSha());

@@ -1,6 +1,6 @@
 # ADR 0006: Provider-neutral review and event/agent adapters
 
-**Status:** Accepted (internal review request port, default-disabled Codex adapter and conservative outcome classification implemented; live completion, agent and event adapters pending)
+**Status:** Accepted (internal review request port, default-disabled Codex adapter and conservative outcome classification implemented; durable PR events and opt-in signed webhook delivery implemented; live completion and Work/Dot adapters pending)
 **Date:** 2026-11-13
 
 ## Context
@@ -22,3 +22,5 @@ Hardcode Codex or Claude integration into the state machine; brittle and provide
 ## Verification
 
 Two interchangeable review adapters with identical normalized outcomes; Dot integration fallback; missing provider credentials; tool-injection and budget override tests.
+
+Issue #25 implements the [domain event and publisher boundary](../development/domain-events.md). PostgreSQL records typed transition events and scoped delivery rows with the journal update. The opt-in HTTPS adapter uses configured destinations, per-subscription signatures, durable retries and send-time revocation checks. The Work/Dot spike verified a synthetic provider path. Production MCP subscription management stays separate from the local queue.

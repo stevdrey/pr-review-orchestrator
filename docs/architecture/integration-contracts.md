@@ -28,9 +28,7 @@ Issue #19 supplies the [internal outcome classifier and clean-recording boundary
 
 ## AgentEventPublisher / MCP
 
-An optional adapter may expose read-only PR status and controlled actions via MCP tools, and publish subscribed domain events to compatible platforms (including Dots/Work **only after a real capability test**). The application is event-driven regardless of MCP client availability.
-
-Possible event kinds: `pr.review.completed`, `pr.feedback.detected`, `pr.feedback.resolved`, `pr.ci.failed`, `pr.ready.for.validation`, `pr.review.limit.reached`, `pr.human.approval.required`. Include event ID, repo/PR identifiers, SHA, trace ID and only redacted metadata. Apply replay/idempotency and opt-in subscription policies; do not send full source/diffs by default.
+Issue #25 supplies the [PR domain event outbox and publisher port](../development/domain-events.md). Each committed journal transition produces a typed, metadata-only event. The opt-in HTTPS adapter signs deliveries for operator-registered subscriptions and deduplicates queue entries by subscription and event UUID. The application remains event-driven independently of the optional Work and Dot bridge and MCP tools.
 
 ## Author notifications
 
