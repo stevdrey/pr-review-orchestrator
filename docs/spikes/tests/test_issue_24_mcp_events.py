@@ -1,15 +1,16 @@
 """Synthetic MCP Events contract probe. The callback accepts loopback traffic only."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
 import hmac
 import http.client
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from io import StringIO
 import json
-from threading import Thread
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -240,7 +241,7 @@ class PostCallbackTest(unittest.TestCase):
 
 class TunnelServerProbe(unittest.TestCase):
     def setUp(self):
-        self.server = HTTPServer(("127.0.0.1", 0), tunnel.McpHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), tunnel.McpHandler)
         self.server.probe = tunnel.Probe()
         thread = Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
@@ -250,8 +251,14 @@ class TunnelServerProbe(unittest.TestCase):
         self.enterContext(redirect_stdout(StringIO()))
         self.request = {"name": tunnel.EVENT, "arguments": {"sample": "work"},
                         "delivery": {"mode": "webhook", "url": "https://chatgpt.com/synthetic-callback"}}
-        self.subscribe = dict(self.request, delivery=dict(self.request["delivery"],
-                                                          secret="whsec_" + base64.b64encode(KEY).decode()))
+        self.subscribe = self.subscription_request()
+
+    def subscription_request(self, key=KEY, **params):
+        delivery = dict(self.request["delivery"], secret="whsec_" + base64.b64encode(key).decode())
+        return dict(self.request, delivery=delivery, **params)
+
+    def echo_challenge(self, payload):
+        return 200, json.dumps({"challenge": payload["challenge"]}).encode()
 
     def rpc(self, method, params=None):
         request = {"id": 1, "jsonrpc": "2.0", "method": method, "params": params or {}}
@@ -264,7 +271,7 @@ class TunnelServerProbe(unittest.TestCase):
     def test_http_discovery_subscription_and_removal(self):
         def webhook(url, key, sub_id, message_id, payload):
             if payload.get("type") == "verification":
-                return 200, json.dumps({"challenge": payload["challenge"]}).encode()
+                return self.echo_challenge(payload)
             self.assertEqual(message_id, payload["eventId"])
             self.assertEqual("work", payload["data"]["sample"])
             return 204, b""
@@ -283,6 +290,113 @@ class TunnelServerProbe(unittest.TestCase):
             self.assertEqual({}, self.rpc("events/unsubscribe", self.request)["result"])
             self.server.probe.emit("work")
             self.assertEqual(2, callback.call_count)
+
+    def test_unsubscribe_invalidates_refresh_while_verification_waits(self):
+        replacement_key = b"r" * 32
+        verifying = Event()
+        release = Event()
+
+        def webhook(url, key, sub_id, message_id, payload):
+            if key == replacement_key:
+                verifying.set()
+                self.assertTrue(release.wait(5))
+            return self.echo_challenge(payload)
+
+        with (patch.object(tunnel, "post_callback", side_effect=webhook) as callback,
+              ThreadPoolExecutor(max_workers=1) as requests):
+            original = self.rpc("events/subscribe", self.subscribe)["result"]["id"]
+            refresh = requests.submit(self.rpc, "events/subscribe", self.subscription_request(replacement_key))
+            try:
+                self.assertTrue(verifying.wait(2))
+                self.assertEqual({}, self.rpc("events/unsubscribe", self.request)["result"])
+                self.assertFalse(refresh.done())
+            finally:
+                release.set()
+
+            self.assertEqual("subscription_superseded", refresh.result(timeout=2)["error"]["data"]["reason"])
+            callback.reset_mock()
+            self.server.probe.emit("work")
+            callback.assert_not_called()
+            fresh = self.rpc("events/subscribe", self.subscribe)["result"]["id"]
+            self.assertNotEqual(original, fresh)
+
+    def test_overlapping_identical_initial_requests_share_one_subscription(self):
+        verifying = Event()
+        duplicate_waiting = Event()
+        release = Event()
+
+        def webhook(url, key, sub_id, message_id, payload):
+            verifying.set()
+            self.assertTrue(release.wait(5))
+            return self.echo_challenge(payload)
+
+        read_result = self.server.probe.subscription_result
+
+        def observe_wait(reservation):
+            duplicate_waiting.set()
+            return read_result(reservation)
+
+        with (patch.object(tunnel, "post_callback", side_effect=webhook) as callback,
+              patch.object(self.server.probe, "subscription_result", side_effect=observe_wait),
+              ThreadPoolExecutor(max_workers=2) as requests):
+            first = requests.submit(self.rpc, "events/subscribe", self.subscribe)
+            try:
+                self.assertTrue(verifying.wait(2))
+                duplicate = requests.submit(self.rpc, "events/subscribe", self.subscribe)
+                self.assertTrue(duplicate_waiting.wait(2))
+                self.assertFalse(duplicate.done())
+            finally:
+                release.set()
+
+            first_result = first.result(timeout=2)["result"]
+            self.assertEqual(first_result, duplicate.result(timeout=2)["result"])
+            self.assertEqual(1, len(self.server.probe.subscriptions))
+            callback.assert_called_once()
+
+    def test_stale_refresh_cannot_replace_newer_committed_key(self):
+        stale_key = b"s" * 32
+        newer_key = b"n" * 32
+        verifying = Event()
+        release = Event()
+
+        def webhook(url, key, sub_id, message_id, payload):
+            if payload.get("type") != "verification":
+                return 204, b""
+            if key == stale_key:
+                verifying.set()
+                self.assertTrue(release.wait(5))
+            return self.echo_challenge(payload)
+
+        with (patch.object(tunnel, "post_callback", side_effect=webhook) as callback,
+              ThreadPoolExecutor(max_workers=1) as requests):
+            original = self.rpc("events/subscribe", self.subscribe)["result"]["id"]
+            stale = requests.submit(self.rpc, "events/subscribe", self.subscription_request(stale_key))
+            try:
+                self.assertTrue(verifying.wait(2))
+                newer = self.rpc("events/subscribe", self.subscription_request(newer_key))["result"]["id"]
+                self.assertEqual(original, newer)
+            finally:
+                release.set()
+
+            self.assertEqual("subscription_superseded", stale.result(timeout=2)["error"]["data"]["reason"])
+            callback.reset_mock()
+            self.server.probe.emit("work")
+            callback.assert_called_once()
+            self.assertEqual((newer_key, original), callback.call_args.args[1:3])
+
+    def test_http_ttl_defaults_and_caps_the_granted_expiry(self):
+        cases = [({}, 1800), ({"ttlMs": None}, 1800), ({"ttlMs": 1250}, 1.25), ({"ttlMs": 10**400}, 1800)]
+
+        def webhook(url, key, sub_id, message_id, payload):
+            return self.echo_challenge(payload)
+
+        with (patch.object(tunnel.time, "time", return_value=SIGNING_TIME),
+              patch.object(tunnel, "post_callback", side_effect=webhook)):
+            for params, granted_seconds in cases:
+                with self.subTest(ttl=params):
+                    result = self.rpc("events/subscribe", self.subscription_request(**params))["result"]
+                    expires = datetime.fromtimestamp(SIGNING_TIME + granted_seconds, timezone.utc).isoformat()
+                    self.assertEqual(expires, result["refreshBefore"])
 
     def test_unapproved_host_and_nonpublic_resolution_are_rejected(self):
         forged = dict(self.subscribe, delivery=dict(self.subscribe["delivery"], url="https://example.invalid/"))

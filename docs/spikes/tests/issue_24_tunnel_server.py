@@ -2,6 +2,8 @@
 
 import argparse
 import base64
+from concurrent.futures import CancelledError, Future
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hmac
 import http.client
@@ -94,9 +96,18 @@ class RpcError(Exception):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class PendingSubscription:
+    subscription_id: str
+    key: bytes
+    ttl: float
+    completion: Future = field(default_factory=Future)
+
+
 class Probe:
     def __init__(self):
         self.subscriptions = {}
+        self.pending = {}
         self.lock = Lock()
 
     def rpc(self, method, params):
@@ -126,8 +137,11 @@ class Probe:
         callback_target(url)
         identity = (sample, url)
 
-        with self.lock:
-            if method == "events/unsubscribe":
+        if method == "events/unsubscribe":
+            with self.lock:
+                pending = self.pending.pop(identity, None)
+                if pending is not None:
+                    pending.completion.cancel()
                 removed = self.subscriptions.pop(identity, None)
                 evidence("unsubscribe", sample=sample, matched=removed is not None,
                          subscription=removed[0] if removed else None)
@@ -138,34 +152,72 @@ class Probe:
         if requested_ttl is not None:
             if type(requested_ttl) is not int or requested_ttl <= 0:
                 raise ValueError("invalid_ttl")
-            ttl = min(ttl, requested_ttl / 1000)
+            ttl = min(ttl * 1000, requested_ttl) / 1000
         secret = destination["secret"]
         if not secret.startswith("whsec_"):
             raise ValueError("invalid_secret")
         key = base64.b64decode(secret[6:], validate=True)
         if not 24 <= len(key) <= 64:
             raise ValueError("invalid_secret")
+        return self.subscribe(identity, key, ttl)
 
+    def subscribe(self, identity, key, ttl):
         with self.lock:
             self.purge_expired()
             previous = self.subscriptions.get(identity)
-            if previous is None and len(self.subscriptions) >= MAX_SUBSCRIPTIONS:
-                raise RpcError(-32000, "subscription_limit")
-            sub_id = previous[0] if previous else "sub_" + uuid4().hex
             needs_verification = previous is None or not hmac.compare_digest(previous[1], key)
-        # Dial the callback without the lock so slow receivers cannot stall other RPCs or deliveries.
-        if needs_verification:
-            self.verify(url, key, sub_id)
+            pending = self.pending.get(identity)
+            duplicate = pending is not None and pending.ttl == ttl and hmac.compare_digest(pending.key, key)
+            if not duplicate:
+                if pending is not None:
+                    # A competing refresh keeps the ID and supersedes the older intent.
+                    sub_id = pending.subscription_id
+                    pending.completion.cancel()
+                elif previous is not None:
+                    sub_id = previous[0]
+                else:
+                    if len(self.subscriptions.keys() | self.pending.keys()) >= MAX_SUBSCRIPTIONS:
+                        raise RpcError(-32000, "subscription_limit")
+                    sub_id = "sub_" + uuid4().hex
+                pending = self.pending[identity] = PendingSubscription(sub_id, key, ttl)
+
+        if not duplicate:
+            self.verify_and_commit(identity, pending, needs_verification, refreshed=previous is not None)
+        return self.subscription_result(pending)
+
+    def verify_and_commit(self, identity, pending, needs_verification, *, refreshed):
+        sample, url = identity
+        sub_id = pending.subscription_id
+        try:
+            # Verification can block on the receiver. Only the commit needs the lock.
+            if needs_verification:
+                self.verify(url, pending.key, sub_id)
+        except Exception as error:
+            with self.lock:
+                if self.pending.get(identity) is pending:
+                    del self.pending[identity]
+                    pending.completion.set_exception(error)
+            return
 
         with self.lock:
-            self.purge_expired()
-            if identity not in self.subscriptions and len(self.subscriptions) >= MAX_SUBSCRIPTIONS:
-                raise RpcError(-32000, "subscription_limit")
-            expires = time.time() + ttl
-            self.subscriptions[identity] = (sub_id, key, expires)
-            evidence("subscribe", sample=sample, subscription=sub_id, refreshed=previous is not None)
-            return {"id": sub_id, "refreshBefore": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
-                    "cursor": None, "truncated": False}
+            if self.pending.get(identity) is not pending:
+                return
+            expires = time.time() + pending.ttl
+            self.subscriptions[identity] = (sub_id, pending.key, expires)
+            del self.pending[identity]
+            evidence("subscribe", sample=sample, subscription=sub_id, refreshed=refreshed)
+            pending.completion.set_result({
+                "id": sub_id, "refreshBefore": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+                "cursor": None, "truncated": False,
+            })
+
+    def subscription_result(self, pending):
+        try:
+            return pending.completion.result(timeout=15)
+        except CancelledError:
+            raise RpcError(-32000, "subscription_superseded") from None
+        except TimeoutError:
+            raise RpcError(-32015, "timeout") from None
 
     def purge_expired(self):
         now = time.time()
