@@ -30,6 +30,8 @@ Java 27 · Spring Boot · Gradle · PostgreSQL · Flyway · GitHub App · GitHub
 5. After a clean Codex baseline, optionally launch deep independent review (e.g., OpenAI/Claude).
 6. Require up-to-date CI, no blocking findings, and a fresh clean review before notifying the author.
 
+The optional [private MCP endpoint](docs/development/mcp-tools.md) offers scoped PR status and findings plus an explicitly approved local pause. Review dispatch from MCP remains unavailable.
+
 ## Getting started
 
 Install a JDK 27 distribution and Docker with Compose. From the repository root:

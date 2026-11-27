@@ -34,7 +34,7 @@ public class JdbcReviewStateStore implements ReviewStateStore {
         transactions.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
     }
 
-    private <T> T transaction(Runnable authorize, Supplier<T> operation) {
+    <T> T transaction(Runnable authorize, Supplier<T> operation) {
         try {
             return transactions.execute(status -> {
                 try {

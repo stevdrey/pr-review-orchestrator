@@ -12,6 +12,7 @@
 - Boundary C: external GitHub/provider responses and PR-authored text → policy engine.
 - Boundary D: AI review outputs → public comments or isolated fix worker.
 - Boundary E: outbox → MCP/Dot callbacks, email and notifications.
+- Boundary F: native MCP client → scoped inspection and explicitly approved local commands.
 
 ## Threats → mandatory controls
 
@@ -76,3 +77,5 @@ automatic review loop is introduced. See [trust contracts and recovery limits](.
 Issue #74 consumes scoped, visit-bound sandbox intents through the one-shot request permit. The queue claim and local request authorization are checked independently. A receipt survives a separate outbox commit failure, and an ambiguous POST remains ineligible for resend. A planned clean transition requires a verified provider record for the exact trigger comment, terminal attempt, full SHA, local stage and persisted review revision. A reaction, editable summary or matching SHA alone cannot supply this provenance. No native completion source or production entitlement is supplied. [Dispatch controls](../development/synchronize-review-planning.md#opt-in-dispatch-to-codex) · [Completion trust contract](../development/review-outcomes.md#authenticated-codex-completion)
 
 Issue #25 adds the [metadata-only PR event outbox and opt-in HTTPS publisher](../development/domain-events.md). Only trusted operator registration and deployment configuration can select callbacks. PostgreSQL binds the recipient ID to its scope and URL fingerprint, fences concurrent attempts and locks the live subscription and repository membership through bounded delivery. Retry attempts reuse the event's idempotency key. Raw keys are read from a mounted directory and receiver bodies are discarded. Deployment egress must restrict approved DNS/IP destinations, and receivers must verify the timestamp and signature and durably deduplicate their processing. Provider-specific client authentication, subscription RPCs and callback challenges remain separate.
+
+Issue #26 intersects delegated MCP grants with live installation/repository membership. Expiry, revocation, exact PR scope, full head SHA and command approval are checked before any local mutation. The PR lock and audit transaction fence retries. Tool payloads exclude review text and credentials. Operator-managed grants are a private deployment trust boundary and require revocation when the user's access changes. [MCP security and operation](../development/mcp-tools.md)

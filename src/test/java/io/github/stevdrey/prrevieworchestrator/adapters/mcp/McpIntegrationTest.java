@@ -1,0 +1,353 @@
+package io.github.stevdrey.prrevieworchestrator.adapters.mcp;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
+import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition;
+import io.github.stevdrey.prrevieworchestrator.domain.Sha256;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.IntStream;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
+@Testcontainers
+@SpringBootTest(classes = PrReviewOrchestratorApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class McpIntegrationTest {
+    private static final JsonMapper JSON = JsonMapper.shared();
+    private static final HttpClient CLIENT = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
+    private static final String VERSION = "2025-11-25";
+    private static final String HEAD = "a".repeat(40);
+    private static final String NEXT_HEAD = "b".repeat(64);
+    private static final String READ = "1".repeat(64);
+    private static final String PAUSE = "2".repeat(64);
+    private static final String REVIEW = "3".repeat(64);
+    private static final PullRequestId PR = new PullRequestId(new RepositoryScope(101, 1001), 7);
+    private static final Map<String, Object> TARGET =
+            Map.of("installationId", 101, "repositoryId", 1001, "prNumber", 7, "headSha", HEAD);
+
+    @Container
+    static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer(DockerImageName.parse(Objects.requireNonNull(
+            System.getProperty("test.postgres.image"))).asCompatibleSubstituteFor("postgres"));
+
+    @DynamicPropertySource
+    static void properties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("orchestrator.github.repositories.101[0]", () -> "1001");
+        registry.add("orchestrator.github.repositories.202[0]", () -> "1001");
+        registry.add("orchestrator.mcp.enabled", () -> "true");
+    }
+
+    @LocalServerPort
+    int port;
+    @Autowired
+    JdbcTemplate jdbc;
+    @Autowired
+    ReviewLifecycle lifecycle;
+
+    @AfterAll
+    static void closeClient() {
+        CLIENT.close();
+    }
+
+    @BeforeEach
+    void seed() {
+        jdbc.execute("TRUNCATE installations CASCADE");
+        jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
+        jdbc.update("""
+                INSERT INTO installation_repositories (installation_id, repository_id, enabled)
+                VALUES (101, 1001, true), (101, 2002, true), (202, 1001, true)
+                """);
+        lifecycle.create(PR, HEAD);
+        lifecycle.create(new PullRequestId(PR.scope(), 8), HEAD);
+        lifecycle.create(new PullRequestId(new RepositoryScope(202, 1001), 7), HEAD);
+        grant(READ, null, null, null);
+    }
+
+    @Test
+    void initializesAndAdvertisesSchemasOverStreamableHttp() throws Exception {
+        var init = post(READ, rpc("initialize", Map.of("protocolVersion", VERSION, "capabilities", Map.of(),
+                "clientInfo", Map.of("name", "fixture", "version", "1"))));
+        assertEquals(200, init.statusCode());
+        assertEquals(VERSION, JSON.readTree(init.body()).at("/result/protocolVersion").asText());
+        assertEquals(202, post(READ, """
+                {"jsonrpc":"2.0","method":"notifications/initialized"}
+                """).statusCode());
+        var listing = post(READ, rpc("tools/list", Map.of()));
+        assertEquals(200, listing.statusCode());
+        assertEquals("no-store", listing.headers().firstValue("Cache-Control").orElseThrow());
+        var tools = JSON.readTree(listing.body()).at("/result/tools");
+        assertThat(tools.values()).extracting(tool -> tool.path("name").asText())
+                .containsExactly("get_pr_status", "list_findings", "pause_cycle", "request_review");
+        for (JsonNode tool : tools) {
+            assertThat(tool.at("/inputSchema/required").values()).anyMatch(field -> field.asText().equals("headSha"));
+            assertThat(tool.at("/inputSchema/additionalProperties").booleanValue()).isFalse();
+        }
+
+        var status = tool(READ, "get_pr_status", TARGET, "OK");
+        assertEquals("NEW", status.path("state").asText());
+        assertEquals("UNKNOWN", status.path("ci").asText());
+        assertEquals(HEAD, status.path("headSha").asText());
+        var get = HttpRequest.newBuilder(endpoint()).header("Authorization", "Bearer " + READ)
+                .header("Accept", "text/event-stream").GET().build();
+        assertEquals(405, CLIENT.send(get, HttpResponse.BodyHandlers.discarding()).statusCode());
+    }
+
+    @Test
+    void onlyReturnsRedactedFindingsForTheAuthorizedPrAndHeadAcrossPages() throws Exception {
+        UUID current = cycle(101, 7, HEAD);
+        for (int i = 1; i <= 51; i++) finding(current, 101, HEAD, i);
+        finding(cycle(101, 7, NEXT_HEAD), 101, NEXT_HEAD, 100);
+        finding(cycle(101, 8, HEAD), 101, HEAD, 101);
+        finding(cycle(202, 7, HEAD), 202, HEAD, 102);
+
+        var page = tool(READ, "list_findings", TARGET, "OK");
+        assertEquals(50, page.path("findings").size());
+        assertThat(page.toString()).doesNotContain("private-body-reference", "sourceId", "sourceProvider");
+        assertEquals("OPEN", page.at("/findings/0/status").asText());
+        assertEquals("ISSUE_COMMENT", page.at("/findings/0/sourceKind").asText());
+        var next = tool(READ, "list_findings", with("after", page.path("nextCursor").asText()), "OK");
+        assertEquals(1, next.path("findings").size());
+        assertEquals(new UUID(0, 51).toString(), next.at("/findings/0/id").asText());
+        assertThat(next.has("nextCursor")).isFalse();
+        tool(READ, "list_findings", with("headSha", NEXT_HEAD), "STALE_HEAD");
+    }
+
+    @Test
+    void deniesUnknownExpiredRevokedAndCrossScopeGrants() throws Exception {
+        String status = call("get_pr_status", TARGET);
+        assertEquals(401, post(null, status).statusCode());
+        assertEquals(401, post("f".repeat(64), status).statusCode());
+        assertEquals(401, post(READ, call("get_pr_status", with("installationId", 202))).statusCode());
+        assertEquals(401, post(READ, call("get_pr_status", with("repositoryId", 2002))).statusCode());
+        assertEquals(401, post(READ, call("get_pr_status", with("prNumber", 8))).statusCode());
+
+        jdbc.update("""
+                UPDATE mcp_tool_sessions SET issued_at = clock_timestamp() - interval '2 minutes',
+                    expires_at = clock_timestamp() - interval '1 minute' WHERE token_sha256 = ?
+                """, digest(READ));
+        assertEquals(401, post(READ, status).statusCode());
+        jdbc.update("""
+                UPDATE mcp_tool_sessions SET expires_at = clock_timestamp() + interval '1 minute',
+                    revoked_at = clock_timestamp() WHERE token_sha256 = ?
+                """, digest(READ));
+        assertEquals(401, post(READ, status).statusCode());
+        jdbc.update("UPDATE mcp_tool_sessions SET revoked_at = NULL WHERE token_sha256 = ?", digest(READ));
+        jdbc.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101 AND repository_id = 1001");
+        assertEquals(401, post(READ, status).statusCode());
+        jdbc.update("UPDATE installation_repositories SET enabled = true WHERE installation_id = 101 AND repository_id = 1001");
+        jdbc.update("UPDATE installations SET status = 'SUSPENDED' WHERE installation_id = 101");
+        assertEquals(401, post(READ, status).statusCode());
+        assertEquals(0, auditCount());
+    }
+
+    @Test
+    void deniesMissingOrForgedToolArgumentsAndUnactionableRpcMessages() throws Exception {
+        var command = UUID.randomUUID();
+        grant(PAUSE, "pause_cycle", command, 0L);
+        var args = command(command, 0);
+        var noHead = new HashMap<>(args);
+        noHead.remove("headSha");
+        var withSpoofedActor = new HashMap<>(args);
+        withSpoofedActor.put("actorId", 42);
+        assertInvalidParams(call("pause_cycle", noHead));
+        assertInvalidParams(call("pause_cycle", withSpoofedActor));
+        assertInvalidParams(call("get_pr_status", with("installationId", "101")));
+        assertInvalidParams(call("get_pr_status", with("prNumber", Long.MAX_VALUE)));
+        assertInvalidParams(call("get_pr_status", with("headSha", "a".repeat(8))));
+        assertInvalidParams(call("list_findings", with("after", "invalid")));
+        assertEquals(400, post(PAUSE, call("pause_cycle", args).replace("\"id\":\"fixture\",", "")
+                .replace(",\"id\":\"fixture\"", "")).statusCode());
+        assertEquals(400, post(PAUSE, "{\"jsonrpc\":\"2.0\",\"jsonrpc\":\"2.0\"}").statusCode());
+        assertEquals(413, post(PAUSE, " ".repeat(16_385)).statusCode());
+        assertEquals(403, CLIENT.send(request(PAUSE, call("pause_cycle", args))
+                .header("Origin", "https://fixture.invalid").build(), HttpResponse.BodyHandlers.ofString()).statusCode());
+        assertEquals(0, auditCount());
+        assertEquals(0, transitionCount());
+    }
+
+    @Test
+    void bindsTheApprovalToTheExactActionCommandHeadAndVersion() throws Exception {
+        var pause = UUID.randomUUID();
+        var review = UUID.randomUUID();
+        grant(PAUSE, "pause_cycle", pause, 0L);
+        grant(REVIEW, "request_review", review, 0L);
+
+        tool(READ, "pause_cycle", command(pause, 0), "APPROVAL_REQUIRED");
+        tool(PAUSE, "request_review", command(pause, 0), "APPROVAL_REQUIRED");
+        tool(PAUSE, "pause_cycle", command(UUID.randomUUID(), 0), "APPROVAL_REQUIRED");
+        tool(PAUSE, "pause_cycle", command(pause, 1), "APPROVAL_REQUIRED");
+        tool(REVIEW, "request_review", command(review, 0), "PROVIDER_UNAVAILABLE");
+        assertEquals(0, count("SELECT count(*) FROM outbox_commands"));
+        assertEquals(0, count("SELECT count(*) FROM review_requests"));
+        assertEquals(0, transitionCount());
+
+        lifecycle.apply(PR, transition(UUID.randomUUID(), 0, ReviewTransition.Action.CONFIRM_HEAD, null));
+        tool(PAUSE, "pause_cycle", command(pause, 0), "STALE_VERSION");
+        lifecycle.apply(PR, transition(UUID.randomUUID(), 1, ReviewTransition.Action.UPDATE_HEAD, NEXT_HEAD));
+        tool(PAUSE, "pause_cycle", command(pause, 0), "STALE_HEAD");
+        assertEquals(2, transitionCount());
+        assertEquals(7, auditCount());
+    }
+
+    @Test
+    void concurrentPauseRetriesApplyOnceAndAuditTheAuthorizedActor() throws Exception {
+        var id = UUID.randomUUID();
+        grant(PAUSE, "pause_cycle", id, 0L);
+        String payload = call("pause_cycle", command(id, 0));
+        var requests = IntStream.range(0, 4).mapToObj(index -> CLIENT.sendAsync(request(PAUSE, payload).build(),
+                HttpResponse.BodyHandlers.ofString())).toList();
+        var responses = requests.stream().map(CompletableFuture::join).map(this::structured).toList();
+        assertThat(responses).extracting(result -> result.path("code").asText())
+                .containsExactlyInAnyOrder("APPLIED", "ALREADY_APPLIED", "ALREADY_APPLIED", "ALREADY_APPLIED");
+        assertThat(responses).allMatch(result -> result.path("appliedVersion").longValue() == 1);
+        assertEquals(1, transitionCount());
+        assertEquals("PAUSED", lifecycle.find(PR).orElseThrow().state().name());
+        assertEquals(List.of("mcp-user:42"), jdbc.queryForList("SELECT DISTINCT actor FROM audit_entries", String.class));
+        assertEquals(1, count("SELECT count(*) FROM audit_entries WHERE outcome = 'APPLIED'"));
+        assertEquals(3, count("SELECT count(*) FROM audit_entries WHERE outcome = 'ALREADY_APPLIED'"));
+        assertEquals(1, count("SELECT count(*) FROM pr_domain_events"));
+    }
+
+    @Test
+    void auditFailureRollsBackStateAndEvent() throws Exception {
+        var id = UUID.randomUUID();
+        grant(PAUSE, "pause_cycle", id, 0L);
+        jdbc.execute("ALTER TABLE audit_entries ADD CONSTRAINT fixture_no_pause CHECK (action <> 'mcp.pause_cycle')");
+        try {
+            var failure = post(PAUSE, call("pause_cycle", command(id, 0)));
+            assertEquals(503, failure.statusCode());
+            assertThat(failure.body()).isEmpty();
+            assertEquals(0, transitionCount());
+            assertEquals(0, count("SELECT count(*) FROM pr_domain_events"));
+        } finally {
+            jdbc.execute("ALTER TABLE audit_entries DROP CONSTRAINT fixture_no_pause");
+        }
+        tool(PAUSE, "pause_cycle", command(id, 0), "APPLIED");
+    }
+
+    private void assertInvalidParams(String body) throws Exception {
+        var response = post(PAUSE, body);
+        assertEquals(200, response.statusCode());
+        assertEquals(-32602, JSON.readTree(response.body()).at("/error/code").intValue());
+    }
+
+    private ReviewTransition transition(UUID id, long version, ReviewTransition.Action action, String newHead) {
+        return new ReviewTransition(id, version, HEAD, action, newHead,
+                new ReviewTransition.Gates(false, false, false, false, false, ReviewTransition.Ci.UNKNOWN));
+    }
+
+    private void grant(String token, String tool, UUID id, Long version) {
+        jdbc.update("""
+                INSERT INTO mcp_tool_sessions (token_sha256, actor_id, installation_id, repository_id, pr_number,
+                    expires_at, approved_tool, command_id, approved_head_sha, approved_version)
+                VALUES (?, 42, 101, 1001, 7, clock_timestamp() + interval '5 minutes', ?, ?, ?, ?)
+                """, digest(token), tool, id, id == null ? null : HEAD, version);
+    }
+
+    private String digest(String token) {
+        return Sha256.hex(token.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private UUID cycle(long installation, int prNumber, String sha) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage, review_provider)
+                VALUES (?, ?, 1001, ?, ?, 'BASELINE', 'fixture')
+                """, id, installation, prNumber, sha);
+        return id;
+    }
+
+    private void finding(UUID cycle, long installation, String sha, long index) {
+        jdbc.update("""
+                INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha, source_provider,
+                    source_kind, source_id, body_ref)
+                VALUES (?, ?, ?, 1001, ?, 'fixture', 'ISSUE_COMMENT', ?, 'private-body-reference')
+                """, new UUID(0, index), cycle, installation, sha, Long.toString(index));
+    }
+
+    private int auditCount() { return count("SELECT count(*) FROM audit_entries"); }
+    private int transitionCount() { return count("SELECT count(*) FROM pr_review_transitions"); }
+    private int count(String sql) { return jdbc.queryForObject(sql, Integer.class); }
+
+    private Map<String, Object> with(String key, Object value) {
+        var result = new HashMap<>(TARGET);
+        result.put(key, value);
+        return result;
+    }
+
+    private Map<String, Object> command(UUID id, long version) {
+        var result = with("commandId", id);
+        result.put("expectedVersion", version);
+        return result;
+    }
+
+    private String rpc(String method, Map<String, ?> params) {
+        return JSON.writeValueAsString(Map.of("jsonrpc", "2.0", "id", "fixture", "method", method, "params", params));
+    }
+
+    private String call(String tool, Map<String, ?> args) {
+        return rpc("tools/call", Map.of("name", tool, "arguments", args));
+    }
+
+    private JsonNode tool(String token, String tool, Map<String, ?> args, String code) throws Exception {
+        var body = structured(post(token, call(tool, args)));
+        assertEquals(code, body.path("code").asText());
+        return body;
+    }
+
+    private JsonNode structured(HttpResponse<String> response) {
+        assertEquals(200, response.statusCode(), response.body());
+        var json = JSON.readTree(response.body());
+        assertEquals("fixture", json.path("id").asText());
+        var result = json.path("result");
+        var content = result.path("structuredContent");
+        assertEquals(content, JSON.readTree(result.at("/content/0/text").asText()));
+        return content;
+    }
+
+    private URI endpoint() {
+        return URI.create("http://localhost:" + port + "/mcp");
+    }
+
+    private HttpRequest.Builder request(String token, String body) {
+        var request = HttpRequest.newBuilder(endpoint()).timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json").header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", VERSION).POST(HttpRequest.BodyPublishers.ofString(body));
+        if (token != null) request.header("Authorization", "Bearer " + token);
+        return request;
+    }
+
+    private HttpResponse<String> post(String token, String body) throws Exception {
+        return CLIENT.send(request(token, body).build(), HttpResponse.BodyHandlers.ofString());
+    }
+}

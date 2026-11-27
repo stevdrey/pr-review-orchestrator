@@ -41,3 +41,5 @@ Record model, account/organization, usage and pricing effective date. Account-sp
 ## Durable worker adapter contracts
 
 Issue #13 supplies provider-neutral `EventPlanner`, `CommandGateway` and `WorkQueue` ports. Approved planners return bounded metadata-only intents; command gateways explicitly support registered actions and reconcile authoritative PR head/remote command-key evidence before writes. Unknown outcomes remain reconciliation-only. No live command adapters are supplied; default-disabled activation fails without approved beans. See [transaction, deadline, policy and idempotency requirements](../development/durable-dispatch.md).
+
+Issue #26 adds [private MCP tools](../development/mcp-tools.md). An operator-managed, revocable grant binds the actor to one installation/repository/PR. A command also requires approval for its exact UUID, SHA and version. The local pause reuses the existing lifecycle transaction and audit trail. Native provider dispatch and client OAuth remain pending.

@@ -26,6 +26,8 @@ Issue #72 adds [durable sandbox re-review planning](development/synchronize-revi
 
 Issue #74 connects [planned sandbox intents to the Codex request adapter](development/synchronize-review-planning.md#opt-in-dispatch-to-codex) and adds [exact terminal-attempt correlation](development/review-outcomes.md#authenticated-codex-completion) for an approved source. Local tests use a loopback GitHub and a signed completion fixture. Live dispatch stays disabled by default, and native completion for the exact request remains unverified.
 
+Issue #26 adds [private MCP tools](development/mcp-tools.md) for redacted PR status and findings, plus an audited local pause under a scoped, expiring command grant. Native review dispatch and Work/Dot compatibility for this endpoint remain pending.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |
