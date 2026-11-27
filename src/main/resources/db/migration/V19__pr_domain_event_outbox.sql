@@ -55,11 +55,11 @@ CREATE INDEX pr_event_deliveries_pending_idx ON pr_event_deliveries (available_a
 -- matching deliveries commit or roll back with the transition. Existing history is not replayed.
 CREATE FUNCTION enqueue_pr_domain_event() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    new_event_id uuid;
+    -- Allocate the ID before INSERT so the journal writer can use insert-only outbox grants.
+    new_event_id uuid := gen_random_uuid();
 BEGIN
-    INSERT INTO pr_domain_events (installation_id, repository_id, pr_number, transition_id)
-    VALUES (NEW.installation_id, NEW.repository_id, NEW.pr_number, NEW.transition_id)
-    RETURNING id INTO new_event_id;
+    INSERT INTO pr_domain_events (id, installation_id, repository_id, pr_number, transition_id)
+    VALUES (new_event_id, NEW.installation_id, NEW.repository_id, NEW.pr_number, NEW.transition_id);
 
     INSERT INTO pr_event_deliveries (subscription_id, event_id)
     SELECT id, new_event_id FROM pr_event_subscriptions

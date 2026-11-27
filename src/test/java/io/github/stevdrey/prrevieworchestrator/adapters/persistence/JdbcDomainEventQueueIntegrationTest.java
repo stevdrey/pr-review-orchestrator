@@ -109,6 +109,49 @@ class JdbcDomainEventQueueIntegrationTest {
     }
 
     @Test
+    void publishesWithAnInsertOnlyOutboxWriter() {
+        subscribe(SUBSCRIBER, SCOPE, PR.number());
+        var command = ready();
+        jdbc.execute("CREATE ROLE v19_transition_writer NOLOGIN");
+        try {
+            jdbc.execute("""
+                    GRANT USAGE ON SCHEMA public TO v19_transition_writer;
+                    GRANT SELECT, UPDATE ON pr_review_states TO v19_transition_writer;
+                    GRANT SELECT, INSERT ON pr_review_transitions TO v19_transition_writer;
+                    GRANT SELECT (id, installation_id, repository_id, pr_number, revoked_at)
+                        ON pr_event_subscriptions TO v19_transition_writer;
+                    GRANT INSERT (id, installation_id, repository_id, pr_number, transition_id)
+                        ON pr_domain_events TO v19_transition_writer;
+                    GRANT INSERT (subscription_id, event_id)
+                        ON pr_event_deliveries TO v19_transition_writer;
+                    """);
+            new TransactionTemplate(transactions).executeWithoutResult(status -> {
+                authorization.requireAuthorized(PR.scope());
+                PostgresLocks.lockPr(jdbc, PR);
+                jdbc.execute("SET LOCAL ROLE v19_transition_writer");
+                assertFalse(jdbc.queryForObject("""
+                        SELECT has_any_column_privilege('pr_domain_events', 'SELECT')
+                            OR has_any_column_privilege('pr_event_deliveries', 'SELECT')
+                            OR has_column_privilege('pr_event_subscriptions', 'callback_sha256', 'SELECT')
+                        """, Boolean.class));
+                states.applyLocked(PR, command, null);
+            });
+
+            assertEquals(State.WAITING_FOR_REVIEW, lifecycle.find(PR).orElseThrow().state());
+            assertEquals(1, countEvents());
+            assertEquals(1, countDeliveries());
+            assertEquals(command.id(), jdbc.queryForObject("""
+                    SELECT e.transition_id FROM pr_domain_events e
+                    JOIN pr_event_deliveries d ON d.event_id = e.id
+                    WHERE d.subscription_id = ? AND d.status = 'PENDING'
+                    """, UUID.class, SUBSCRIBER));
+        } finally {
+            jdbc.execute("DROP OWNED BY v19_transition_writer");
+            jdbc.execute("DROP ROLE v19_transition_writer");
+        }
+    }
+
+    @Test
     void persistsTypedEventsWithoutSubscribersAndDoesNotReplayToLateRegistrations() {
         lifecycle.apply(PR, ready());
         assertEquals(1, countEvents());

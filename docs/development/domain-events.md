@@ -38,7 +38,18 @@ WHERE i.installation_id = 101 AND r.repository_id = 202
 RETURNING id;
 ```
 
-Require the returned ID before starting a new subscription. The database binding is immutable. Register a new UUID to change the filter or destination. The delivery worker independently verifies the active membership and deployment allowlist before sending. When separating database roles, account for PostgreSQL row-lock privileges on the subscription and membership in addition to reads and queue updates. Keep subscription registration and revocation privileges with the trusted operator. The transition writer needs insert access to the outbox tables and read access to matching subscriptions.
+Require the returned ID before starting a new subscription. The database binding is immutable. Register a new UUID to change the filter or destination. The delivery worker independently verifies the active membership and deployment allowlist before sending. When separating database roles, account for PostgreSQL row-lock privileges on the subscription and membership in addition to reads and queue updates. Keep subscription registration and revocation privileges with the trusted operator.
+
+Grant the transition writer only the V19 columns used for event capture. The trigger generates the event ID before inserting and reuses it for fanout, so the writer needs no read access to events, deliveries or callback fingerprints.
+
+```sql
+GRANT SELECT (id, installation_id, repository_id, pr_number, revoked_at)
+    ON pr_event_subscriptions TO transition_writer;
+GRANT INSERT (id, installation_id, repository_id, pr_number, transition_id)
+    ON pr_domain_events TO transition_writer;
+GRANT INSERT (subscription_id, event_id)
+    ON pr_event_deliveries TO transition_writer;
+```
 
 ## Verify and deduplicate deliveries
 
@@ -63,6 +74,8 @@ The opt-in transport has no GitHub polling dependency. The synthetic Work web an
 
 ## Verification
 
-`./gradlew --offline clean build` passed all 395 tests with no failures, errors or skips. PostgreSQL fixtures cover atomic rollback, V18 upgrade without replay, scoped fanout, concurrent claims and revocation, a failed commit after acknowledgement, and lease exhaustion. The HTTP adapter tests verify exact payload fields, signature bytes, callback binding, key rotation and retryable versus terminal responses. `git diff --check` passed.
+`./gradlew --offline test --tests '*JdbcDomainEventQueueIntegrationTest' --tests '*DatabaseIntegrationTest.v18TransitionsSurviveTheEventOutboxUpgradeWithoutReplay'` passed all 11 tests on PostgreSQL 17. The restricted-role test reproduced the original `permission denied for table pr_domain_events` at `INSERT ... RETURNING id`. After the fix, the same grants committed a PR transition, its event and the pending delivery with the shared event ID.
+
+`./gradlew --offline clean build` passed all 396 tests with no failures, errors or skips. PostgreSQL fixtures cover atomic rollback, V18 upgrade without replay, scoped fanout, concurrent claims and revocation, a failed commit after acknowledgement, and lease exhaustion. The HTTP adapter tests verify exact payload fields, signature bytes, callback binding, key rotation and retryable versus terminal responses. `git diff --check` passed.
 
 The packaged application ran against PostgreSQL 17 and a loopback HTTPS receiver with an isolated TLS trust store and synthetic credentials. A `503` followed by `204` used identical event bytes and idempotency keys and a fresh HMAC timestamp. The receiver verified both signatures independently. A second event received `503`. Revocation cancelled its queued retry, and a third committed transition produced a local event with no delivery row. The receiver recorded three requests in total.
