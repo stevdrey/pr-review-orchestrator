@@ -54,7 +54,7 @@ Issue #74 connects [planned sandbox intents to the Codex request adapter](develo
 - Confirm whether a GitHub App user access token can request Codex in the **desired account and subscription billing context**; fallback to supported automatic reviews or a different review provider.
 - [Issue #42 accounting investigation](spikes/issue-42-review-accounting.md) concluded with an owner-accepted limitation: +4 review activity and +1 finding correlate with four observed manual runs and one P2, while individual financial attribution remains unverified. Closure does not waive accounting or budget prerequisites; keep Codex dispatch disabled until they are verified.
 - Verify GitHub review-thread state event semantics and API permission boundaries.
-- [Issue #24](spikes/issue-24-mcp-events.md) verifies the synthetic MCP Events subscription, delivery and unsubscribe in Work web and Dot through a private tunnel. The production bridge and durable domain events remain pending.
+- [Issue #24](spikes/issue-24-mcp-events.md) verifies the synthetic MCP Events subscription, delivery and unsubscribe in Work web and Dot through a private tunnel. [Issue #25](development/domain-events.md) adds the durable local outbox and opt-in signed webhooks. The production Work and Dot bridge remains pending.
 - Validate OpenAI model names, pricing and any API credits with the actual account and live pricing before establishing production quotas.
 - Decide how general comments are linked to tracked findings when the provider cannot produce a structured finding identifier.
 
