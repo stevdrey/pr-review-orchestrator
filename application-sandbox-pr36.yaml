@@ -1,0 +1,40 @@
+# Load explicitly from a checkout of PR Review Orchestrator.
+# Use a disposable PostgreSQL database and a PKCS#8 PEM readable by the operator only.
+server:
+  address: 127.0.0.1
+  port: ${SANDBOX_PORT:8081}
+
+spring:
+  datasource:
+    url: ${SANDBOX_DB_URL}
+    username: ${SANDBOX_DB_USER}
+    password: ${SANDBOX_DB_PASSWORD}
+
+orchestrator:
+  codex:
+    enabled: false
+  notifications:
+    enabled: false
+  dispatch:
+    enabled: true
+  sandbox-ci:
+    enabled: true
+    review-evidence-enabled: true
+    installation-id: 183768713
+    read-installation-id: 183768713
+    repository-id: 1469482362
+    repository: stevdrey/realtime-voice-lab
+    pr-number: 36
+    head: a93acbc63bc55db86d1b567029e963b3f9a6aca7
+    workflow-ids:
+      - 428572965 # Agent PR Preflight Tests
+      - 428572966 # Pull Request Size Guard
+      - 428583491 # Offline build
+  github:
+    client-id: ${SANDBOX_APP_CLIENT_ID}
+    private-key-file: ${SANDBOX_APP_KEY_FILE}
+    repositories:
+      183768713: [1469482362]
+    webhook:
+      enabled: true
+      secret-file: ${SANDBOX_WEBHOOK_SECRET_FILE}

@@ -33,28 +33,30 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
 
     @Override
     public boolean observeHead(UUID delivery, PullRequestReview expected, Head head, Runnable authorize) {
-        var pr = head.pr();
-        return states.locked(pr, authorize, () -> {
-            // Not applyLocked's replay check: a redelivery is re-read after the first commit, so its expected
-            // version no longer matches and would look like a reused ID.
-            var previous = jdbc.query("""
-                    SELECT action IN ('UPDATE_HEAD', 'CONFIRM_HEAD') AND resulting_head_sha = ?, action = 'UPDATE_HEAD'
-                    FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
-                        AND pr_number = ? AND transition_id = ?
-                    """, (rs, row) -> new boolean[] {rs.getBoolean(1), rs.getBoolean(2)}, head.sha(), pr.scope().installationId(),
-                    pr.scope().repositoryId(), pr.number(), delivery);
-            if (!previous.isEmpty()) {
-                if (!previous.getFirst()[0]) throw new ReviewConflict(TRANSITION_ID_REUSED);
-                return previous.getFirst()[1];
-            }
+        return states.locked(head.pr(), authorize, () -> observeHeadLocked(delivery, expected, head));
+    }
 
-            boolean changed = !expected.headSha().equals(head.sha());
-            var action = changed ? ReviewTransition.Action.UPDATE_HEAD : ReviewTransition.Action.CONFIRM_HEAD;
-            var gates = new ReviewTransition.Gates(head.open(), head.draft(), false, false, false, ReviewTransition.Ci.UNKNOWN);
-            states.applyLocked(pr, new ReviewTransition(delivery, expected.version(), expected.headSha(),
-                    action, changed ? head.sha() : null, gates), null);
-            return changed;
-        });
+    boolean observeHeadLocked(UUID delivery, PullRequestReview expected, Head head) {
+        var pr = head.pr();
+        // Not applyLocked's replay check: a redelivery is re-read after the first commit, so its expected
+        // version no longer matches and would look like a reused ID.
+        var previous = jdbc.query("""
+                SELECT action IN ('UPDATE_HEAD', 'CONFIRM_HEAD') AND resulting_head_sha = ?, action = 'UPDATE_HEAD'
+                FROM pr_review_transitions WHERE installation_id = ? AND repository_id = ?
+                    AND pr_number = ? AND transition_id = ?
+                """, (rs, row) -> new boolean[] {rs.getBoolean(1), rs.getBoolean(2)}, head.sha(), pr.scope().installationId(),
+                pr.scope().repositoryId(), pr.number(), delivery);
+        if (!previous.isEmpty()) {
+            if (!previous.getFirst()[0]) throw new ReviewConflict(TRANSITION_ID_REUSED);
+            return previous.getFirst()[1];
+        }
+
+        boolean changed = !expected.headSha().equals(head.sha());
+        var action = changed ? ReviewTransition.Action.UPDATE_HEAD : ReviewTransition.Action.CONFIRM_HEAD;
+        var gates = new ReviewTransition.Gates(head.open(), head.draft(), false, false, false, ReviewTransition.Ci.UNKNOWN);
+        states.applyLocked(pr, new ReviewTransition(delivery, expected.version(), expected.headSha(),
+                action, changed ? head.sha() : null, gates), null);
+        return changed;
     }
 
     @Override
@@ -63,7 +65,7 @@ public class JdbcFixCorrelationStore implements FixCorrelationStore {
         return states.locked(pr, authorize, () -> assessLocked(pr, assessment));
     }
 
-    private Decision assessLocked(PullRequestId pr, Assessment assessment) {
+    Decision assessLocked(PullRequestId pr, Assessment assessment) {
         Head head = assessment.head();
         Timeline timeline = loadTimeline(pr);
         if (timeline.version() != assessment.expectedVersion()) throw new ReviewConflict(STALE_VERSION);

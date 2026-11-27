@@ -73,10 +73,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     request.pr().scope().repositoryId(), request.pr().number(), request.headSha(),
                     request.stage(), request.provider(), request.headEpoch());
             if (!reconciled.isEmpty()) return reconciled.getFirst();
-            long used = jdbc.queryForObject("""
-                    SELECT coalesce(max(iteration), 0) FROM review_requests
-                    WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
-                    """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
+            long used = usedIterations(jdbc, pr);
             if (used >= limit) {
                 // An untracked PR has no aggregate to pause; never create one from an unverified request head.
                 if (current == null) throw new ReviewRequestFailure(LIMIT_REACHED);
@@ -142,6 +139,13 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             markNotSent(request, id, State.ATTEMPTED);
             throw failure;
         }
+    }
+
+    static long usedIterations(JdbcTemplate jdbc, PullRequestId pr) {
+        return jdbc.queryForObject("""
+                SELECT coalesce(max(iteration), 0) FROM review_requests
+                WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
+                """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number());
     }
 
     private PullRequestReview requireCurrentVisit(ReviewRequest request) {

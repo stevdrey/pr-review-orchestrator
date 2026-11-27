@@ -7,6 +7,8 @@ import java.util.UUID;
 public final class DurableWork {
     private DurableWork() {}
 
+    public static final String REVIEW_ASSESSMENT_EVENT = "sandbox_review_assessment";
+
     public enum Queue { INBOX, OUTBOX }
     public enum ErrorCode {
         INTERNAL_ERROR, AUTHORIZATION_DENIED, AUTHORIZATION_UNAVAILABLE, INVALID_EVENT, UNSUPPORTED_COMMAND,

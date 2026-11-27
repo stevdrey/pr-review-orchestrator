@@ -1,6 +1,8 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.github;
 
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler.Policy;
+import io.github.stevdrey.prrevieworchestrator.domain.CommitSha;
+import io.github.stevdrey.prrevieworchestrator.domain.FixCorrelation.Head;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.ErrorCode;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Failure;
 import java.net.URI;
@@ -9,6 +11,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
@@ -42,14 +45,23 @@ final class GitHubSandboxReadClient {
     }
 
     boolean currentPr(Policy policy, InstallationToken token, long deadline) {
+        return readHead(policy, token, deadline).filter(head ->
+                policy.head().equals(head.sha()) && head.open() && !head.draft()).isPresent();
+    }
+
+    Optional<Head> readHead(Policy policy, InstallationToken token, long deadline) {
         var pr = get(policy, pullPath(policy), token, deadline);
         long repositoryId = policy.pr().scope().repositoryId();
-        return pr.path("number").asInt() == policy.pr().number()
-                && pr.path("base").path("repo").path("id").asLong() == repositoryId
-                && pr.path("head").path("repo").path("id").asLong() == repositoryId
-                && policy.head().equals(pr.path("head").path("sha").asString())
-                && "open".equals(pr.path("state").asString())
-                && pr.path("draft").isBoolean() && !pr.path("draft").asBoolean();
+        String sha = pr.path("head").path("sha").asString();
+        String state = pr.path("state").asString();
+        if (pr.path("number").asInt() != policy.pr().number()
+                || pr.path("base").path("repo").path("id").asLong() != repositoryId
+                || pr.path("head").path("repo").path("id").asLong() != repositoryId
+                || !CommitSha.isValid(sha) || !("open".equals(state) || "closed".equals(state))
+                || !pr.path("draft").isBoolean()) {
+            return Optional.empty();
+        }
+        return Optional.of(new Head(policy.pr(), sha, "open".equals(state), pr.path("draft").asBoolean()));
     }
 
     JsonNode get(Policy policy, String path, InstallationToken token, long deadline) {

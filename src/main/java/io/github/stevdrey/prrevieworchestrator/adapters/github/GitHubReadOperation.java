@@ -6,6 +6,7 @@ import java.util.Map;
 public enum GitHubReadOperation {
     PULL_REQUESTS("pull_requests"),
     COMMENTS("issues"),
+    CONTENTS("contents"),
     CHECKS("checks"),
     WORKFLOWS("actions");
 

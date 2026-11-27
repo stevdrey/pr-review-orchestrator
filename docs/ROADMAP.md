@@ -22,6 +22,8 @@ Issue #22 adds [opt-in GitHub author notifications](development/author-notificat
 
 Issue #23 adds [local sandbox feedback-loop acceptance coverage and live prerequisites](architecture/testing-strategy.md#end-to-end-acceptance), including replay protection, current-SHA review and CI evidence, bounded stops and one author notice.
 
+Issue #72 adds [durable sandbox re-review planning](development/synchronize-review-planning.md) from signed synchronize and CI deliveries, using authoritative PR reads, quiet-period coalescing and a deduplicated outbox intent for the eligible head.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |

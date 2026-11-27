@@ -1,9 +1,14 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
+import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REVIEW_ASSESSMENT_EVENT;
+
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
 import java.time.Duration;
+import java.time.Instant;
+import java.sql.Timestamp;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -120,16 +125,46 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     /** The local write shares the inbox claim transaction. It must use the same transaction manager. */
     boolean completeLocalEvent(Event event, Runnable authorize, Runnable localWrite) {
-        return transaction(() -> {
-            if (!lock(event.lease())) return false;
-            authorize.run();
+        return withEvent(event, authorize, () -> {
             localWrite.run();
-            finish(event.lease(), "PROCESSED", null);
+            finishEvent(event);
             return true;
+        }).orElse(false);
+    }
+
+    <T> Optional<T> withEvent(Event event, Runnable authorize, Supplier<T> operation) {
+        return transaction(() -> {
+            if (!lock(event.lease())) return Optional.empty();
+            authorize.run();
+            return Optional.of(operation.get());
         });
     }
 
-    private void enqueue(Event event, Intent intent) {
+    void finishEvent(Event event) {
+        finish(event.lease(), "PROCESSED", null);
+    }
+
+    /**
+     * Schedule at most one assessment per PR head and quiet-period deadline in the fenced completion
+     * transaction. The synchronize and CI wake-ups in the same quiet period share it; the first keeps its correlation.
+     */
+    void scheduleReviewAssessment(Event event, PullRequestId pr, String headSha, Instant availableAt) {
+        // Ingress only accepts UUID delivery IDs. An internal row has no event_action, so the
+        // signed payload fingerprint continues to deduplicate only the original delivery.
+        String key = "review-assessment:" + pr.scope().installationId() + ":" + pr.scope().repositoryId() + ":"
+                + pr.number() + ":" + headSha + ":" + availableAt;
+        jdbc.update("""
+                INSERT INTO inbox_events (id, delivery_id, event_type, installation_id, repository_id,
+                    pr_number, head_sha, payload_sha256, correlation_id, verified_at, max_attempts, available_at)
+                SELECT ?, ?, ?, installation_id, repository_id,
+                    ?, ?, payload_sha256, correlation_id, verified_at, max_attempts, ?
+                FROM inbox_events WHERE id = ? AND (installation_id, repository_id) = (?, ?)
+                ON CONFLICT (delivery_id) DO NOTHING
+                """, UUID.randomUUID(), key, REVIEW_ASSESSMENT_EVENT, pr.number(), headSha, Timestamp.from(availableAt),
+                event.lease().id(), pr.scope().installationId(), pr.scope().repositoryId());
+    }
+
+    void enqueue(Event event, Intent intent) {
         var scope = event.scope();
         UUID cycle = UUID.randomUUID();
         jdbc.update("""
