@@ -1,5 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
+import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REVIEW_ASSESSMENT_EVENT;
+
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.WorkQueue;
@@ -141,14 +143,18 @@ public final class JdbcWorkQueue implements WorkQueue {
         finish(event.lease(), "PROCESSED", null);
     }
 
-    void deferEvent(Event event, Instant retryAt) {
-        var lease = event.lease();
+    /** Schedule at most one assessment per source delivery in its fenced completion transaction. */
+    void scheduleReviewAssessment(Event event, Instant availableAt) {
+        // Ingress only accepts UUID delivery IDs. An internal row has no event_action, so the
+        // signed payload fingerprint continues to deduplicate only the original delivery.
         jdbc.update("""
-                UPDATE inbox_events SET status = 'PENDING', available_at = ?, locked_by = NULL,
-                    locked_until = NULL, lease_token = NULL, last_error_code = NULL
-                WHERE id = ?
-                """, Timestamp.from(retryAt), lease.id());
-        journal(lease, "RETRY", null);
+                INSERT INTO inbox_events (id, delivery_id, event_type, installation_id, repository_id,
+                    pr_number, head_sha, payload_sha256, correlation_id, verified_at, max_attempts, available_at)
+                SELECT ?, 'review-assessment:' || id::text, ?, installation_id, repository_id,
+                    pr_number, head_sha, payload_sha256, correlation_id, verified_at, max_attempts, ?
+                FROM inbox_events WHERE id = ?
+                ON CONFLICT (delivery_id) DO NOTHING
+                """, UUID.randomUUID(), REVIEW_ASSESSMENT_EVENT, Timestamp.from(availableAt), event.lease().id());
     }
 
     void enqueue(Event event, Intent intent) {

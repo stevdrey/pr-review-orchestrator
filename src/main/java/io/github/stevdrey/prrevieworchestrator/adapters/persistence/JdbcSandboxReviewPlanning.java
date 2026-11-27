@@ -67,8 +67,11 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
             }
             var decision = fixes.assessLocked(pr, new Assessment(head, current.version(), false, null));
             if (decision.status() == WAITING_FOR_PUSHES) {
-                queue.deferEvent(event, decision.retryAt());
-                return DEFERRED;
+                // If a due assessment sees a newer quiet-period deadline, the newer
+                // synchronize observation already scheduled its own assessment.
+                if (!SandboxReviewPlanning.isAssessment(event)) queue.scheduleReviewAssessment(event, decision.retryAt());
+                queue.finishEvent(event);
+                return PROCESSED;
             }
             if (decision.status() == COMPARISON_REQUIRED) {
                 return new Preparation.Ready(current.version(), decision.baseSha());

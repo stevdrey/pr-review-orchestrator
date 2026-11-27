@@ -361,6 +361,62 @@ class FeedbackLoopSandboxIntegrationTest {
     }
 
     @Test
+    void successfulFinalSynchronizeAttemptStillPlansAfterQuietPeriod() throws Exception {
+        var round = startRemediation();
+        var worker = planningWorker((pr, intent) -> true, 6);
+        String head = repository.fixedSha;
+        var delivery = UUID.randomUUID();
+        String push = pullWebhook("synchronize", head);
+        github.push(head);
+        github.failNextPullReads(4);
+        assertEquals(202, signed("pull_request", delivery, push).statusCode());
+
+        for (int attempt = 1; attempt <= 4; attempt++) {
+            assertTrue(worker.processEvent());
+            assertEquals(Map.of("attempts", attempt, "status", "PENDING", "last_error_code", "REMOTE_UNAVAILABLE"),
+                    jdbc.queryForMap("""
+                            SELECT attempts, status, last_error_code FROM inbox_events WHERE delivery_id = ?
+                            """, delivery.toString()));
+            assertEquals(repository.openedSha, current().headSha());
+            jdbc.update("UPDATE inbox_events SET available_at=clock_timestamp() WHERE delivery_id = ?", delivery.toString());
+        }
+
+        assertTrue(worker.processEvent(), "the fifth attempt records the fresh head");
+        assertEquals(head, current().headSha());
+        assertEquals(Ci.UNKNOWN, current().ci());
+        assertEquals(200, signed("pull_request", delivery, push).statusCode());
+        assertEquals(200, signed("pull_request", UUID.randomUUID(), push).statusCode());
+        assertFalse(worker.processEvent(), "the assessment must wait for the quiet period");
+        assertEquals(0, count("queue_dead_letters"), "a successful observation must not exhaust its follow-up");
+        assertEquals(0, count("outbox_commands"));
+        assertEquals(Map.of("attempts", 5, "status", "PROCESSED"), jdbc.queryForMap("""
+                SELECT attempts, status FROM inbox_events WHERE delivery_id = ?
+                """, delivery.toString()));
+        assertEquals(Map.of("attempts", 0, "max_attempts", 5, "status", "PENDING"), jdbc.queryForMap("""
+                SELECT attempts, max_attempts, status FROM inbox_events WHERE event_type = ?
+                """, DurableWork.REVIEW_ASSESSMENT_EVENT));
+
+        dispose(round, GeneralFeedback.Action.CLAIM_FIXED, head);
+        successfulWorkflows();
+        agePlanning();
+        github.failNextPullReads(1);
+        var restarted = planningWorker((pr, intent) -> true, 6);
+        assertTrue(restarted.processEvent());
+        assertEquals(Map.of("attempts", 1, "status", "PENDING", "last_error_code", "REMOTE_UNAVAILABLE"),
+                jdbc.queryForMap("""
+                        SELECT attempts, status, last_error_code FROM inbox_events WHERE event_type = ?
+                        """, DurableWork.REVIEW_ASSESSMENT_EVENT));
+        jdbc.update("UPDATE inbox_events SET available_at=clock_timestamp() WHERE event_type = ?",
+                DurableWork.REVIEW_ASSESSMENT_EVENT);
+        assertTrue(restarted.processEvent(), "the assessment resumes without a CI webhook");
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(head, jdbc.queryForObject("SELECT expected_head_sha FROM outbox_commands", String.class));
+        assertFalse(restarted.processEvent());
+        assertEquals(1, count("outbox_commands"));
+        assertEquals(0, count("queue_dead_letters"));
+    }
+
+    @Test
     void currentCiAndDispositionsMustPassBeforeBudgetCanPermitAnIntent() throws Exception {
         var round = startRemediation();
         var permit = new AtomicBoolean();

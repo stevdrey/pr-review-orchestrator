@@ -1,5 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.application;
 
+import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REVIEW_ASSESSMENT_EVENT;
+
 import io.github.stevdrey.prrevieworchestrator.application.SandboxCiReconciler.Policy;
 import io.github.stevdrey.prrevieworchestrator.domain.CiEvidence;
 import io.github.stevdrey.prrevieworchestrator.domain.CommitSha;
@@ -12,7 +14,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-/** Signed synchronize events and CI wake-ups for one explicitly selected sandbox PR. */
+/** Signed synchronize events, CI wake-ups and due assessments for one explicitly selected sandbox PR. */
 public final class SandboxReviewPlanning {
     public interface Reader extends SandboxCiReconciler.Reader {
         Optional<Head> readHead(Policy policy);
@@ -21,7 +23,7 @@ public final class SandboxReviewPlanning {
 
     public sealed interface Preparation {
         record Ready(long version, String baseSha) implements Preparation {}
-        enum Finished implements Preparation { PROCESSED, DEFERRED, LEASE_LOST }
+        enum Finished implements Preparation { PROCESSED, LEASE_LOST }
     }
 
     public interface Commit {
@@ -50,11 +52,16 @@ public final class SandboxReviewPlanning {
     }
 
     public boolean handles(Event event) {
-        return "check_run".equals(event.eventType()) || "workflow_run".equals(event.eventType()) || isSynchronize(event);
+        return "check_run".equals(event.eventType()) || "workflow_run".equals(event.eventType())
+                || isSynchronize(event) || isAssessment(event);
     }
 
     public static boolean isSynchronize(Event event) {
         return "pull_request".equals(event.eventType()) && "synchronize".equals(event.action());
+    }
+
+    public static boolean isAssessment(Event event) {
+        return REVIEW_ASSESSMENT_EVENT.equals(event.eventType()) && event.action() == null;
     }
 
     public boolean complete(Event event) {
@@ -72,6 +79,7 @@ public final class SandboxReviewPlanning {
 
         // Capture the version before the remote read so a concurrent newer observation wins at commit.
         var expected = lifecycle.find(policy.pr());
+        if (isAssessment(event) && expected.isEmpty()) return queue.completeEvent(event, List.of(), authorize);
         if (!sync && !expected.map(PullRequestReview::headSha).orElse(policy.head()).equals(event.observedHeadSha())) {
             return queue.completeEvent(event, List.of(), authorize);
         }
