@@ -146,7 +146,8 @@ class ReviewRequestIntegrationTest {
 
     @Test void botCommentsAndReviewEventsNeverCreateReservationsEvenForNewSha() {
         for (var trigger : ReviewRequest.Trigger.values()) {
-            var bot = new ReviewRequest(PR, HEAD, "BASELINE", "codex", trigger, 99, true);
+            UUID command = trigger == ReviewRequest.Trigger.PLANNED_REREVIEW ? UUID.randomUUID() : null;
+            var bot = new ReviewRequest(PR, HEAD, "BASELINE", "codex", trigger, 99, true, 0, command);
             assertEquals(IGNORED, adapter().request(bot));
         }
         for (var trigger : List.of(ReviewRequest.Trigger.COMMENT, ReviewRequest.Trigger.REVIEW)) {
@@ -205,7 +206,7 @@ class ReviewRequestIntegrationTest {
     @Test void operatorCommandRequiresTheSandboxAndConsentingActorAndReusesTheDurableKey() {
         var operator = new ReviewRequest(PR, HEAD, "BASELINE", "codex", ReviewRequest.Trigger.SANDBOX_OPERATOR, 42, false);
         code(UNSUPPORTED_TRIGGER, () -> adapter().request(operator));
-        var sandbox = new CodexReviewAdapter(authorization, store(), approval, comments, 42, 1, true);
+        var sandbox = new CodexReviewAdapter(authorization, store(), approval, comments, 42, 1, CodexReviewAdapter.Mode.SANDBOX_OPERATOR);
         var otherActor = new ReviewRequest(PR, HEAD, "BASELINE", "codex", operator.trigger(), 43, false);
         code(UNSUPPORTED_TRIGGER, () -> sandbox.request(otherActor));
         assertEquals(0, rows());

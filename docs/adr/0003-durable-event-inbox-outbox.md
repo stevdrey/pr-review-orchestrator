@@ -24,3 +24,5 @@ Direct webhook→GitHub call: event loss and duplicate actions. In-memory queue:
 Crash-after-write, duplicate delivery, concurrent workers, lost API response and out-of-order commit tests.
 
 Issue #13 implements these paths using PostgreSQL integration fixtures and a strongly idempotent synthetic remote adapter. See [dispatch contracts and operational limits](../development/durable-dispatch.md). Default-disabled ticks require approved planner/gateway beans; no live GitHub write or review-iteration/spending policy is implied. Gateways must preserve ambiguous remote outcomes and enforce fresh SHA, authorization, approval and spending gates at the actual effect boundary.
+
+Issue #74 adds [planned Codex dispatch](../development/synchronize-review-planning.md#opt-in-dispatch-to-codex). The sandbox worker fences the outbox claim while the existing request store owns authorization, budget enforcement and the one-shot send. GitHub's comment API provides no remote idempotency key or atomic head condition. The retained permit and receipt govern retries, and the exact reviewed SHA is checked independently at completion.

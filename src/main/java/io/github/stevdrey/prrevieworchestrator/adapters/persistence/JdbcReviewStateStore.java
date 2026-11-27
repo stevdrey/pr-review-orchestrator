@@ -163,6 +163,9 @@ public class JdbcReviewStateStore implements ReviewStateStore {
                 && (command.action() == Action.MARK_READY_FOR_HUMAN || command.action() == Action.RESUME);
         if (evidenceGuard != null) {
             evidenceGuard.run();
+        } else if (command.action() == Action.BASELINE_CLEAN
+                && JdbcReviewRequestStore.plannedBaseline(jdbc, pr, current.headSha()).isPresent()) {
+            throw new ReviewConflict(GUARD_REJECTED);
         } else if ((command.action() == ReviewTransition.Action.BASELINE_CLEAN
                 || command.action() == ReviewTransition.Action.DEEP_CLEAN
                 || ready)

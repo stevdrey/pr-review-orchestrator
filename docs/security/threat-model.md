@@ -72,3 +72,5 @@ excluded as triggers. GitHub comments lack atomic SHA preconditions: independent
 reviewed-SHA evidence remains mandatory, and the adapter cannot be used as the
 durable command gateway. No new public endpoint, OAuth flow, merged verdict or
 automatic review loop is introduced. See [trust contracts and recovery limits](../development/codex-review-requests.md).
+
+Issue #74 consumes scoped, visit-bound sandbox intents through the one-shot request permit. The queue claim and local request authorization are checked independently. A receipt survives a separate outbox commit failure, and an ambiguous POST remains ineligible for resend. A planned clean transition requires a verified provider record for the exact trigger comment, terminal attempt, full SHA, local stage and persisted review revision. A reaction, editable summary or matching SHA alone cannot supply this provenance. No native completion source or production entitlement is supplied. [Dispatch controls](../development/synchronize-review-planning.md#opt-in-dispatch-to-codex) · [Completion trust contract](../development/review-outcomes.md#authenticated-codex-completion)

@@ -32,6 +32,14 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
     private record Loaded(Snapshot snapshot, Instant ingestedAt) {}
 
     @Override
+    public OptionalLong codexTrigger(Run run, Runnable authorize) {
+        return states.locked(run.pr(), authorize, () -> {
+            var request = requested(run);
+            return request.isEmpty() ? OptionalLong.empty() : OptionalLong.of(request.orElseThrow().commentId());
+        });
+    }
+
+    @Override
     public ReviewOutcome assess(Assessment assessment, Runnable authorize) {
         return states.locked(assessment.run().pr(), authorize, () -> classify(assessment, true));
     }
@@ -47,13 +55,17 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
             var state = states.applyLocked(run.pr(), transition, () -> {
                 if (classify(assessment, false).verdict() != Verdict.CLEAN_FOR_SHA) throw new ReviewConflict(GUARD_REJECTED);
             });
+            var proof = assessment.completion().codexProvenance();
             jdbc.update("""
                     INSERT INTO review_clean_evidence (installation_id, repository_id, pr_number, transition_id,
-                        request_id, cycle_id, snapshot_id, head_sha, stage, provider, evidence_provider, review_source_id, reviewer)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        request_id, cycle_id, snapshot_id, head_sha, stage, provider, evidence_provider, review_source_id, reviewer,
+                        trigger_comment_id, provider_execution_id, provider_attempt_id, provider_terminal_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, run.pr().scope().installationId(), run.pr().scope().repositoryId(), run.pr().number(), commandId,
                     run.requestId(), run.cycleId(), assessment.snapshotId(), run.headSha(), run.stage().name(),
-                    run.provider(), run.evidenceProvider(), assessment.completion().reviewId(), run.reviewer());
+                    run.provider(), run.evidenceProvider(), assessment.completion().reviewId(), run.reviewer(),
+                    proof == null ? null : proof.commentId(), proof == null ? null : proof.executionId(),
+                    proof == null ? null : proof.attemptId(), proof == null ? null : Timestamp.from(proof.terminalAt()));
             saveProgress(assessment, null, false);
             return state;
         });
@@ -62,9 +74,10 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
     private void rejectReplay(Assessment assessment, UUID commandId) {
         Run run = assessment.run();
         var previous = jdbc.queryForList("""
-                SELECT t.expected_version, t.expected_head_sha, t.action, e.*
+                SELECT t.expected_version, t.expected_head_sha, t.action, e.*, s.body_sha256, s.source_updated_at
                 FROM pr_review_transitions t LEFT JOIN review_clean_evidence e
                     USING (installation_id, repository_id, pr_number, transition_id)
+                LEFT JOIN review_evidence_sources s ON s.snapshot_id = e.snapshot_id AND s.source_id = e.review_source_id
                 WHERE t.installation_id = ? AND t.repository_id = ? AND t.pr_number = ? AND t.transition_id = ?
                 """, run.pr().scope().installationId(), run.pr().scope().repositoryId(), run.pr().number(), commandId);
         if (previous.isEmpty()) return;
@@ -78,7 +91,8 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 && Objects.equals(p.get("stage"), run.stage().name()) && Objects.equals(p.get("provider"), run.provider())
                 && Objects.equals(p.get("evidence_provider"), run.evidenceProvider()) && Objects.equals(p.get("reviewer"), run.reviewer())
                 && completion != null && run.equals(completion.run()) && completion.status() == Status.COMPLETED
-                && completion.conclusion() == Conclusion.NO_FINDINGS && Objects.equals(p.get("review_source_id"), completion.reviewId());
+                && completion.conclusion() == Conclusion.NO_FINDINGS && Objects.equals(p.get("review_source_id"), completion.reviewId())
+                && sameCodexAttempt(p, completion.codexProvenance());
         throw new ReviewConflict(exact ? DUPLICATE_TRANSITION : TRANSITION_ID_REUSED);
     }
 
@@ -96,19 +110,7 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         if (((Number) current.getFirst().get("version")).longValue() != assessment.expectedVersion()) throw new ReviewConflict(STALE_VERSION);
         if (!current.getFirst().get("head_sha").equals(run.headSha())) throw new ReviewConflict(STALE_HEAD);
 
-        // A receipt only proves a request was posted, never that the provider completed it.
-        var requests = jdbc.query("""
-                SELECT r.created_at FROM review_requests r JOIN review_cycles c
-                    ON c.installation_id = r.installation_id AND c.repository_id = r.repository_id
-                    AND c.pr_number = r.pr_number AND c.head_sha = r.head_sha
-                    AND c.stage = r.stage AND c.review_provider = r.provider
-                WHERE r.id = ? AND c.id = ? AND r.installation_id = ? AND r.repository_id = ? AND r.pr_number = ?
-                    AND r.head_sha = ? AND r.stage = ? AND r.provider = ?
-                    AND r.head_epoch = ?
-                    AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
-                """, (rs, row) -> rs.getTimestamp(1).toInstant(), run.requestId(), run.cycleId(),
-                pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), run.headSha(), run.stage().name(),
-                run.provider(), JdbcFixCorrelationStore.headEpoch(jdbc, pr, run.headSha()));
+        var request = requested(run).orElse(null);
         Loaded loaded = loadSnapshot(assessment);
         Snapshot snapshot = loaded == null ? null : loaded.snapshot();
         Timestamp changed = (Timestamp) current.getFirst().get("head_changed_at");
@@ -116,13 +118,14 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
         var pending = JdbcGeneralFeedbackStore.pending(jdbc, pr, run.headSha());
         // Ingestion and head updates timestamp their writes while holding the same PR lock.
         // A timestamp tied with the head update cannot prove later ingestion.
-        if (requests.size() != 1 || snapshot == null || loaded.ingestedAt() == null
-                || loaded.ingestedAt().isBefore(requests.getFirst())
+        if (request == null || snapshot == null || loaded.ingestedAt() == null
+                || loaded.ingestedAt().isBefore(request.createdAt())
                 || changed != null && !loaded.ingestedAt().isAfter(changed.toInstant())
                 || snapshot.sources().stream().filter(s -> s.kind() == Kind.REVIEW
                     && assessment.completion() != null && s.id().equals(assessment.completion().reviewId()))
-                    .anyMatch(s -> s.updatedAt().isBefore(requests.getFirst())
-                        || changed != null && s.updatedAt().isBefore(changed.toInstant()))) {
+                    .anyMatch(s -> s.updatedAt().isBefore(request.createdAt())
+                        || changed != null && s.updatedAt().isBefore(changed.toInstant()))
+                || !correlatedCodexAttempt(assessment, request, snapshot)) {
             return classifier.classify(run, assessment.expectedVersion(), null, null, pending);
         }
         var dismissed = JdbcGeneralFeedbackStore.dismissedSources(jdbc, snapshot);
@@ -139,6 +142,66 @@ public class JdbcReviewOutcomeStore implements ReviewOutcomeStore {
                 .map(progress -> recordProgress(assessment, outcome,
                         outcome.verdict() == Verdict.ACTION_REQUIRED ? progress.fingerprint() : null))
                 .orElse(outcome);
+    }
+
+    private record Requested(Instant createdAt, long commentId, boolean planned) {}
+
+    private Optional<Requested> requested(Run run) {
+        var pr = run.pr();
+        if (run.stage() == Stage.BASELINE && JdbcReviewRequestStore.plannedBaseline(jdbc, pr, run.headSha())
+                .filter(id -> !id.equals(run.requestId())).isPresent()) return Optional.empty();
+        // A receipt only proves the request was posted. Planned requests also name their exact outbox cycle.
+        return jdbc.query("""
+                SELECT r.created_at, r.comment_id, r.planned_command_id IS NOT NULL AS planned
+                FROM review_requests r JOIN review_cycles c
+                    ON c.installation_id = r.installation_id AND c.repository_id = r.repository_id
+                    AND c.pr_number = r.pr_number AND c.head_sha = r.head_sha
+                    AND c.stage = r.stage AND c.review_provider = r.provider
+                WHERE r.id = ? AND c.id = ? AND r.installation_id = ? AND r.repository_id = ? AND r.pr_number = ?
+                    AND r.head_sha = ? AND r.stage = ? AND r.provider = ?
+                    AND r.head_epoch = ?
+                    AND r.state IN ('COMMENT_CREATED', 'COMMENT_CREATED_HEAD_UNCONFIRMED')
+                    AND (r.planned_command_id IS NULL OR EXISTS (
+                        SELECT 1 FROM outbox_commands o WHERE o.id = r.planned_command_id AND o.review_cycle_id = c.id))
+                """, (rs, row) -> new Requested(rs.getTimestamp(1).toInstant(), rs.getLong(2), rs.getBoolean("planned")),
+                run.requestId(), run.cycleId(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                run.headSha(), run.stage().name(), run.provider(),
+                JdbcFixCorrelationStore.headEpoch(jdbc, pr, run.headSha())).stream().findFirst();
+    }
+
+    private boolean correlatedCodexAttempt(Assessment assessment, Requested request, Snapshot snapshot) {
+        var completion = assessment.completion();
+        var proof = completion == null ? null : completion.codexProvenance();
+        if (proof == null) return !request.planned() || completion == null;
+        var run = assessment.run();
+        if (!"codex".equals(run.provider()) || !run.pr().equals(proof.pr()) || !run.headSha().equals(proof.reviewedSha())
+                || run.stage() != proof.stage() || request.commentId() != proof.commentId()
+                || proof.terminalAt().isBefore(request.createdAt()) || proof.terminalAt().isAfter(snapshot.capturedAt())) {
+            return false;
+        }
+
+        boolean sameRevision = snapshot.sources().stream().anyMatch(source -> source.kind() == Kind.REVIEW
+                && source.id().equals(completion.reviewId()) && run.reviewer().equals(source.author())
+                && proof.reviewedSha().equals(source.reviewedSha()) && proof.bodySha256().equals(source.bodySha256())
+                && proof.sourceUpdatedAt().equals(source.updatedAt()));
+        return sameRevision && !Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM review_clean_evidence
+                    WHERE provider_execution_id = ? AND provider_attempt_id = ? AND request_id <> ?)
+                OR EXISTS (SELECT 1 FROM review_requests
+                    WHERE (installation_id, repository_id, pr_number, comment_id) = (?, ?, ?, ?) AND id <> ?)
+                """, Boolean.class, proof.executionId(), proof.attemptId(), run.requestId(),
+                run.pr().scope().installationId(), run.pr().scope().repositoryId(), run.pr().number(),
+                request.commentId(), run.requestId()));
+    }
+
+    private boolean sameCodexAttempt(Map<String, Object> recorded, CodexProvenance proof) {
+        if (proof == null) return recorded.get("trigger_comment_id") == null;
+        return Objects.equals(recorded.get("trigger_comment_id"), proof.commentId())
+                && Objects.equals(recorded.get("provider_execution_id"), proof.executionId())
+                && Objects.equals(recorded.get("provider_attempt_id"), proof.attemptId())
+                && Objects.equals(recorded.get("provider_terminal_at"), Timestamp.from(proof.terminalAt()))
+                && Objects.equals(recorded.get("body_sha256"), proof.bodySha256())
+                && Objects.equals(recorded.get("source_updated_at"), Timestamp.from(proof.sourceUpdatedAt()));
     }
 
     private ReviewOutcome recordProgress(Assessment assessment, ReviewOutcome outcome, String fingerprint) {

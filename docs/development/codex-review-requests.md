@@ -18,10 +18,11 @@ the consenting user's own trigger comment and provider replies. This deliberatel
 does not implement a comment-based manual-command workflow. Event IDs, senders and
 cycle IDs cannot change the logical request identity.
 
-The internal API is called by an [opt-in sandbox terminal command](#one-shot-sandbox-trigger).
-A future webhook caller must authenticate the event, fetch
-complete authoritative state, preserve the sender ID/type, and enforce trigger
-eligibility. Never construct trusted policy inputs from comment instructions.
+The internal API is called by an [opt-in sandbox terminal command](#one-shot-sandbox-trigger)
+and the [opt-in sandbox outbox worker](synchronize-review-planning.md#opt-in-dispatch-to-codex).
+The worker uses the `PLANNED_REREVIEW` trigger and binds the configured consenting actor
+to the exact fenced intent. Signed event metadata can wake the planner. It cannot
+grant dispatch authorization. Never construct trusted policy inputs from comment instructions.
 
 The default `ReviewProvider` throws `DISABLED` before accessing a credential or
 network. Enabling `orchestrator.codex.enabled=true` requires all of:

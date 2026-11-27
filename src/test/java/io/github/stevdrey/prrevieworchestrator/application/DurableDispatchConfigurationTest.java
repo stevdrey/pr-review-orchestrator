@@ -9,9 +9,12 @@ import io.github.stevdrey.prrevieworchestrator.adapters.github.GitHubReviewNorma
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcFixCorrelationStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.config.CodexReviewConfiguration;
 import io.github.stevdrey.prrevieworchestrator.config.DurableDispatchConfiguration;
 import io.github.stevdrey.prrevieworchestrator.config.RepositoryAuthorizationConfiguration.Allowlist;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
+import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
+import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials;
 import io.github.stevdrey.prrevieworchestrator.ports.CommandGateway;
 import io.github.stevdrey.prrevieworchestrator.ports.InstallationAuthorization;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
@@ -76,6 +79,15 @@ class DurableDispatchConfigurationTest {
         });
         sandbox.withPropertyValues("orchestrator.codex.enabled=true").run(app -> assertThat(app).hasFailed());
         sandbox.withPropertyValues("orchestrator.notifications.enabled=true").run(app -> assertThat(app).hasFailed());
+
+        var planned = sandbox.withUserConfiguration(CodexReviewConfiguration.class)
+                .withPropertyValues("orchestrator.sandbox-ci.codex-dispatch-enabled=true",
+                        "orchestrator.codex.enabled=true", "orchestrator.codex.actor-id=42")
+                .withBean(CodexApproval.class, () -> mock(CodexApproval.class))
+                .withBean(CodexUserCredentials.class, () -> mock(CodexUserCredentials.class));
+        planned.run(app -> assertThat(app).hasFailed());
+        planned.withBean(ReviewIntentPolicy.class, () -> mock(ReviewIntentPolicy.class))
+                .run(app -> assertThat(app).hasNotFailed().hasSingleBean(DispatchPlannedCodexReview.class));
     }
 
     @Test

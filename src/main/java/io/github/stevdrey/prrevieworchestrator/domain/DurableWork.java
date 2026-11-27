@@ -7,6 +7,7 @@ import java.util.UUID;
 public final class DurableWork {
     private DurableWork() {}
 
+    public static final String REQUEST_REVIEW = "REQUEST_REVIEW";
     public static final String REVIEW_ASSESSMENT_EVENT = "sandbox_review_assessment";
 
     public enum Queue { INBOX, OUTBOX }
@@ -37,7 +38,11 @@ public final class DurableWork {
                     + expectedHeadSha + "/" + stage + "/" + provider + "/" + type;
         }
     }
-    public record Command(Lease lease, RepositoryScope scope, Intent intent, String key) {}
+    public record Command(Lease lease, RepositoryScope scope, Intent intent, String key, Long plannedHeadEpoch) {
+        public Command(Lease lease, RepositoryScope scope, Intent intent, String key) {
+            this(lease, scope, intent, key, null);
+        }
+    }
     public record RemoteState(String currentHeadSha, RemoteEffect effect) {
         public RemoteState {
             if (!CommitSha.isValid(currentHeadSha) || effect == null) {

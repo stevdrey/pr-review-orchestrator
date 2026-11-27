@@ -5,6 +5,7 @@ import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRe
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequest;
@@ -33,7 +34,8 @@ public class CodexReviewConfiguration {
     record SandboxSettings(boolean enabled, long installationId, long repositoryId, int prNumber, String head,
                            ReviewRequest.Trigger trigger, long headEpoch) {
         ReviewRequest pinnedRequest(long actorId) {
-            if (trigger == null || trigger == ReviewRequest.Trigger.COMMENT || trigger == ReviewRequest.Trigger.REVIEW) {
+            if (trigger == null || trigger == ReviewRequest.Trigger.COMMENT || trigger == ReviewRequest.Trigger.REVIEW
+                    || trigger == ReviewRequest.Trigger.PLANNED_REREVIEW) {
                 throw new IllegalArgumentException("Sandbox dispatch requires a supported trigger");
             }
             var pr = new PullRequestId(new RepositoryScope(installationId, repositoryId), prNumber);
@@ -88,7 +90,8 @@ public class CodexReviewConfiguration {
     @ConditionalOnProperty(prefix = "orchestrator.codex", name = "enabled", havingValue = "true")
     ReviewProvider codexReviewProvider(JdbcTemplate jdbc, PlatformTransactionManager manager, JdbcReviewStateStore states,
             RepositoryAuthorization authorization, CodexApproval approval, CodexUserCredentials credentials, SandboxSettings sandbox,
-            ObjectProvider<JdbcSandboxCodexBudget.Terms> budgetTerms,
+            ObjectProvider<JdbcSandboxCodexBudget.Terms> budgetTerms, ObjectProvider<ReviewIntentPolicy> intentPolicy,
+            Environment env,
             @Value("${orchestrator.codex.actor-id}") long actorId,
             @Value("${orchestrator.codex.max-requests:6}") int limit,
             @Value("${orchestrator.notifications.enabled:false}") boolean notifications,
@@ -97,13 +100,45 @@ public class CodexReviewConfiguration {
             throw new IllegalArgumentException("Pinned sandbox dispatch requires a valid request limit and disabled notifications");
         }
         if (oneShot && !sandbox.enabled()) throw new IllegalArgumentException("One-shot review requires sandbox mode");
+        if (env.getProperty("orchestrator.sandbox-ci.codex-dispatch-enabled", Boolean.class, false)) {
+            return plannedProvider(jdbc, manager, states, authorization, approval, credentials, sandbox,
+                    intentPolicy.getObject(), env, actorId, limit);
+        }
         var budget = oneShot ? new JdbcSandboxCodexBudget(jdbc, budgetTerms.getObject()) : null;
         var adapter = new CodexReviewAdapter(authorization, new JdbcReviewRequestStore(jdbc, manager, states, budget), approval,
-                new GitHubCodexComments(credentials, Clock.systemUTC()), actorId, sandbox.enabled() ? 1 : limit, oneShot);
+                new GitHubCodexComments(credentials, Clock.systemUTC()), actorId, sandbox.enabled() ? 1 : limit,
+                oneShot ? CodexReviewAdapter.Mode.SANDBOX_OPERATOR : CodexReviewAdapter.Mode.STANDARD);
         if (!sandbox.enabled()) return adapter;
         var pinned = sandbox.pinnedRequest(actorId);
         return request -> {
             if (!pinned.equals(request)) throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            return adapter.request(request);
+        };
+    }
+    private ReviewProvider plannedProvider(JdbcTemplate jdbc, PlatformTransactionManager manager,
+            JdbcReviewStateStore states, RepositoryAuthorization authorization, CodexApproval approval,
+            CodexUserCredentials credentials, SandboxSettings sandbox, ReviewIntentPolicy policy,
+            Environment env, long actorId, int limit) {
+        if (sandbox.enabled() || !env.getProperty("orchestrator.dispatch.enabled", Boolean.class, false)
+                || !env.getProperty("orchestrator.sandbox-ci.enabled", Boolean.class, false)
+                || !env.getProperty("orchestrator.sandbox-ci.synchronize-enabled", Boolean.class, false)) {
+            throw new IllegalStateException("Planned Codex dispatch requires the synchronize worker and a dedicated grant");
+        }
+        var scope = new RepositoryScope(env.getRequiredProperty("orchestrator.sandbox-ci.installation-id", Long.class),
+                env.getRequiredProperty("orchestrator.sandbox-ci.repository-id", Long.class));
+        var pr = new PullRequestId(scope, env.getRequiredProperty("orchestrator.sandbox-ci.pr-number", Integer.class));
+        CodexApproval plannedApproval = request -> {
+            var intent = new DurableWork.Intent(pr.number(), request.headSha(), request.stage(),
+                    request.provider(), DurableWork.REQUEST_REVIEW);
+            if (!policy.permits(pr, intent)) throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            approval.requirePermitted(request);
+        };
+        var adapter = new CodexReviewAdapter(authorization, new JdbcReviewRequestStore(jdbc, manager, states),
+                plannedApproval, new GitHubCodexComments(credentials, Clock.systemUTC()), actorId, limit, CodexReviewAdapter.Mode.PLANNED);
+        return request -> {
+            if (!request.pr().equals(pr) || request.trigger() != ReviewRequest.Trigger.PLANNED_REREVIEW) {
+                throw new ReviewRequestFailure(ReviewRequestFailure.Code.POLICY_DENIED);
+            }
             return adapter.request(request);
         };
     }
