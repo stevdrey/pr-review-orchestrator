@@ -45,6 +45,27 @@ orchestrator:
 
 The mode requires both enablement flags and an allowlist with exactly one installation/repository pair. It refuses startup with Codex or author notification delivery enabled and never claims external commands. The configured SHA and workflow IDs are an operator-supplied sandbox policy. Testing a different head requires a fresh sandbox configuration and database. This mode accepts only same-repository PRs.
 
+#### Local replay for realtime-voice-lab PR #36
+
+Use [the local PR #36 configuration](../../application-sandbox-pr36.yaml) with a disposable PostgreSQL database. Set `SANDBOX_DB_URL`, `SANDBOX_DB_USER` and `SANDBOX_DB_PASSWORD` for that database. Set `SANDBOX_APP_CLIENT_ID`, `SANDBOX_APP_KEY_FILE` and `SANDBOX_WEBHOOK_SECRET_FILE` for the approved read-only App and a sandbox signing secret. The App key file must be PKCS#8 PEM with mode `0600`. The signing secret file must contain the exact bytes used to sign deliveries.
+
+After building the app, start it from the repository root.
+
+```sh
+java -jar build/libs/pr-review-orchestrator-0.1.0-SNAPSHOT.jar \
+  --spring.config.additional-location=file:./application-sandbox-pr36.yaml
+```
+
+Flyway creates the schema on startup. In this disposable database, provision the approved installation and repository before sending signed deliveries.
+
+```sql
+INSERT INTO installations (installation_id, account_id) VALUES (183768713, 3165632);
+INSERT INTO installation_repositories (installation_id, repository_id, enabled)
+VALUES (183768713, 1469482362, true);
+```
+
+Send locally signed deliveries to `http://127.0.0.1:8081/webhooks/github`. This configuration reads CI and review evidence for one pinned head. A signed `pull_request.synchronize` delivery is accepted into the inbox, but this worker completes it without advancing the head or planning a review request. Use the [signed ingress contract](../github/webhook-ingress.md) for event routing and replay.
+
 After a signed `check_run` or `workflow_run` is persisted, the worker matches the event to the configured repository and head. It uses the event as a wake-up signal. It reads the PR head before and after two bounded workflow observations using repository-scoped read tokens. GitHub workflow ID and run number establish the current run for each dependency. The current attempt, PR association and SHA must match. Missing, ambiguous or changing evidence produces `UNKNOWN`. Read failures use bounded inbox retries. Replay keeps the original inbox identity, and distinct same-head events can reconcile a rerun from `PENDING` to `PASSED` or `FAILED`.
 
 The CI transition and inbox completion commit in one fenced PostgreSQL transaction. The worker rechecks both installation scopes and the local aggregate version at commit. If a valid PR has no local state, the worker initializes it in that same transaction. The worker ignores stale heads and unrelated events. A deferred commit failure rolls back the CI transition and the inbox completion together so the retry fetches fresh evidence.
