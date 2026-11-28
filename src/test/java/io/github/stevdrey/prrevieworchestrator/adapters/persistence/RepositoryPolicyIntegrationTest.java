@@ -7,6 +7,13 @@ import io.github.stevdrey.prrevieworchestrator.adapters.operator.RepositoryPolic
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryAuthorization;
 import io.github.stevdrey.prrevieworchestrator.application.RepositoryPolicyOperator;
 import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Intent;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Lease;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Limits;
+import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Queue;
+import java.time.Duration;
+import java.util.UUID;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.QuietHours;
@@ -288,6 +295,67 @@ class RepositoryPolicyIntegrationTest {
                 Set.of("codex"), true, null, 7));
         assertThrows(IllegalArgumentException.class, () -> new RepositoryReviewPolicy(Set.of(Stage.BASELINE),
                 Set.of("Invalid Provider"), true, null, 1));
+    }
+
+    @Test
+    void anUnrecognizedStoredZoneFailsClosedAndCanBeReplaced() {
+        jdbc.update("INSERT INTO repository_review_policy_time_zones (zone_id) VALUES ('Mars/Olympus')");
+        jdbc.update("""
+                INSERT INTO repository_review_policy_versions (installation_id, repository_id, version, stages, providers,
+                    require_passing_ci, quiet_zone, quiet_start_minute, quiet_end_minute,
+                    iteration_cap, held, changed_by, change_kind)
+                VALUES (101, 1001, 1, ARRAY['BASELINE'], ARRAY['codex'], false, 'Mars/Olympus', 0, 60, 6, false, 42, 'CONFIGURE')
+                """);
+        var unreadable = operator.read(SCOPE, ACTOR);
+        assertEquals(1L, unreadable.version());
+        assertEquals(RepositoryReviewPolicy.DEFAULT, unreadable.policy());
+        assertEquals(ReviewRequestFailure.Code.POLICY_DENIED, assertThrows(ReviewRequestFailure.class,
+                () -> reserve(request(7, "BASELINE", "codex"))).code());
+        assertEquals(2L, operator.change(SCOPE, ACTOR, 1, CONFIGURE, ENABLED).version());
+        assertTrue(reserve(request(7, "BASELINE", "codex")).created());
+    }
+
+    @Test
+    void quietHoursDeferNativeRequestsInsteadOfDenyingThem() {
+        var quiet = new QuietHours(ZoneId.of("America/Costa_Rica"), 22 * 60, 6 * 60);
+        assertEquals(Instant.parse("2026-11-27T12:00:00Z"), quiet.end(Instant.parse("2026-11-27T04:00:00Z")));
+        assertEquals(Instant.parse("2026-11-28T12:00:00Z"), quiet.end(Instant.parse("2026-11-27T12:00:00Z")));
+        int minute = jdbc.queryForObject(
+                "SELECT (extract(hour FROM clock_timestamp() AT TIME ZONE 'UTC') * 60 + extract(minute FROM clock_timestamp() AT TIME ZONE 'UTC'))::int",
+                Integer.class);
+        operator.change(SCOPE, ACTOR, 0, CONFIGURE, new RepositoryReviewPolicy(ENABLED.stages(), ENABLED.providers(),
+                false, new QuietHours(ZoneId.of("UTC"), minute, (minute + 120) % 1440), 6));
+        assertEquals(ReviewRequestFailure.Code.QUIET_HOURS, assertThrows(ReviewRequestFailure.class,
+                () -> reserve(request(7, "BASELINE", "codex"))).code());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
+    }
+
+    @Test
+    void tentativeSlotsOrALoweredCapDenyWithoutStoppingThePr() {
+        var pr = new PullRequestId(SCOPE, 7);
+        new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(jdbc.getDataSource()))
+                .create(pr, "a".repeat(40), this::authorize);
+        operator.change(SCOPE, ACTOR, 0, CONFIGURE,
+                new RepositoryReviewPolicy(Set.of(Stage.BASELINE, Stage.DEEP), Set.of("codex"), false, null, 1));
+        assertTrue(reserve(request(7, "BASELINE", "codex")).created());
+        assertEquals(ReviewRequestFailure.Code.LIMIT_REACHED, assertThrows(ReviewRequestFailure.class,
+                () -> reserve(request(7, "DEEP", "codex"))).code());
+        assertNotEquals("PAUSED", jdbc.queryForObject("SELECT state FROM pr_review_states WHERE pr_number = 7", String.class));
+    }
+
+    @Test
+    void aGenericCommandSendingNativelyIsNotItsOwnDuplicate() {
+        var snapshot = operator.change(SCOPE, ACTOR, 0, CONFIGURE, ENABLED);
+        var lease = new Lease(Queue.INBOX, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 1);
+        var queue = new JdbcWorkQueue(jdbc, new DataSourceTransactionManager(jdbc.getDataSource()),
+                new Limits(Duration.ofSeconds(30), Duration.ofSeconds(2), Duration.ofSeconds(8)));
+        queue.enqueue(new Event(lease, SCOPE, "pull_request", "synchronize", 7, "a".repeat(40)),
+                new Intent(7, "a".repeat(40), "BASELINE", "codex", "REQUEST_REVIEW"), null, snapshot.version());
+        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        assertEquals(ReviewRequestFailure.Code.POLICY_DENIED, assertThrows(ReviewRequestFailure.class,
+                () -> reserve(request(7, "BASELINE", "codex"))).code());
+        assertTrue(reserve(new ReviewRequest(new PullRequestId(SCOPE, 7), "a".repeat(40), "BASELINE", "codex",
+                ReviewRequest.Trigger.PR_READY, ACTOR, false, 0, null, command)).created());
     }
 
     private void assertSqlState(String state, Runnable operation) {

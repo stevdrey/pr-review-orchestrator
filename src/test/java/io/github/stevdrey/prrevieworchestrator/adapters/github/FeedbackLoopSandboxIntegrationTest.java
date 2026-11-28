@@ -764,7 +764,8 @@ class FeedbackLoopSandboxIntegrationTest {
         } else {
             assertEquals(1, count("review_requests"));
             assertEquals(0, count("sandbox_codex_budget_reservations"));
-            assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, current().intervention());
+            // A pinned policy cap filled by another command denies without a permanent ITERATION_LIMIT stop.
+            assertNull(current().intervention());
         }
     }
 

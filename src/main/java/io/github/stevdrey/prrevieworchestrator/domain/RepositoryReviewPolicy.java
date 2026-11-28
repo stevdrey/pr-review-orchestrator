@@ -2,7 +2,9 @@ package io.github.stevdrey.prrevieworchestrator.domain;
 
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Stage;
 import java.time.Instant;
+import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.Objects;
 import java.util.Set;
 
@@ -22,16 +24,26 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
     }
 
     public boolean permits(String stage, String provider, Instant now) {
+        return allows(stage, provider) && !quiet(now);
+    }
+
+    /** The stage, provider and cap rules, independent of the quiet-hours schedule. */
+    public boolean allows(String stage, String provider) {
         return iterationCap > 0 && providers.contains(provider)
-                && stages.stream().anyMatch(allowed -> allowed.name().equals(stage))
-                && (quietHours == null || !quietHours.contains(now));
+                && stages.stream().anyMatch(allowed -> allowed.name().equals(stage));
+    }
+
+    public boolean quiet(Instant now) {
+        return quietHours != null && quietHours.contains(now);
     }
 
     /** A daily wall-clock interval in an IANA time zone, start inclusive and end exclusive. */
     public record QuietHours(ZoneId zone, int startMinute, int endMinute) {
+        private static final Set<String> ZONES = ZoneId.getAvailableZoneIds();
+
         public QuietHours {
             Objects.requireNonNull(zone);
-            if (!ZoneId.getAvailableZoneIds().contains(zone.getId()) || startMinute < 0 || startMinute >= 1440
+            if (!ZONES.contains(zone.getId()) || startMinute < 0 || startMinute >= 1440
                     || endMinute < 0 || endMinute >= 1440 || startMinute == endMinute) {
                 throw new IllegalArgumentException("Invalid repository quiet hours");
             }
@@ -43,6 +55,13 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
             return startMinute < endMinute ? minute >= startMinute && minute < endMinute
                     : minute >= startMinute || minute < endMinute;
         }
+
+        /** The next local end of the interval strictly after {@code now}. */
+        public Instant end(Instant now) {
+            var local = now.atZone(zone);
+            var end = ZonedDateTime.of(local.toLocalDate(), LocalTime.of(endMinute / 60, endMinute % 60), zone);
+            return (end.isAfter(local) ? end : end.plusDays(1)).toInstant();
+        }
     }
 
     public record Snapshot(long version, RepositoryReviewPolicy policy, boolean held) {
@@ -53,6 +72,10 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
 
         public boolean permits(String stage, String provider, Instant now) {
             return !held && policy.permits(stage, provider, now);
+        }
+
+        public boolean quiet(Instant now) {
+            return policy.quiet(now);
         }
 
         public int effectiveIterationCap(Snapshot active) {

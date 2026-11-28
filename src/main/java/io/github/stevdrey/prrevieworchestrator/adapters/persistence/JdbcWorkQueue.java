@@ -16,6 +16,8 @@ import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -23,6 +25,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /** PostgreSQL clocks, SKIP LOCKED claims and per-claim fencing. No JVM clock orders work. */
 public final class JdbcWorkQueue implements WorkQueue {
+    private static final Logger LOG = LoggerFactory.getLogger(JdbcWorkQueue.class);
     /** Every queue transaction, including any gateway call inside executeCommand, finishes within this. */
     private static final Duration DEADLINE = Duration.ofSeconds(10);
     // Three independent 8s request transactions, including the send, plus bounded cleanup and queue overhead.
@@ -99,7 +102,8 @@ public final class JdbcWorkQueue implements WorkQueue {
     private Optional<Command> claimCommand(String filter, Object... args) {
         return transaction(() -> {
             var lease = claim(Queue.OUTBOX, filter + """
-                     AND (command_type <> 'REQUEST_REVIEW' OR NOT coalesce((
+                     AND (command_type <> 'REQUEST_REVIEW' OR status <> 'PENDING' OR attempts >= max_attempts
+                         OR NOT coalesce((
                          SELECT held FROM repository_review_policy_versions policy
                          WHERE (policy.installation_id, policy.repository_id) =
                              (outbox_commands.installation_id, outbox_commands.repository_id)
@@ -169,11 +173,15 @@ public final class JdbcWorkQueue implements WorkQueue {
                     continue;
                 }
                 var pr = new PullRequestId(event.scope(), intent.prNumber());
-                if (snapshot.permits(intent.stage(), intent.provider(), repositoryPolicy.now())
+                // A hold parks the command at claim and quiet hours defer it at execution.
+                if (snapshot.policy().allows(intent.stage(), intent.provider())
                         && repositoryPolicy.occupied(pr, null) < snapshot.policy().iterationCap()
                         && reviewStatePermits(pr, intent, snapshot.policy().requirePassingCi())
                         && !alreadyReserved(pr, intent)) {
                     enqueue(event, intent, null, snapshot.version());
+                } else {
+                    LOG.info("queue={} work_id={} correlation_id={} pr_number={} outcome=POLICY_DENIED",
+                            event.lease().queue(), event.lease().id(), event.lease().correlationId(), intent.prNumber());
                 }
             }
         });
@@ -250,15 +258,22 @@ public final class JdbcWorkQueue implements WorkQueue {
             if (!lock(command.lease())) return false;
             authorize.run();
             // Holding the row lock prevents another worker stealing the lease during a bounded API call.
-            Outcome outcome = java.util.Objects.requireNonNull(operation.apply(() -> reviewPolicyAllows(command)));
-            finishCommand(command.lease(), outcome);
+            var decision = new java.util.concurrent.atomic.AtomicReference<Decision>();
+            Outcome outcome = java.util.Objects.requireNonNull(operation.apply(() -> {
+                decision.set(reviewPolicyDecision(command));
+                return decision.get() == Decision.ALLOW;
+            }));
+            finishCommand(command.lease(), outcome == Outcome.POLICY_DENIED && decision.get() == Decision.DEFER
+                    ? Outcome.DEFERRED : outcome);
             return true;
         });
     }
 
-    private boolean reviewPolicyAllows(Command command) {
+    private enum Decision { ALLOW, DENY, DEFER }
+
+    private Decision reviewPolicyDecision(Command command) {
         var intent = command.intent();
-        if (!REQUEST_REVIEW.equals(intent.type())) return true;
+        if (!REQUEST_REVIEW.equals(intent.type())) return Decision.ALLOW;
         var pr = new PullRequestId(command.scope(), intent.prNumber());
         PostgresLocks.lockPr(jdbc, pr);
         var active = repositoryPolicy.lockCurrent(command.scope());
@@ -266,17 +281,21 @@ public final class JdbcWorkQueue implements WorkQueue {
                 Long.class, command.lease().id());
         var pinned = repositoryPolicy.pinned(command.scope(), version);
         var now = repositoryPolicy.now();
-        return pinned.permits(intent.stage(), intent.provider(), now)
-                && active.permits(intent.stage(), intent.provider(), now)
+        // The live hold governs; a command admitted during a pause runs under its pinned rules after resume.
+        boolean allowed = !active.held() && pinned.policy().allows(intent.stage(), intent.provider())
+                && active.policy().allows(intent.stage(), intent.provider())
                 && repositoryPolicy.occupied(pr, null) <= pinned.effectiveIterationCap(active)
                 && reviewStatePermits(pr, intent, pinned.policy().requirePassingCi() || active.policy().requirePassingCi());
+        if (!allowed) return Decision.DENY;
+        return pinned.quiet(now) || active.quiet(now) ? Decision.DEFER : Decision.ALLOW;
     }
 
     private boolean reviewStatePermits(PullRequestId pr, Intent intent, boolean requireCi) {
         return jdbc.query("""
-                SELECT head_sha = ? AND state <> 'PAUSED' AND (NOT ? OR ci_status = 'PASSED')
+                SELECT CASE WHEN head_sha IS DISTINCT FROM ? THEN NOT ?
+                    ELSE state <> 'PAUSED' AND (NOT ? OR ci_status IS NOT DISTINCT FROM 'PASSED') END
                 FROM pr_review_states WHERE (installation_id, repository_id, pr_number) = (?, ?, ?)
-                """, (rs, row) -> rs.getBoolean(1), intent.expectedHeadSha(), requireCi,
+                """, (rs, row) -> rs.getBoolean(1), intent.expectedHeadSha(), requireCi, requireCi,
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number()).stream().findFirst().orElse(!requireCi);
     }
 
@@ -301,8 +320,32 @@ public final class JdbcWorkQueue implements WorkQueue {
     }
 
     private void finishCommand(Lease lease, Outcome outcome) {
-        if (outcome == Outcome.POLICY_DENIED) finish(lease, Outcome.CANCELLED.name(), ErrorCode.POLICY_DENIED);
+        if (outcome == Outcome.DEFERRED) defer(lease);
+        else if (outcome == Outcome.POLICY_DENIED) finish(lease, Outcome.CANCELLED.name(), ErrorCode.POLICY_DENIED);
         else finish(lease, outcome.name(), null);
+    }
+
+    /** Quiet hours return a provably unsent command to PENDING until the window ends. Attempts are never reset. */
+    private void defer(Lease lease) {
+        var row = jdbc.queryForMap("""
+                SELECT installation_id, repository_id, repository_policy_version, max_attempts
+                FROM outbox_commands WHERE id = ?
+                """, lease.id());
+        if (lease.attempt() >= ((Number) row.get("max_attempts")).intValue()) {
+            finish(lease, Outcome.CANCELLED.name(), ErrorCode.POLICY_DENIED);
+            return;
+        }
+        var scope = new RepositoryScope(((Number) row.get("installation_id")).longValue(),
+                ((Number) row.get("repository_id")).longValue());
+        var active = repositoryPolicy.lockCurrent(scope);
+        var pinned = repositoryPolicy.pinned(scope, (Long) row.get("repository_policy_version"));
+        var now = repositoryPolicy.now();
+        var until = JdbcRepositoryPolicy.quietUntil(pinned, active, now);
+        jdbc.update("""
+                UPDATE outbox_commands SET status = 'PENDING', locked_by = NULL, locked_until = NULL, lease_token = NULL,
+                    last_error_code = ?, available_at = ? WHERE id = ?
+                """, ErrorCode.POLICY_DENIED.name(), Timestamp.from(until == null ? now : until), lease.id());
+        journal(lease, "RETRY", ErrorCode.POLICY_DENIED);
     }
 
     @Override

@@ -119,7 +119,8 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         var pr = current.pr();
         var intent = new Intent(pr.number(), current.headSha(), "BASELINE", "codex", REQUEST_REVIEW);
         var snapshot = repositoryPolicy.lockCurrent(pr.scope());
-        if (!snapshot.permits(intent.stage(), intent.provider(), repositoryPolicy.now())) return;
+        // A hold parks the planned command at claim; quiet hours defer it at dispatch.
+        if (!snapshot.policy().allows(intent.stage(), intent.provider())) return;
         boolean duplicate = Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM outbox_commands WHERE command_key = ?)
                     OR EXISTS (SELECT 1 FROM review_requests

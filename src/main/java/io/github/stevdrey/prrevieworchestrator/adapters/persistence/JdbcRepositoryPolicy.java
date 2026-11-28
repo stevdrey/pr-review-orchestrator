@@ -13,6 +13,7 @@ import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Chang
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -112,11 +113,29 @@ public final class JdbcRepositoryPolicy {
         var providers = Arrays.stream((String[]) rs.getArray("providers").getArray())
                 .collect(Collectors.toUnmodifiableSet());
         String zone = rs.getString("quiet_zone");
-        var quiet = zone == null ? null : new QuietHours(ZoneId.of(zone), rs.getInt("quiet_start_minute"),
-                rs.getInt("quiet_end_minute"));
+        QuietHours quiet = null;
+        if (zone != null) {
+            try {
+                quiet = new QuietHours(ZoneId.of(zone), rs.getInt("quiet_start_minute"), rs.getInt("quiet_end_minute"));
+            } catch (DateTimeException | IllegalArgumentException unknownZone) {
+                // Fail closed without wedging reads: the denying default keeps the stored hold so CONFIGURE can replace it.
+                return new Snapshot(rs.getLong("version"), RepositoryReviewPolicy.DEFAULT, rs.getBoolean("held"));
+            }
+        }
         var policy = new RepositoryReviewPolicy(stages, providers, rs.getBoolean("require_passing_ci"), quiet,
                 rs.getInt("iteration_cap"));
         return new Snapshot(rs.getLong("version"), policy, rs.getBoolean("held"));
+    }
+
+    /** The latest end of any quiet window in either snapshot that currently contains {@code now}, or null. */
+    static Instant quietUntil(Snapshot pinned, Snapshot active, Instant now) {
+        Instant until = null;
+        for (var snapshot : new Snapshot[] {pinned, active}) {
+            if (!snapshot.quiet(now)) continue;
+            var end = snapshot.policy().quietHours().end(now);
+            if (until == null || end.isAfter(until)) until = end;
+        }
+        return until;
     }
 
     Instant now() {

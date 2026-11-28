@@ -70,6 +70,7 @@ public final class DispatchPlannedCodexReview {
             return switch (failure.code()) {
                 case STALE_HEAD, ACTOR_DENIED -> Outcome.CANCELLED;
                 case POLICY_DENIED, LIMIT_REACHED, HUMAN_INTERVENTION_REQUIRED -> Outcome.POLICY_DENIED;
+                case QUIET_HOURS -> Outcome.DEFERRED;
                 case REMOTE_UNAVAILABLE, PR_NOT_READY, CAPABILITY_UNVERIFIED ->
                         throw new Failure(ErrorCode.REMOTE_UNAVAILABLE, true);
                 case OUTCOME_UNKNOWN -> throw new Failure(ErrorCode.REMOTE_UNCERTAIN, false);

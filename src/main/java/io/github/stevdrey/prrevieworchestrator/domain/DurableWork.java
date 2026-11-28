@@ -15,7 +15,7 @@ public final class DurableWork {
         INTERNAL_ERROR, AUTHORIZATION_DENIED, AUTHORIZATION_UNAVAILABLE, INVALID_EVENT, UNSUPPORTED_COMMAND,
         REMOTE_UNAVAILABLE, REMOTE_UNCERTAIN, LEASE_EXHAUSTED, POLICY_DENIED
     }
-    public enum Outcome { SUCCEEDED, CANCELLED, POLICY_DENIED }
+    public enum Outcome { SUCCEEDED, CANCELLED, POLICY_DENIED, DEFERRED }
     public enum RemoteEffect { ABSENT, APPLIED, UNKNOWN }
 
     public record Lease(Queue queue, UUID id, UUID token, UUID correlationId, int attempt) {}
