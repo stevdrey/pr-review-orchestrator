@@ -99,36 +99,49 @@ public class JdbcMcpToolStore implements McpToolStore {
             var pr = session.pr();
             long installation = pr.scope().installationId();
             long repository = pr.scope().repositoryId();
-            return jdbc.query(JdbcGeneralFeedbackStore.LAST_HEAD + """
-                    , page AS (
-                        SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.status, f.thread_resolved
-                        FROM review_cycles c JOIN findings f ON f.review_cycle_id = c.id
-                        WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ? AND c.head_sha = ?
-                          AND (CAST(? AS uuid) IS NULL OR f.id > ?)
-                        ORDER BY f.id LIMIT ?
+            // The clean gate's effective projection across every round of the PR: retained findings from earlier
+            // heads stay visible, and superseded inline copies collapse to their current occurrence.
+            return jdbc.query(JdbcGeneralFeedbackStore.LAST_HEAD + ", "
+                    + JdbcGeneralFeedbackStore.EFFECTIVE_INLINE_FINDING_CTES + """
+                    , inline_rows AS (
+                        SELECT DISTINCT ON (coalesce(stable_finding_id, id))
+                            id, stable_finding_id, source_kind, severity, status, thread_resolved
+                        FROM effective_inline_findings
+                        ORDER BY coalesce(stable_finding_id, id), at_round DESC NULLS LAST,
+                            linked_at DESC NULLS LAST, id DESC
+                    ), general_effective AS (
+                    """ + JdbcGeneralFeedbackStore.EFFECTIVE_GENERAL_FINDINGS + """
                     ), general_status AS (
                         SELECT stable_finding_id,
                             CASE WHEN bool_and(decision IS NOT DISTINCT FROM 'DISMISSED') THEN 'DISMISSED'
                                  WHEN bool_and(decision IS NOT NULL) THEN 'ACKNOWLEDGED'
                                  ELSE 'OPEN' END AS status
-                        FROM (
-                    """ + JdbcGeneralFeedbackStore.EFFECTIVE_GENERAL_FINDINGS + """
-                        ) effective
-                        WHERE stable_finding_id IN (SELECT stable_finding_id FROM page
-                            WHERE source_kind IN ('REVIEW', 'ISSUE_COMMENT'))
-                        GROUP BY stable_finding_id
+                        FROM general_effective GROUP BY stable_finding_id
+                    ), general_rows AS (
+                        SELECT DISTINCT ON (e.stable_finding_id)
+                            e.id, e.stable_finding_id, e.source_kind, e.severity, g.status, e.thread_resolved
+                        FROM general_effective e JOIN general_status g USING (stable_finding_id)
+                        ORDER BY e.stable_finding_id, e.id
+                    ), legacy_rows AS (
+                        SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.status, f.thread_resolved
+                        FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
+                        WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
+                            AND f.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND f.stable_finding_id IS NULL
                     )
-                    SELECT p.id, p.stable_finding_id, p.source_kind, p.severity, p.thread_resolved,
-                        CASE WHEN p.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND p.stable_finding_id IS NOT NULL
-                             THEN coalesce(g.status, 'OPEN') ELSE p.status END AS status
-                    FROM page p LEFT JOIN general_status g USING (stable_finding_id)
-                    ORDER BY p.id
+                    SELECT * FROM (
+                        SELECT * FROM inline_rows UNION ALL SELECT * FROM general_rows
+                        UNION ALL SELECT * FROM legacy_rows
+                    ) effective
+                    WHERE (CAST(? AS uuid) IS NULL OR id > ?)
+                    ORDER BY id LIMIT ?
                     """, (rs, row) -> new Finding(rs.getObject("id", UUID.class),
                     rs.getObject("stable_finding_id", UUID.class), rs.getString("source_kind"),
                     rs.getString("severity"), rs.getString("status"), rs.getObject("thread_resolved", Boolean.class)),
                     installation, repository, pr.number(),
-                    installation, repository, pr.number(), headSha, after, after, limit,
-                    headSha, installation, repository, pr.number());
+                    installation, repository, pr.number(),
+                    headSha, installation, repository, pr.number(),
+                    installation, repository, pr.number(),
+                    after, after, limit);
         }
 
         @Override

@@ -142,6 +142,11 @@ class McpIntegrationTest {
         var june = initialize(juneVersion);
         assertEquals(200, june.statusCode());
         assertEquals(juneVersion, JSON.readTree(june.body()).at("/result/protocolVersion").asText());
+        // Initialization negotiates from its body, even when the client sends an older header revision.
+        var legacyHeader = post(READ, rpc("initialize", Map.of("protocolVersion", legacyVersion, "capabilities", Map.of(),
+                "clientInfo", Map.of("name", "fixture", "version", "1"))), legacyVersion);
+        assertEquals(200, legacyHeader.statusCode());
+        assertEquals(VERSION, JSON.readTree(legacyHeader.body()).at("/result/protocolVersion").asText());
 
         String ping = rpc("ping", Map.of());
         assertEquals(200, post(READ, ping, juneVersion).statusCode());
@@ -151,9 +156,10 @@ class McpIntegrationTest {
     }
 
     @Test
-    void onlyReturnsRedactedFindingsForTheAuthorizedPrAndHeadAcrossPages() throws Exception {
+    void onlyReturnsRedactedFindingsForTheAuthorizedPrAcrossRoundsAndPages() throws Exception {
         UUID current = cycle(101, 7, HEAD);
         for (int i = 1; i <= 51; i++) finding(current, 101, HEAD, i);
+        // A retained finding from an earlier head still feeds the clean gate, so it stays listed.
         finding(cycle(101, 7, NEXT_HEAD), 101, NEXT_HEAD, 100);
         finding(cycle(101, 8, HEAD), 101, HEAD, 101);
         finding(cycle(202, 7, HEAD), 202, HEAD, 102);
@@ -164,10 +170,43 @@ class McpIntegrationTest {
         assertEquals("OPEN", page.at("/findings/0/status").asText());
         assertEquals("ISSUE_COMMENT", page.at("/findings/0/sourceKind").asText());
         var next = tool(READ, "list_findings", with("after", page.path("nextCursor").asText()), "OK");
-        assertEquals(1, next.path("findings").size());
-        assertEquals(new UUID(0, 51).toString(), next.at("/findings/0/id").asText());
+        assertThat(next.path("findings").values()).extracting(finding -> finding.path("id").asText())
+                .containsExactly(new UUID(0, 51).toString(), new UUID(0, 100).toString());
         assertThat(next.has("nextCursor")).isFalse();
         tool(READ, "list_findings", with("headSha", NEXT_HEAD), "STALE_HEAD");
+    }
+
+    @Test
+    void listsRetainedInlineFindingsOnceWithTheirCurrentOccurrence() throws Exception {
+        UUID older = cycle(101, 7, NEXT_HEAD);
+        jdbc.update("""
+                INSERT INTO findings (id, review_cycle_id, installation_id, repository_id, reviewed_sha, source_provider,
+                    source_kind, source_id, thread_id, thread_resolved)
+                VALUES (?, ?, 101, 1001, ?, 'fixture', 'REVIEW_COMMENT', 'legacy-inline', 'legacy-thread', false)
+                """, new UUID(0, 200), older, NEXT_HEAD);
+
+        Instant observedAt = Instant.parse("2026-11-27T12:00:00Z");
+        for (int round = 0; round < 2; round++) {
+            UUID roundCycle = UUID.randomUUID();
+            jdbc.update("""
+                    INSERT INTO review_cycles (id, installation_id, repository_id, pr_number, head_sha, stage,
+                        review_provider, iteration)
+                    VALUES (?, 101, 1001, 7, ?, 'BASELINE', 'fixture', ?)
+                    """, roundCycle, HEAD, round + 1);
+            var comment = new ReviewEvidence.Source("fixture-inline", ReviewEvidence.Kind.REVIEW_COMMENT, null,
+                    "fixture-thread", null, null, HEAD, HEAD, "b".repeat(64), observedAt, null, round == 1, false,
+                    "src/Example.java", 10, 10, ReviewEvidence.Severity.UNKNOWN);
+            evidence.ingest(new ReviewEvidence.Snapshot(UUID.randomUUID(), roundCycle, PR, "fixture", HEAD,
+                    observedAt.plusSeconds(round), List.of(comment)));
+        }
+        assertEquals(2, count("SELECT count(*) FROM findings WHERE stable_finding_id IS NOT NULL"));
+
+        var findings = tool(READ, "list_findings", TARGET, "OK").path("findings").values();
+        assertThat(findings).hasSize(2);
+        assertThat(findings).anyMatch(finding -> finding.path("id").asText().equals(new UUID(0, 200).toString())
+                && finding.path("status").asText().equals("OPEN"));
+        assertThat(findings).filteredOn(finding -> !finding.path("stableId").isNull()).singleElement()
+                .satisfies(finding -> assertThat(finding.path("threadResolved").booleanValue()).isTrue());
     }
 
     @ParameterizedTest

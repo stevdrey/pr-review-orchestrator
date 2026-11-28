@@ -54,7 +54,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
 
     // Both the clean gate and MCP use the same current-head disposition rules.
     static final String EFFECTIVE_GENERAL_FINDINGS = """
-            SELECT f.stable_finding_id, f.feedback,
+            SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.thread_resolved, f.feedback,
                 (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
                              WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
                              ELSE 'PENDING' END
@@ -68,7 +68,8 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
     // Shared by the pending-findings gate and the no-progress comparison.
     static final String EFFECTIVE_INLINE_FINDING_CTES = """
             inline_findings AS (
-                SELECT f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
+                SELECT f.id, f.source_kind, f.severity, f.thread_resolved,
+                    f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
                     latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
                 FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
                 LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id

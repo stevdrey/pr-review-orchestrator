@@ -52,7 +52,6 @@ public class McpController {
         try {
             String digest = credentialDigest(request);
             String version = single(request, "MCP-Protocol-Version");
-            if (version != null && !VERSIONS.contains(version)) return response(400).build();
             if (!jsonInput(request)) return response(415).build();
             if (request.getContentLengthLong() > BODY_LIMIT) return response(413).build();
 
@@ -78,8 +77,11 @@ public class McpController {
             return rpcError(400, null, -32600, "Invalid request");
         }
         String method = message.path("method").asText();
-        // Initialization negotiates the revision. Later requests must identify a supported revision.
-        if (version == null && !"initialize".equals(method)) return response(400).build();
+        // Initialization negotiates from its body and ignores the header. Every later message must name a
+        // supported revision: a missing header means 2025-03-26, which this server does not support.
+        if (!"initialize".equals(method) && (version == null || !VERSIONS.contains(version))) {
+            return response(400).build();
+        }
         if (!message.has("id")) {
             // Notifications carry no request ID and must never invoke commands.
             return switch (method) {
