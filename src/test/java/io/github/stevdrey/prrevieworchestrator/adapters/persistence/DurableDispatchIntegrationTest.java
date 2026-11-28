@@ -9,6 +9,7 @@ import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Stage;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
 import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import java.time.Duration;
@@ -104,6 +105,37 @@ class DurableDispatchIntegrationTest {
         assertTrue(dispatcher().processCommand());
         assertEquals(0, gateway.writes.get());
         assertEquals(1, count("outbox_commands", "status = 'CANCELLED' AND last_error_code = 'POLICY_DENIED' AND repository_policy_version = 1"));
+    }
+
+    @Test
+    void increasingTheLimitCannotRelaxAnOlderReviewCommand() {
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(
+                new DataSourceTransactionManager(dataSource)), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of(INTENT.provider());
+        assertEquals(2L, operator.change(FIRST, 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 1)).version());
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1, jdbc.update("""
+                UPDATE outbox_commands SET available_at = clock_timestamp() + interval '1 hour'
+                WHERE command_key = ? AND repository_policy_version = 2
+                """, INTENT.key(FIRST)));
+
+        assertEquals(3L, operator.change(FIRST, 1, 2, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 2)).version());
+        var newer = new Intent(7, HEAD, "DEEP", INTENT.provider(), INTENT.type());
+        event(FIRST, HEAD);
+        assertTrue(dispatcher(ignored -> List.of(newer)).processEvent());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(Set.of(newer.key(FIRST)), gateway.applied);
+        assertEquals(1, count("outbox_commands", "status = 'SUCCEEDED' AND repository_policy_version = 3"));
+
+        ready("outbox_commands");
+        assertTrue(dispatcher().processCommand());
+        assertEquals(Set.of(newer.key(FIRST)), gateway.applied);
+        assertEquals(1, count("outbox_commands",
+                "status = 'CANCELLED' AND last_error_code = 'POLICY_DENIED' AND repository_policy_version = 2"));
     }
 
     @Test

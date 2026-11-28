@@ -266,9 +266,10 @@ public final class JdbcWorkQueue implements WorkQueue {
                 Long.class, command.lease().id());
         var pinned = repositoryPolicy.pinned(command.scope(), version);
         var now = repositoryPolicy.now();
+        int iterationCap = Math.min(pinned.policy().iterationCap(), active.policy().iterationCap());
         return pinned.permits(intent.stage(), intent.provider(), now)
                 && active.permits(intent.stage(), intent.provider(), now)
-                && repositoryPolicy.occupied(pr, null) <= active.policy().iterationCap()
+                && repositoryPolicy.occupied(pr, null) <= iterationCap
                 && reviewStatePermits(pr, intent, pinned.policy().requirePassingCi() || active.policy().requirePassingCi());
     }
 
