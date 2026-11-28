@@ -36,7 +36,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at)
             """;
 
-    private static final String LAST_HEAD = """
+    static final String LAST_HEAD = """
             WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
                 WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
                     AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD'))
@@ -50,6 +50,19 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 AND d.head_version >= (SELECT version FROM last_head)
                 AND s.body_sha256 = f.body_sha256 AND s.source_updated_at = f.source_updated_at
                 AND s.feedback = f.feedback
+            """;
+
+    // Both the clean gate and MCP use the same current-head disposition rules.
+    static final String EFFECTIVE_GENERAL_FINDINGS = """
+            SELECT f.stable_finding_id, f.feedback,
+                (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
+                             WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
+                             ELSE 'PENDING' END
+            """ + CURRENT_DECISION + """
+                ) AS decision
+            FROM (
+            """ + LATEST + """
+            ) f
             """;
 
     // Shared by the pending-findings gate and the no-progress comparison.
@@ -100,15 +113,9 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
     static FindingGates findingGates(JdbcTemplate jdbc, PullRequestId pr, String head) {
         return jdbc.queryForObject(LAST_HEAD + """
                 , general AS (
-                SELECT f.feedback,
-                    (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
-                                 WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
-                                 ELSE 'PENDING' END
-                """ + CURRENT_DECISION + """
-                    ) AS decision
-                FROM (
-                """ + LATEST + """
-                ) f
+                SELECT feedback, decision FROM (
+                """ + EFFECTIVE_GENERAL_FINDINGS + """
+                ) effective
                 UNION ALL
                     SELECT 'NEEDS_HUMAN', 'PENDING' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?

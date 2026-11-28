@@ -1,6 +1,6 @@
 # MCP tools
 
-The optional `POST /mcp` endpoint implements the JSON response form of [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports). It supports initialization, ping, tool discovery and tool calls. It supports protocol versions `2025-11-25`, `2025-06-18` and `2025-03-26`. The transport keeps no MCP session ID and opens no SSE stream. An authenticated client can supply its negotiated version in `MCP-Protocol-Version` and advertise both `application/json` and `text/event-stream` in `Accept`. The endpoint refuses requests with an `Origin` header and expects UTF-8 `application/json` bodies up to 16 KiB.
+The optional `POST /mcp` endpoint implements the JSON response form of [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports). It supports initialization, ping, tool discovery and tool calls with protocol versions `2025-11-25` and `2025-06-18`. After initialization, send the negotiated version in `MCP-Protocol-Version` and advertise both `application/json` and `text/event-stream` in `Accept`. The transport accepts one JSON-RPC message per POST, keeps no MCP session ID and opens no SSE stream. The endpoint refuses requests with an `Origin` header and expects UTF-8 `application/json` bodies up to 16 KiB.
 
 ## Enable and grant access
 
@@ -26,7 +26,7 @@ Every tool requires `installationId`, `repositoryId`, `prNumber` and the full lo
 | Tool | Result |
 | --- | --- |
 | `get_pr_status` | Current local state, version, CI and clean-stage flags for the expected SHA. |
-| `list_findings` | Up to 50 redacted findings for the PR and SHA, including stable IDs where available and separate thread-resolution and finding status fields. Pass `nextCursor` as `after` to continue. Pages reflect current local data at each call. |
+| `list_findings` | Up to 50 redacted findings for the PR and SHA, including stable IDs where available and separate thread-resolution and finding status fields. For normalized general feedback, status reflects the latest evidence and a disposition valid for the current head visit. Inline and legacy findings report their recorded status. Pass `nextCursor` as `after` to continue. Pages reflect current local data at each call. |
 | `pause_cycle` | Applies the existing local pause transition once. A matching retry on the same head returns `ALREADY_APPLIED` and the applied version. The normal PR domain event is committed with the transition. A pause gates subsequent review work and cannot cancel a provider request already sent. |
 | `request_review` | Validates the scoped grant, exact approval, head and version. Returns `PROVIDER_UNAVAILABLE` for a valid request because there is no approved MCP provider, user credential and budget integration. No review is enqueued or sent. |
 
@@ -40,6 +40,6 @@ Unauthorized requests return HTTP 401 with a generic bearer challenge. Tool erro
 
 Verification passed with `./gradlew --offline test --tests '*McpIntegrationTest' --tests '*DatabaseIntegrationTest'`. The tests use a native HTTP fixture client and disposable PostgreSQL. They exercise the disabled-by-default route, migration upgrades, authentication, grant confinement, full-SHA and version checks, redacted pagination, concurrent replay, audit rollback and the unavailable review provider.
 
-The full `./gradlew --offline build` passed all 404 tests.
+The full `./gradlew --offline build --console=plain --info` passed all 407 tests, including regression coverage for invalidated dismissals on the same SHA and unsupported protocol revisions.
 
 The synthetic subscription tested in Issue #24 used a separate endpoint. Work and Dot compatibility with this private bearer endpoint has not been verified. [Issue #24 evidence](../spikes/issue-24-mcp-events.md)

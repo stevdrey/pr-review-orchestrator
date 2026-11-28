@@ -97,16 +97,38 @@ public class JdbcMcpToolStore implements McpToolStore {
         @Override
         public List<Finding> findings(String headSha, UUID after, int limit) {
             var pr = session.pr();
-            return jdbc.query("""
-                    SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.status, f.thread_resolved
-                    FROM review_cycles c JOIN findings f ON f.review_cycle_id = c.id
-                    WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ? AND c.head_sha = ?
-                      AND (CAST(? AS uuid) IS NULL OR f.id > ?)
-                    ORDER BY f.id LIMIT ?
+            long installation = pr.scope().installationId();
+            long repository = pr.scope().repositoryId();
+            return jdbc.query(JdbcGeneralFeedbackStore.LAST_HEAD + """
+                    , page AS (
+                        SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.status, f.thread_resolved
+                        FROM review_cycles c JOIN findings f ON f.review_cycle_id = c.id
+                        WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ? AND c.head_sha = ?
+                          AND (CAST(? AS uuid) IS NULL OR f.id > ?)
+                        ORDER BY f.id LIMIT ?
+                    ), general_status AS (
+                        SELECT stable_finding_id,
+                            CASE WHEN bool_and(decision IS NOT DISTINCT FROM 'DISMISSED') THEN 'DISMISSED'
+                                 WHEN bool_and(decision IS NOT NULL) THEN 'ACKNOWLEDGED'
+                                 ELSE 'OPEN' END AS status
+                        FROM (
+                    """ + JdbcGeneralFeedbackStore.EFFECTIVE_GENERAL_FINDINGS + """
+                        ) effective
+                        WHERE stable_finding_id IN (SELECT stable_finding_id FROM page
+                            WHERE source_kind IN ('REVIEW', 'ISSUE_COMMENT'))
+                        GROUP BY stable_finding_id
+                    )
+                    SELECT p.id, p.stable_finding_id, p.source_kind, p.severity, p.thread_resolved,
+                        CASE WHEN p.source_kind IN ('REVIEW', 'ISSUE_COMMENT') AND p.stable_finding_id IS NOT NULL
+                             THEN coalesce(g.status, 'OPEN') ELSE p.status END AS status
+                    FROM page p LEFT JOIN general_status g USING (stable_finding_id)
+                    ORDER BY p.id
                     """, (rs, row) -> new Finding(rs.getObject("id", UUID.class),
                     rs.getObject("stable_finding_id", UUID.class), rs.getString("source_kind"),
                     rs.getString("severity"), rs.getString("status"), rs.getObject("thread_resolved", Boolean.class)),
-                    pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), headSha, after, after, limit);
+                    installation, repository, pr.number(),
+                    installation, repository, pr.number(), headSha, after, after, limit,
+                    headSha, installation, repository, pr.number());
         }
 
         @Override

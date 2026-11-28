@@ -4,9 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
+import io.github.stevdrey.prrevieworchestrator.application.DisposeGeneralFeedback;
+import io.github.stevdrey.prrevieworchestrator.application.IngestReviewEvidence;
 import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
+import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition;
 import io.github.stevdrey.prrevieworchestrator.domain.Sha256;
 import java.net.URI;
@@ -15,6 +19,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +30,8 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -73,6 +80,10 @@ class McpIntegrationTest {
     JdbcTemplate jdbc;
     @Autowired
     ReviewLifecycle lifecycle;
+    @Autowired
+    IngestReviewEvidence evidence;
+    @Autowired
+    DisposeGeneralFeedback dispositions;
 
     @AfterAll
     static void closeClient() {
@@ -95,8 +106,7 @@ class McpIntegrationTest {
 
     @Test
     void initializesAndAdvertisesSchemasOverStreamableHttp() throws Exception {
-        var init = post(READ, rpc("initialize", Map.of("protocolVersion", VERSION, "capabilities", Map.of(),
-                "clientInfo", Map.of("name", "fixture", "version", "1"))));
+        var init = initialize(VERSION);
         assertEquals(200, init.statusCode());
         assertEquals(VERSION, JSON.readTree(init.body()).at("/result/protocolVersion").asText());
         assertEquals(202, post(READ, """
@@ -123,6 +133,24 @@ class McpIntegrationTest {
     }
 
     @Test
+    void negotiatesOnlyRevisionsWithSingleMessageHttp() throws Exception {
+        String legacyVersion = "2025-03-26";
+        String juneVersion = "2025-06-18";
+        var fallback = initialize(legacyVersion);
+        assertEquals(200, fallback.statusCode());
+        assertEquals(VERSION, JSON.readTree(fallback.body()).at("/result/protocolVersion").asText());
+        var june = initialize(juneVersion);
+        assertEquals(200, june.statusCode());
+        assertEquals(juneVersion, JSON.readTree(june.body()).at("/result/protocolVersion").asText());
+
+        String ping = rpc("ping", Map.of());
+        assertEquals(200, post(READ, ping, juneVersion).statusCode());
+        assertEquals(400, post(READ, ping, legacyVersion).statusCode());
+        assertEquals(400, post(READ, ping, null).statusCode());
+        assertEquals(400, post(READ, "[" + ping + "]").statusCode());
+    }
+
+    @Test
     void onlyReturnsRedactedFindingsForTheAuthorizedPrAndHeadAcrossPages() throws Exception {
         UUID current = cycle(101, 7, HEAD);
         for (int i = 1; i <= 51; i++) finding(current, 101, HEAD, i);
@@ -140,6 +168,37 @@ class McpIntegrationTest {
         assertEquals(new UUID(0, 51).toString(), next.at("/findings/0/id").asText());
         assertThat(next.has("nextCursor")).isFalse();
         tool(READ, "list_findings", with("headSha", NEXT_HEAD), "STALE_HEAD");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void showsCurrentDispositionWhenTheSameShaIsObservedAgain(boolean confirmSameHead) throws Exception {
+        Instant observedAt = Instant.parse("2026-11-27T12:00:00Z");
+        var source = new ReviewEvidence.Source("fixture-comment", ReviewEvidence.Kind.ISSUE_COMMENT,
+                null, null, null, null, null, null, "a".repeat(64), observedAt, null,
+                null, null, null, null, null, ReviewEvidence.Severity.UNKNOWN, ReviewEvidence.Feedback.ACTIONABLE);
+        var snapshot = new ReviewEvidence.Snapshot(UUID.randomUUID(), cycle(101, 7, HEAD), PR, "fixture", HEAD,
+                observedAt, List.of(source));
+        evidence.ingest(snapshot);
+        var stableId = jdbc.queryForObject("SELECT stable_finding_id FROM findings", UUID.class);
+        dispositions.dispose(PR, new GeneralFeedback.Disposition(UUID.randomUUID(), stableId, snapshot.id(),
+                HEAD, 0, GeneralFeedback.Action.ACKNOWLEDGE, "fixture-maintainer", "Acknowledged", null));
+        assertEquals("ACKNOWLEDGED", tool(READ, "list_findings", TARGET, "OK").at("/findings/0/status").asText());
+        dismiss(stableId, snapshot.id(), 0);
+        assertEquals("DISMISSED", tool(READ, "list_findings", TARGET, "OK").at("/findings/0/status").asText());
+
+        if (confirmSameHead) {
+            lifecycle.apply(PR, transition(UUID.randomUUID(), 0, ReviewTransition.Action.CONFIRM_HEAD, null));
+        } else {
+            lifecycle.apply(PR, transition(UUID.randomUUID(), 0, ReviewTransition.Action.UPDATE_HEAD, NEXT_HEAD));
+            lifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), 1, NEXT_HEAD, ReviewTransition.Action.UPDATE_HEAD,
+                    HEAD, new ReviewTransition.Gates(false, false, false, false, false, ReviewTransition.Ci.UNKNOWN)));
+        }
+        assertEquals("DISMISSED", jdbc.queryForObject("SELECT status FROM findings", String.class));
+        assertEquals("OPEN", tool(READ, "list_findings", TARGET, "OK").at("/findings/0/status").asText());
+
+        dismiss(stableId, snapshot.id(), lifecycle.find(PR).orElseThrow().version());
+        assertEquals("DISMISSED", tool(READ, "list_findings", TARGET, "OK").at("/findings/0/status").asText());
     }
 
     @Test
@@ -261,6 +320,11 @@ class McpIntegrationTest {
         assertEquals(-32602, JSON.readTree(response.body()).at("/error/code").intValue());
     }
 
+    private void dismiss(UUID stableId, UUID snapshotId, long version) {
+        dispositions.dispose(PR, new GeneralFeedback.Disposition(UUID.randomUUID(), stableId, snapshotId,
+                HEAD, version, GeneralFeedback.Action.DISMISS, "fixture-maintainer", "Confirmed dismissal", null));
+    }
+
     private ReviewTransition transition(UUID id, long version, ReviewTransition.Action action, String newHead) {
         return new ReviewTransition(id, version, HEAD, action, newHead,
                 new ReviewTransition.Gates(false, false, false, false, false, ReviewTransition.Ci.UNKNOWN));
@@ -340,14 +404,28 @@ class McpIntegrationTest {
     }
 
     private HttpRequest.Builder request(String token, String body) {
+        return request(token, body, VERSION);
+    }
+
+    private HttpRequest.Builder request(String token, String body, String version) {
         var request = HttpRequest.newBuilder(endpoint()).timeout(Duration.ofSeconds(10))
                 .header("Content-Type", "application/json").header("Accept", "application/json, text/event-stream")
-                .header("MCP-Protocol-Version", VERSION).POST(HttpRequest.BodyPublishers.ofString(body));
+                .POST(HttpRequest.BodyPublishers.ofString(body));
         if (token != null) request.header("Authorization", "Bearer " + token);
+        if (version != null) request.header("MCP-Protocol-Version", version);
         return request;
     }
 
+    private HttpResponse<String> initialize(String requestedVersion) throws Exception {
+        return post(READ, rpc("initialize", Map.of("protocolVersion", requestedVersion, "capabilities", Map.of(),
+                "clientInfo", Map.of("name", "fixture", "version", "1"))), null);
+    }
+
     private HttpResponse<String> post(String token, String body) throws Exception {
-        return CLIENT.send(request(token, body).build(), HttpResponse.BodyHandlers.ofString());
+        return post(token, body, VERSION);
+    }
+
+    private HttpResponse<String> post(String token, String body, String version) throws Exception {
+        return CLIENT.send(request(token, body, version).build(), HttpResponse.BodyHandlers.ofString());
     }
 }

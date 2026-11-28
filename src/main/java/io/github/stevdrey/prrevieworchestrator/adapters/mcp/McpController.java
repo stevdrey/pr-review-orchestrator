@@ -31,7 +31,7 @@ import tools.jackson.databind.json.JsonMapper;
 public class McpController {
     private static final int BODY_LIMIT = 16_384;
     private static final String LATEST = "2025-11-25";
-    private static final Set<String> VERSIONS = Set.of(LATEST, "2025-06-18", "2025-03-26");
+    private static final Set<String> VERSIONS = Set.of(LATEST, "2025-06-18");
     private static final Pattern BEARER = Pattern.compile("(?i:Bearer) ([0-9a-f]{64})");
     private static final JsonMapper JSON = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -60,7 +60,7 @@ public class McpController {
             byte[] body = request.getInputStream().readNBytes(BODY_LIMIT + 1);
             if (body.length > BODY_LIMIT) return response(413).build();
             JsonNode message = JSON.readTree(StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString());
-            return route(digest, message);
+            return route(digest, message, version);
         } catch (AuthorizationDenied ignored) {
             return response(401).header("WWW-Authenticate", "Bearer realm=\"pr-review-orchestrator\"").build();
         } catch (AuthorizationUnavailable | ReviewStateUnavailable ignored) {
@@ -72,12 +72,14 @@ public class McpController {
         }
     }
 
-    private ResponseEntity<?> route(String digest, JsonNode message) {
+    private ResponseEntity<?> route(String digest, JsonNode message, String version) {
         if (message == null || !message.isObject() || !"2.0".equals(message.path("jsonrpc").stringValue())
                 || !message.path("method").isString()) {
             return rpcError(400, null, -32600, "Invalid request");
         }
         String method = message.path("method").asText();
+        // Initialization negotiates the revision. Later requests must identify a supported revision.
+        if (version == null && !"initialize".equals(method)) return response(400).build();
         if (!message.has("id")) {
             // Notifications carry no request ID and must never invoke commands.
             return switch (method) {
