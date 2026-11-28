@@ -19,10 +19,13 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewConflict;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /** Reuse the lifecycle and correlation rules within the fenced inbox transaction. */
 public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Commit {
+    private static final Logger LOG = LoggerFactory.getLogger(JdbcSandboxReviewPlanning.class);
     private final JdbcTemplate jdbc;
     private final JdbcWorkQueue queue;
     private final JdbcReviewStateStore states;
@@ -131,7 +134,11 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         if (duplicate) return;
 
         if (repositoryPolicy.occupied(pr, null) >= Math.min(limit, snapshot.policy().iterationCap())) {
-            states.stopLocked(current, Intervention.ITERATION_LIMIT);
+            if (JdbcReviewRequestStore.usedIterations(jdbc, pr) >= limit) {
+                states.stopLocked(current, Intervention.ITERATION_LIMIT);
+            }
+            LOG.info("queue={} work_id={} correlation_id={} pr_number={} outcome=POLICY_DENIED",
+                    event.lease().queue(), event.lease().id(), event.lease().correlationId(), pr.number());
         } else if (policy.permits(pr, intent)) {
             queue.enqueue(event, intent, headEpoch, snapshot.version());
         }

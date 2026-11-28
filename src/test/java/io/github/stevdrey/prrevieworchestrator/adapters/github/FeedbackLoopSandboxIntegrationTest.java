@@ -815,6 +815,83 @@ class FeedbackLoopSandboxIntegrationTest {
         assertEquals(0, count("review_clean_evidence"));
     }
 
+    @Test
+    void genericWorkerRejectsANestedNativeAdapterBeforeReserving() throws Exception {
+        String head = github.head();
+        var intent = new DurableWork.Intent(PR.number(), head, "BASELINE", "codex", DurableWork.REQUEST_REVIEW);
+        var nativeAdapter = codex(request -> fail("nested requests must be rejected before approval"),
+                6, CodexReviewAdapter.Mode.STANDARD);
+        var generic = new DurableDispatcher(queue, authorization, event -> List.of(intent), new CommandGateway() {
+            @Override public boolean supports(DurableWork.Command command) { return intent.equals(command.intent()); }
+            @Override public DurableWork.RemoteState reconcile(DurableWork.Command command) {
+                return new DurableWork.RemoteState(head, DurableWork.RemoteEffect.ABSENT);
+            }
+            @Override public void execute(DurableWork.Command command) {
+                nativeAdapter.request(baseline(head, ReviewRequest.Trigger.PR_READY, 0));
+            }
+        });
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("ready_for_review", head)).statusCode());
+        assertTrue(generic.processEvent());
+        assertTimeout(Duration.ofSeconds(5), () -> assertTrue(generic.processCommand()));
+        assertEquals(Map.of("status", "DEAD", "last_error_code", "UNSUPPORTED_COMMAND", "attempts", 1),
+                jdbc.queryForMap("SELECT status, last_error_code, attempts FROM outbox_commands"));
+        assertEquals(0, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void plannerCapacityDenialAllowsLaterEligibleWorkWithoutAPrStop(boolean tentativeSlot) throws Exception {
+        var round = startRemediation();
+        var permit = new AtomicBoolean();
+        var worker = planningWorker((pr, intent) -> permit.get(), 6);
+        String head = repository.fixedSha;
+        github.push(head);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("synchronize", head)).statusCode());
+        assertTrue(worker.processEvent());
+        dispose(round, GeneralFeedback.Action.CLAIM_FIXED, head);
+        successfulWorkflows();
+        agePlanning();
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(0, count("outbox_commands"));
+
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(transactions), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of("codex", "sandbox-deep");
+        operator.change(PR.scope(), 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, tentativeSlot ? 2 : 1));
+        if (tentativeSlot) {
+            var delivery = enqueue("pull_request", "ready_for_review", head, pullWebhook("ready_for_review", head));
+            var deep = new DurableWork.Intent(PR.number(), head, "DEEP", "sandbox-deep", DurableWork.REQUEST_REVIEW);
+            assertTrue(queue.completeEvent(delivery, List.of(deep), this::authorize));
+            assertEquals(1, count("outbox_commands"));
+        }
+
+        permit.set(true);
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 66)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+        assertNull(current().intervention());
+        assertEquals(0, jdbc.queryForObject("""
+                SELECT count(*) FROM pr_review_transitions WHERE action = 'STOP_ITERATION_LIMIT'
+                """, Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM outbox_commands WHERE planned_head_epoch IS NOT NULL", Integer.class));
+
+        if (tentativeSlot) {
+            assertEquals(1, jdbc.update("UPDATE outbox_commands SET status = 'CANCELLED', completed_at = clock_timestamp()"));
+        } else {
+            operator.change(PR.scope(), 1, 2, Change.CONFIGURE,
+                    new RepositoryReviewPolicy(stages, providers, false, null, 2));
+        }
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 67)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM outbox_commands WHERE planned_head_epoch IS NOT NULL AND status = 'PENDING'
+                """, Integer.class));
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+    }
+
     private Assessment planCorrectiveReview() throws Exception {
         return planCorrectiveReview(requests);
     }

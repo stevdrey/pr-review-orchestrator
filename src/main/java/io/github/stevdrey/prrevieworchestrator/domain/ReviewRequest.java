@@ -5,13 +5,8 @@ import java.util.UUID;
 
 /** Trusted caller supplies verified event or sandbox operator metadata. */
 public record ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
-        Trigger trigger, long senderId, boolean bot, long headEpoch, UUID plannedCommandId, UUID outboxCommandId) {
+        Trigger trigger, long senderId, boolean bot, long headEpoch, UUID plannedCommandId) {
     public enum Trigger { PR_OPENED, PR_READY, PR_SYNCHRONIZE, PR_REOPENED, SANDBOX_OPERATOR, PLANNED_REREVIEW, COMMENT, REVIEW }
-
-    public ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
-            Trigger trigger, long senderId, boolean bot, long headEpoch, UUID plannedCommandId) {
-        this(pr, headSha, stage, provider, trigger, senderId, bot, headEpoch, plannedCommandId, null);
-    }
 
     public ReviewRequest(PullRequestId pr, String headSha, String stage, String provider,
             Trigger trigger, long senderId, boolean bot, long headEpoch) {
@@ -26,9 +21,7 @@ public record ReviewRequest(PullRequestId pr, String headSha, String stage, Stri
         Objects.requireNonNull(pr);
         Objects.requireNonNull(trigger);
         CommitSha.require(headSha);
-        // A generic outbox command names itself so its own queued row is not treated as a duplicate.
         if ((plannedCommandId != null) != (trigger == Trigger.PLANNED_REREVIEW)
-                || plannedCommandId != null && outboxCommandId != null
                 || senderId <= 0 || headEpoch < 0 || stage == null || !stage.matches("[A-Z_]{1,32}")
                 || provider == null || !provider.matches("[a-z0-9_-]{1,32}")) {
             throw new IllegalArgumentException("Invalid review request");

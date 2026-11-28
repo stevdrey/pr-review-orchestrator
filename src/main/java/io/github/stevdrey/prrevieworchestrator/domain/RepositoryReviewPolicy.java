@@ -4,7 +4,6 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Stage;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.util.Objects;
 import java.util.Set;
 
@@ -56,11 +55,24 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
                     : minute >= startMinute || minute < endMinute;
         }
 
-        /** The next local end of the interval strictly after {@code now}. */
+        /** The first instant at or after {@code now} outside the quiet interval. */
         public Instant end(Instant now) {
-            var local = now.atZone(zone);
-            var end = ZonedDateTime.of(local.toLocalDate(), LocalTime.of(endMinute / 60, endMinute % 60), zone);
-            return (end.isAfter(local) ? end : end.plusDays(1)).toInstant();
+            var endTime = LocalTime.of(endMinute / 60, endMinute % 60);
+            var rules = zone.getRules();
+            var cursor = now;
+            while (contains(cursor)) {
+                var local = cursor.atZone(zone);
+                var localEnd = local.toLocalDate().atTime(endTime);
+                if (!localEnd.isAfter(local.toLocalDateTime())) localEnd = localEnd.plusDays(1);
+                var endWithCurrentOffset = localEnd.toInstant(local.getOffset());
+                var transition = rules.nextTransition(cursor);
+                if (transition == null || endWithCurrentOffset.isBefore(transition.getInstant())) {
+                    return endWithCurrentOffset;
+                }
+                // At a gap or overlap, recheck the new wall-clock time before choosing a release.
+                cursor = transition.getInstant();
+            }
+            return cursor;
         }
     }
 

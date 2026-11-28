@@ -57,6 +57,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         } catch (RuntimeException failure) { throw ReviewRequestFailure.sanitized(failure); }
     }
     @Override public Reservation reserve(ReviewRequest request, long actorId, int limit, Runnable authorize, Runnable approve) {
+        requireIndependentDispatch();
         if (actorId <= 0 || limit < 1 || limit > 6) throw new IllegalArgumentException("Invalid review policy");
         var reservation = transaction(() -> {
             var pr = request.pr();
@@ -121,6 +122,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         return reservation;
     }
     @Override public void send(ReviewRequest request, UUID id, Runnable guards, Function<Runnable, Receipt> effect) {
+        requireIndependentDispatch();
         try {
             transaction(() -> {
                 PostgresLocks.lockPr(jdbc, request.pr());
@@ -290,12 +292,18 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
                     WHERE o.command_type = 'REQUEST_REVIEW' AND o.status <> 'CANCELLED'
-                        AND o.id IS DISTINCT FROM ?::uuid
                         AND (o.planned_head_epoch IS NULL OR o.planned_head_epoch = ?)
                         AND (o.installation_id, o.repository_id, c.pr_number, o.expected_head_sha,
                             c.stage, o.target_provider) = (?, ?, ?, ?, ?, ?))
-                """, Boolean.class, request.outboxCommandId(), request.headEpoch(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                """, Boolean.class, request.headEpoch(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
                 request.headSha(), request.stage(), request.provider()));
+    }
+
+    private void requireIndependentDispatch() {
+        if (JdbcWorkQueue.GENERIC_DISPATCH.isBound()) {
+            // The generic worker may hold the PR lock on another connection until its gateway returns.
+            throw new DurableWork.Failure(DurableWork.ErrorCode.UNSUPPORTED_COMMAND, false);
+        }
     }
 
     private void requireEligible(ReviewRequest request, PullRequestReview current, long iteration) {

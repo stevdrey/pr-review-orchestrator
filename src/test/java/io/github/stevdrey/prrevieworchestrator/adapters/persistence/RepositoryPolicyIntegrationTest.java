@@ -344,18 +344,16 @@ class RepositoryPolicyIntegrationTest {
     }
 
     @Test
-    void aGenericCommandSendingNativelyIsNotItsOwnDuplicate() {
+    void aStandaloneNativeRequestCannotDuplicateAQueuedGenericReview() {
         var snapshot = operator.change(SCOPE, ACTOR, 0, CONFIGURE, ENABLED);
         var lease = new Lease(Queue.INBOX, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), 1);
         var queue = new JdbcWorkQueue(jdbc, new DataSourceTransactionManager(jdbc.getDataSource()),
                 new Limits(Duration.ofSeconds(30), Duration.ofSeconds(2), Duration.ofSeconds(8)));
         queue.enqueue(new Event(lease, SCOPE, "pull_request", "synchronize", 7, "a".repeat(40)),
                 new Intent(7, "a".repeat(40), "BASELINE", "codex", "REQUEST_REVIEW"), null, snapshot.version());
-        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
         assertEquals(ReviewRequestFailure.Code.POLICY_DENIED, assertThrows(ReviewRequestFailure.class,
                 () -> reserve(request(7, "BASELINE", "codex"))).code());
-        assertTrue(reserve(new ReviewRequest(new PullRequestId(SCOPE, 7), "a".repeat(40), "BASELINE", "codex",
-                ReviewRequest.Trigger.PR_READY, ACTOR, false, 0, null, command)).created());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM review_requests", Integer.class));
     }
 
     private void assertSqlState(String state, Runnable operation) {

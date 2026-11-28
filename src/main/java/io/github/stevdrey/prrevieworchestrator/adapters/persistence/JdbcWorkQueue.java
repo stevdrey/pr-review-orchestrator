@@ -26,6 +26,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 /** PostgreSQL clocks, SKIP LOCKED claims and per-claim fencing. No JVM clock orders work. */
 public final class JdbcWorkQueue implements WorkQueue {
     private static final Logger LOG = LoggerFactory.getLogger(JdbcWorkQueue.class);
+    static final ScopedValue<Boolean> GENERIC_DISPATCH = ScopedValue.newInstance();
     /** Every queue transaction, including any gateway call inside executeCommand, finishes within this. */
     private static final Duration DEADLINE = Duration.ofSeconds(10);
     // Three independent 8s request transactions, including the send, plus bounded cleanup and queue overhead.
@@ -259,10 +260,11 @@ public final class JdbcWorkQueue implements WorkQueue {
             authorize.run();
             // Holding the row lock prevents another worker stealing the lease during a bounded API call.
             var decision = new java.util.concurrent.atomic.AtomicReference<Decision>();
-            Outcome outcome = java.util.Objects.requireNonNull(operation.apply(() -> {
+            Outcome outcome = ScopedValue.where(GENERIC_DISPATCH, true).call(() -> operation.apply(() -> {
                 decision.set(reviewPolicyDecision(command));
                 return decision.get() == Decision.ALLOW;
             }));
+            java.util.Objects.requireNonNull(outcome);
             finishCommand(command.lease(), outcome == Outcome.POLICY_DENIED && decision.get() == Decision.DEFER
                     ? Outcome.DEFERRED : outcome);
             return true;
