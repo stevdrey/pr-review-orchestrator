@@ -31,7 +31,7 @@ flowchart TB
 - `adapters/github`: signed webhook controller, GitHub App auth, REST/GraphQL clients, review/thread correlation.
 - `adapters/persistence`: PostgreSQL, Flyway, transactional inbox/outbox.
 - `adapters/ai`: optional OpenAI and Claude review decision adapters.
-- `adapters/mcp`: optional MCP tools and event delivery.
+- `adapters/mcp`: opt-in [MCP tools](../development/mcp-tools.md) for scoped inspection and local pause.
 - `worker`: async dispatcher / isolated fix execution, only after authorization.
 - `observability`: trace, structured audit metadata, provider latency/cost metrics.
 

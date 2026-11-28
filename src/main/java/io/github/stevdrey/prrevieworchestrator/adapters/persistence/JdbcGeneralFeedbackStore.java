@@ -36,7 +36,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                     WHERE n.stable_finding_id = f.stable_finding_id AND newer.captured_at > o.captured_at)
             """;
 
-    private static final String LAST_HEAD = """
+    static final String LAST_HEAD = """
             WITH last_head AS (SELECT coalesce(max(resulting_version), 0) AS version FROM pr_review_transitions
                 WHERE installation_id = ? AND repository_id = ? AND pr_number = ?
                     AND action IN ('UPDATE_HEAD', 'CONFIRM_HEAD'))
@@ -52,11 +52,26 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                 AND s.feedback = f.feedback
             """;
 
+    // Both the clean gate and MCP use the same current-head disposition rules.
+    static final String EFFECTIVE_GENERAL_FINDINGS = """
+            SELECT f.id, f.stable_finding_id, f.source_kind, f.severity, f.thread_resolved, f.feedback,
+                (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
+                             WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
+                             ELSE 'PENDING' END
+            """ + CURRENT_DECISION + """
+                ) AS decision
+            FROM (
+            """ + LATEST + """
+            ) f
+            """;
+
     // Shared by the pending-findings gate and the no-progress comparison.
     static final String EFFECTIVE_INLINE_FINDING_CTES = """
             inline_findings AS (
-                SELECT f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
-                    latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
+                SELECT f.id, f.source_kind, f.severity, f.thread_resolved,
+                    f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
+                    latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback,
+                    f.status IN ('OPEN', 'ACKNOWLEDGED') AS pending
                 FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
                 LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
                 LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
@@ -74,7 +89,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                                 AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
                                 AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at)))
             ), pending_inline_findings AS (
-                SELECT stable_finding_id FROM effective_inline_findings WHERE status IN ('OPEN', 'ACKNOWLEDGED')
+                SELECT stable_finding_id FROM effective_inline_findings WHERE pending
             )
             """;
 
@@ -100,15 +115,9 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
     static FindingGates findingGates(JdbcTemplate jdbc, PullRequestId pr, String head) {
         return jdbc.queryForObject(LAST_HEAD + """
                 , general AS (
-                SELECT f.feedback,
-                    (SELECT CASE WHEN d.action = 'DISMISS' THEN 'DISMISSED'
-                                 WHEN d.action = 'CLAIM_FIXED' AND d.evidence_sha = d.head_sha THEN 'CLAIMED'
-                                 ELSE 'PENDING' END
-                """ + CURRENT_DECISION + """
-                    ) AS decision
-                FROM (
-                """ + LATEST + """
-                ) f
+                SELECT feedback, decision FROM (
+                """ + EFFECTIVE_GENERAL_FINDINGS + """
+                ) effective
                 UNION ALL
                     SELECT 'NEEDS_HUMAN', 'PENDING' FROM findings legacy JOIN review_cycles c ON c.id = legacy.review_cycle_id
                     WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ?
