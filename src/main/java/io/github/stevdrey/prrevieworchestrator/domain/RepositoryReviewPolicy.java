@@ -54,5 +54,9 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
         public boolean permits(String stage, String provider, Instant now) {
             return !held && policy.permits(stage, provider, now);
         }
+
+        public int effectiveIterationCap(Snapshot active) {
+            return Math.min(policy.iterationCap(), active.policy().iterationCap());
+        }
     }
 }

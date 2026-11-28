@@ -96,7 +96,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             }
             long used = usedIterations(jdbc, pr);
             long occupied = repositoryPolicy.occupied(pr, request.plannedCommandId());
-            if (occupied >= Math.min(limit, active.policy().iterationCap()) || used >= pinned.policy().iterationCap()) {
+            if (occupied >= Math.min(limit, pinned.effectiveIterationCap(active))) {
                 // An untracked PR has no aggregate to pause; never create one from an unverified request head.
                 if (current == null) throw new ReviewRequestFailure(LIMIT_REACHED);
                 states.stopLocked(current, Intervention.ITERATION_LIMIT);
@@ -261,8 +261,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         if (request.plannedCommandId() != null && !Objects.equals(version, requirePlannedReview(request, current))) {
             throw new ReviewRequestFailure(POLICY_DENIED);
         }
-        if (iteration > pinned.policy().iterationCap()
-                || repositoryPolicy.occupied(request.pr(), null) > active.policy().iterationCap()) {
+        if (repositoryPolicy.occupied(request.pr(), null) > pinned.effectiveIterationCap(active)) {
             throw new ReviewRequestFailure(POLICY_DENIED);
         }
         return () -> requireRepositoryPolicy(request, current, pinned, active);

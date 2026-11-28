@@ -27,6 +27,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexCompletionSource.TerminalAttempt;
+import io.github.stevdrey.prrevieworchestrator.ports.CommandGateway;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
 import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
@@ -67,6 +68,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -705,6 +708,64 @@ class FeedbackLoopSandboxIntegrationTest {
                 SELECT repository_policy_version FROM review_requests WHERE planned_command_id IS NOT NULL
                 """, Long.class));
         assertThat(github.comments()).extracting(SandboxGitHub.Comment::id).containsExactly(9001L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void plannedDispatchCountsGenericReviewsAgainstItsPinnedCap(boolean reservedBeforeGeneric) throws Exception {
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(transactions), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of("codex", "sandbox-deep");
+        operator.change(PR.scope(), 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 2));
+        planCorrectiveReview();
+        var dispatch = plannedDispatch(new FixtureBudget(1), budgetedRequests());
+        if (reservedBeforeGeneric) {
+            github.failNextPullReads(1);
+            assertTrue(dispatch.processCommand());
+            assertEquals("RESERVED", jdbc.queryForObject("""
+                    SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                    """, String.class));
+            assertSingleBudgetHold(repository.fixedSha);
+        }
+
+        operator.change(PR.scope(), 1, 2, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 3));
+        var deep = new DurableWork.Intent(PR.number(), repository.fixedSha, "DEEP", "sandbox-deep", DurableWork.REQUEST_REVIEW);
+        var genericEffect = new AtomicBoolean();
+        var generic = new DurableDispatcher(queue, authorization, event -> List.of(deep), new CommandGateway() {
+            @Override public boolean supports(DurableWork.Command command) { return deep.equals(command.intent()); }
+            @Override public DurableWork.RemoteState reconcile(DurableWork.Command command) {
+                return new DurableWork.RemoteState(github.head(), DurableWork.RemoteEffect.ABSENT);
+            }
+            @Override public void execute(DurableWork.Command command) { genericEffect.set(true); }
+        });
+        assertEquals(202, signed("pull_request", UUID.randomUUID(),
+                pullWebhook("ready_for_review", repository.fixedSha)).statusCode());
+        assertTrue(generic.processEvent());
+        assertTrue(generic.processCommand());
+        assertTrue(genericEffect.get());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands WHERE command_key = ?",
+                String.class, deep.key(PR.scope())));
+
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp() WHERE planned_head_epoch IS NOT NULL");
+        assertTrue(dispatch.processCommand());
+        assertThat(github.comments()).isEmpty();
+        assertEquals(Map.of("status", "CANCELLED", "last_error_code", "POLICY_DENIED", "repository_policy_version", 2L),
+                jdbc.queryForMap("""
+                        SELECT status, last_error_code, repository_policy_version FROM outbox_commands
+                        WHERE planned_head_epoch IS NOT NULL
+                        """));
+        if (reservedBeforeGeneric) {
+            assertEquals("NOT_SENT", jdbc.queryForObject("""
+                    SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                    """, String.class));
+            assertSingleBudgetHold(repository.fixedSha);
+        } else {
+            assertEquals(1, count("review_requests"));
+            assertEquals(0, count("sandbox_codex_budget_reservations"));
+            assertEquals(PullRequestReview.Intervention.ITERATION_LIMIT, current().intervention());
+        }
     }
 
     @Test
