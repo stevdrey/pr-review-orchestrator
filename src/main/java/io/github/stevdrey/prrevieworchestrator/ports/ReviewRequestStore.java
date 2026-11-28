@@ -2,7 +2,7 @@ package io.github.stevdrey.prrevieworchestrator.ports;
 
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequest;
 import java.util.UUID;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 public interface ReviewRequestStore {
     /** NOT_SENT is terminal and provably effect-free; it still consumes the key and lifetime slot. */
@@ -17,6 +17,7 @@ public interface ReviewRequestStore {
      * The effect must throw ReviewRequestFailure(OUTCOME_UNKNOWN) once a remote write may have happened;
      * any other failure asserts that no write was attempted and records the terminal NOT_SENT state.
      * Failures after the effect returned surface as OUTCOME_UNKNOWN.
+     * The effect must invoke the supplied final guards immediately before the remote write.
      */
-    void send(ReviewRequest request, UUID reservationId, Runnable authorizeAndApprove, Supplier<Receipt> effect);
+    void send(ReviewRequest request, UUID reservationId, Runnable authorizeAndApprove, Function<Runnable, Receipt> effect);
 }

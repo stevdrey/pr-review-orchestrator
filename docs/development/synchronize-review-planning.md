@@ -19,6 +19,8 @@ Intent creation also requires a trusted `ReviewIntentPolicy` bean that allows th
 
 Without the dispatch opt-in, the worker leaves outbox commands pending for inspection. Disable `synchronize-enabled` to return to pinned CI mode. Preserve the inbox and outbox records.
 
+Publish a [repository review policy](repository-review-policy.md) that permits the baseline stage and Codex before enabling planning. The outbox command pins the admitting version, and the planned provider request inherits it.
+
 ## Opt-in dispatch to Codex
 
 [Issue #74](https://github.com/stevdrey/pr-review-orchestrator/issues/74) adds a worker for this sandbox PR's planned `codex` / `BASELINE` intents. Set `orchestrator.sandbox-ci.codex-dispatch-enabled=true` together with the dispatch, sandbox CI, synchronize and Codex enablement flags. The process still requires the single paired allowlist, read key, consenting `orchestrator.codex.actor-id`, notifications disabled and a dedicated approved `CodexUserCredentials` implementation. The terminal one-shot authorization and its temporary grant cannot be reused. Supply the local `ReviewIntentPolicy`, a `JdbcSandboxCodexBudget.Terms` bean for local hard budget reservations, and an approved `CodexApproval` that covers the planned trigger, entitlement and individual accounting. Startup fails without the budget terms. The repository ships without these approvals or credentials. See [Codex activation prerequisites](codex-review-requests.md#internal-contract-and-activation).

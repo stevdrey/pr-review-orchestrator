@@ -28,6 +28,7 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
     private final JdbcReviewStateStore states;
     private final JdbcFixCorrelationStore fixes;
     private final ReviewIntentPolicy policy;
+    private final JdbcRepositoryPolicy repositoryPolicy;
     private final int limit;
 
     public JdbcSandboxReviewPlanning(JdbcTemplate jdbc, JdbcWorkQueue queue, JdbcReviewStateStore states,
@@ -38,6 +39,7 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
         this.states = states;
         this.fixes = fixes;
         this.policy = policy;
+        this.repositoryPolicy = new JdbcRepositoryPolicy(jdbc);
         this.limit = limit;
     }
 
@@ -116,6 +118,8 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
     private void plan(Event event, PullRequestReview current, long headEpoch) {
         var pr = current.pr();
         var intent = new Intent(pr.number(), current.headSha(), "BASELINE", "codex", REQUEST_REVIEW);
+        var snapshot = repositoryPolicy.lockCurrent(pr.scope());
+        if (!snapshot.permits(intent.stage(), intent.provider(), repositoryPolicy.now())) return;
         boolean duplicate = Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS (SELECT 1 FROM outbox_commands WHERE command_key = ?)
                     OR EXISTS (SELECT 1 FROM review_requests
@@ -125,20 +129,10 @@ public final class JdbcSandboxReviewPlanning implements SandboxReviewPlanning.Co
                 pr.number(), intent.expectedHeadSha(), intent.stage(), intent.provider()));
         if (duplicate) return;
 
-        // Count issued intents conservatively until a reservation for that same target already occupies a slot.
-        // CANCELLED is only recorded after reconcile proved no effect; DEAD may have landed, so it still counts.
-        long planned = jdbc.queryForObject("""
-                SELECT count(*) FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
-                WHERE c.installation_id = ? AND c.repository_id = ? AND c.pr_number = ? AND o.command_type = ?
-                  AND o.status <> 'CANCELLED'
-                  AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE
-                    (r.installation_id, r.repository_id, r.pr_number, r.head_sha, r.stage, r.provider) =
-                    (c.installation_id, c.repository_id, c.pr_number, o.expected_head_sha, c.stage, o.target_provider))
-                """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), REQUEST_REVIEW);
-        if (JdbcReviewRequestStore.usedIterations(jdbc, pr) + planned >= limit) {
+        if (repositoryPolicy.occupied(pr, null) >= Math.min(limit, snapshot.policy().iterationCap())) {
             states.stopLocked(current, Intervention.ITERATION_LIMIT);
         } else if (policy.permits(pr, intent)) {
-            queue.enqueue(event, intent, headEpoch);
+            queue.enqueue(event, intent, headEpoch, snapshot.version());
         }
     }
 

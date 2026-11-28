@@ -24,3 +24,5 @@ Let model decide all actions: vulnerable to prompt injection, unpredictable cost
 Race tests on budget reservations; hard-cap bypass attempts; no-progress stop; model requesting forbidden action; missing usage metadata must fail closed or pause.
 
 Issue #21 implements [current-head CI and bounded review policy](../development/ci-and-iteration-policy.md). The persisted cap counts reservations across all stages and providers. Identical findings in consecutive authenticated rounds for a provider and stage pause the PR. Financial approval and accounting remain separate gates.
+
+Issue #27 implements [scoped versioned review policy and operator holds](0009-versioned-repository-review-policy.md). Repository policy can narrow review eligibility independently of provider and budget authority.

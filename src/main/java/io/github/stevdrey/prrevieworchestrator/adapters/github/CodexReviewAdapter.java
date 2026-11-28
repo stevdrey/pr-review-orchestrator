@@ -66,7 +66,7 @@ public final class CodexReviewAdapter implements ReviewProvider {
             approve.run();
         };
         try {
-            store.send(request, reserved.id(), guards, () -> comments.create(request, actorId, guards));
+            store.send(request, reserved.id(), guards, finalGuards -> comments.create(request, actorId, finalGuards));
         } catch (ReviewRequestFailure failure) {
             // Uncertain outcomes share one channel with redelivery; other codes are actionable and unsent.
             if (failure.code() == OUTCOME_UNKNOWN) return Result.OUTCOME_UNKNOWN;

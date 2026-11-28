@@ -28,6 +28,8 @@ Issue #74 connects [planned sandbox intents to the Codex request adapter](develo
 
 Issue #26 adds [private MCP tools](development/mcp-tools.md) for redacted PR status and findings, plus an audited local pause under a scoped, expiring command grant. Native review dispatch and Work/Dot compatibility for this endpoint remain pending.
 
+Issue #27 adds [versioned repository review policy and local operator controls](development/repository-review-policy.md). Review requests default to disabled for unconfigured repositories. An authorized operator can publish, pause and resume policy while existing commands retain their original version.
+
 | Phase | Priority | Outcome | Exit condition |
 | --- | --- | --- | --- |
 | [EPIC 1](https://github.com/stevdrey/pr-review-orchestrator/issues/1) — Foundations & GitHub App | P0 | Java 27 / Spring Boot skeleton, Postgres/Flyway, verified GitHub webhooks, durable event inbox | Replay and unauthorized events do not cause duplicate/unauthorized actions |

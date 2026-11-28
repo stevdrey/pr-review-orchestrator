@@ -7,8 +7,10 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
+import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -55,6 +57,7 @@ class DurableDispatchIntegrationTest {
         jdbc.execute("TRUNCATE queue_transitions, inbox_events, installations CASCADE");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true), (202, 2002, true)");
+        RepositoryPolicyFixtures.allowReviews(jdbc, "fixture");
         queue = newQueue();
         authorization = new RepositoryAuthorization(Set.of(FIRST, SECOND), new JdbcInstallationAuthorization(jdbc));
         gateway = new FixtureGateway();
@@ -83,6 +86,24 @@ class DurableDispatchIntegrationTest {
         assertTrue(dispatcher().processCommand());
         assertEquals(2, gateway.writes.get());
         assertEquals(2, gateway.applied.size());
+    }
+
+    @Test
+    void pausedRepositoryLeavesQueuedWorkPendingAndNewLimitsVetoTheOriginalSnapshot() {
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1L, jdbc.queryForObject("SELECT repository_policy_version FROM outbox_commands", Long.class));
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(
+                new DataSourceTransactionManager(dataSource)), authorization);
+        assertTrue(operator.change(FIRST, 1, 1, Change.PAUSE, null).held());
+        assertFalse(dispatcher().processCommand());
+        assertEquals(1, count("outbox_commands", "status = 'PENDING' AND attempts = 0"));
+
+        assertTrue(operator.change(FIRST, 1, 2, Change.CONFIGURE, RepositoryReviewPolicy.DEFAULT).held());
+        assertFalse(operator.change(FIRST, 1, 3, Change.RESUME, null).held());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(0, gateway.writes.get());
+        assertEquals(1, count("outbox_commands", "status = 'CANCELLED' AND last_error_code = 'POLICY_DENIED' AND repository_policy_version = 1"));
     }
 
     @Test
@@ -274,7 +295,7 @@ class DurableDispatchIntegrationTest {
         event(FIRST, HEAD);
         dispatcher().processEvent();
         Command claimed = queue.claimCommand().orElseThrow();
-        assertThrows(AssertionError.class, () -> queue.executeCommand(claimed, () -> authorization.requireAuthorized(FIRST), () -> {
+        assertThrows(AssertionError.class, () -> queue.executeCommand(claimed, () -> authorization.requireAuthorized(FIRST), policyAllows -> {
             gateway.execute(claimed);
             throw new AssertionError("simulated process death");
         }));
@@ -458,7 +479,7 @@ class DurableDispatchIntegrationTest {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (var executor = Executors.newSingleThreadExecutor()) {
-            Future<Boolean> result = executor.submit(() -> queue.executeCommand(command, () -> authorization.requireAuthorized(FIRST), () -> {
+            Future<Boolean> result = executor.submit(() -> queue.executeCommand(command, () -> authorization.requireAuthorized(FIRST), policyAllows -> {
                 entered.countDown();
                 try { assertTrue(release.await(5, TimeUnit.SECONDS)); }
                 catch (InterruptedException e) { throw new RuntimeException(e); }
@@ -481,7 +502,7 @@ class DurableDispatchIntegrationTest {
         dispatcher().processEvent();
         Command stale = queue.claimCommand().orElseThrow();
         expire("outbox_commands", stale.lease().id());
-        assertFalse(queue.executeCommand(stale, () -> fail("stale authorization"), () -> { fail("stale effect"); return null; }));
+        assertFalse(queue.executeCommand(stale, () -> fail("stale authorization"), policyAllows -> { fail("stale effect"); return null; }));
         dispatcher().processCommand();
         assertEquals(1, gateway.writes.get());
     }

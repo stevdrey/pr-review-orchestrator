@@ -1,0 +1,151 @@
+package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
+
+import io.github.stevdrey.prrevieworchestrator.domain.AuthorizationDenied;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.QuietHours;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.Snapshot;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewConflict;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Stage;
+import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore;
+import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.Arrays;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+/** Policy editors take the exclusive repository lock. Review decisions hold its shared counterpart through commit. */
+public final class JdbcRepositoryPolicy {
+    private static final Duration DEADLINE = Duration.ofSeconds(10);
+    private static final Snapshot DEFAULT = new Snapshot(0, RepositoryReviewPolicy.DEFAULT, false);
+    private final JdbcTemplate jdbc;
+
+    public JdbcRepositoryPolicy(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public RepositoryPolicyStore operatorStore(PlatformTransactionManager manager) {
+        var transaction = new TransactionTemplate(manager);
+        transaction.setTimeout(Math.toIntExact(DEADLINE.toSeconds()));
+        return new RepositoryPolicyStore() {
+            @Override public Snapshot read(RepositoryScope scope, long actorId, Runnable authorize) {
+                return transaction.execute(status -> {
+                    PostgresDeadlines.apply(jdbc, DEADLINE);
+                    authorize.run();
+                    requireOperator(scope, actorId);
+                    return lockCurrent(scope);
+                });
+            }
+
+            @Override public Snapshot update(RepositoryScope scope, long expectedVersion, long actorId, Change change,
+                    RepositoryReviewPolicy policy, Runnable authorize) {
+                return transaction.execute(status -> {
+                    PostgresDeadlines.apply(jdbc, DEADLINE);
+                    authorize.run();
+                    requireOperator(scope, actorId);
+                    lock(scope, false);
+                    return append(scope, expectedVersion, actorId, change, policy);
+                });
+            }
+        };
+    }
+
+    private void requireOperator(RepositoryScope scope, long actorId) {
+        if (jdbc.queryForList("""
+                SELECT 1 FROM repository_review_policy_operators
+                WHERE (installation_id, repository_id, actor_id) = (?, ?, ?) AND database_role = session_user
+                """, Integer.class, scope.installationId(), scope.repositoryId(), actorId).isEmpty()) {
+            throw new AuthorizationDenied();
+        }
+    }
+
+    private Snapshot append(RepositoryScope scope, long expectedVersion, long actorId, Change change,
+            RepositoryReviewPolicy replacement) {
+        var previous = latest(scope);
+        if (previous.version() != expectedVersion) throw new ReviewConflict(ReviewConflict.Code.STALE_VERSION);
+        var policy = change == Change.CONFIGURE ? replacement : previous.policy();
+        boolean held = switch (change) {
+            case CONFIGURE -> previous.held();
+            case PAUSE -> true;
+            case RESUME -> false;
+        };
+        long version = expectedVersion + 1;
+        QuietHours quiet = policy.quietHours();
+        jdbc.update("""
+                INSERT INTO repository_review_policy_versions (installation_id, repository_id, version, stages,
+                    providers, require_passing_ci, quiet_zone, quiet_start_minute, quiet_end_minute,
+                    iteration_cap, held, changed_by, change_kind)
+                VALUES (?, ?, ?, ?::text[], ?::text[], ?, ?, ?, ?, ?, ?, ?, ?)
+                """, scope.installationId(), scope.repositoryId(), version,
+                policy.stages().stream().map(Stage::name).sorted().toArray(String[]::new),
+                policy.providers().stream().sorted().toArray(String[]::new), policy.requirePassingCi(),
+                quiet == null ? null : quiet.zone().getId(), quiet == null ? null : quiet.startMinute(),
+                quiet == null ? null : quiet.endMinute(), policy.iterationCap(), held, actorId, change.name());
+        return new Snapshot(version, policy, held);
+    }
+
+    Snapshot lockCurrent(RepositoryScope scope) {
+        lock(scope, true);
+        return latest(scope);
+    }
+
+    private Snapshot latest(RepositoryScope scope) {
+        return jdbc.query("""
+                SELECT * FROM repository_review_policy_versions WHERE installation_id = ? AND repository_id = ?
+                ORDER BY version DESC LIMIT 1
+                """, this::snapshot, scope.installationId(), scope.repositoryId()).stream().findFirst().orElse(DEFAULT);
+    }
+
+    Snapshot pinned(RepositoryScope scope, Long version) {
+        if (version == null) return DEFAULT;
+        return jdbc.queryForObject("""
+                SELECT * FROM repository_review_policy_versions WHERE installation_id = ? AND repository_id = ? AND version = ?
+                """, this::snapshot, scope.installationId(), scope.repositoryId(), version);
+    }
+
+    private Snapshot snapshot(ResultSet rs, int row) throws SQLException {
+        var stages = Arrays.stream((String[]) rs.getArray("stages").getArray()).map(Stage::valueOf)
+                .collect(Collectors.toUnmodifiableSet());
+        var providers = Arrays.stream((String[]) rs.getArray("providers").getArray())
+                .collect(Collectors.toUnmodifiableSet());
+        String zone = rs.getString("quiet_zone");
+        var quiet = zone == null ? null : new QuietHours(ZoneId.of(zone), rs.getInt("quiet_start_minute"),
+                rs.getInt("quiet_end_minute"));
+        var policy = new RepositoryReviewPolicy(stages, providers, rs.getBoolean("require_passing_ci"), quiet,
+                rs.getInt("iteration_cap"));
+        return new Snapshot(rs.getLong("version"), policy, rs.getBoolean("held"));
+    }
+
+    Instant now() {
+        return jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
+    }
+
+    /** Count an outbox action until a request for the same target already consumes an iteration. */
+    long occupied(PullRequestId pr, UUID excludedCommand) {
+        long planned = jdbc.queryForObject("""
+                SELECT count(*) FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
+                WHERE (c.installation_id, c.repository_id, c.pr_number) = (?, ?, ?)
+                  AND o.command_type = 'REQUEST_REVIEW' AND o.status <> 'CANCELLED'
+                  AND o.id IS DISTINCT FROM ?::uuid
+                  AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE
+                    (r.installation_id, r.repository_id, r.pr_number, r.head_sha, r.stage, r.provider) =
+                    (c.installation_id, c.repository_id, c.pr_number, o.expected_head_sha, c.stage, o.target_provider))
+                """, Long.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(), excludedCommand);
+        return JdbcReviewRequestStore.usedIterations(jdbc, pr) + planned;
+    }
+
+    private void lock(RepositoryScope scope, boolean shared) {
+        String lock = shared ? "pg_advisory_xact_lock_shared" : "pg_advisory_xact_lock";
+        jdbc.query("SELECT " + lock + "(hashtextextended(?, 0))", rs -> {},
+                "review-policy:" + scope.installationId() + ":" + scope.repositoryId());
+    }
+}

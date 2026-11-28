@@ -70,6 +70,7 @@ The bootstrap contains PostgreSQL/Flyway schema, database integration tests and 
 - [Codex review requests, deduplication and activation prerequisites](docs/development/codex-review-requests.md)
 - [Conservative review outcomes and completion trust contract](docs/development/review-outcomes.md)
 - [Fix correlation and durable re-review eligibility](docs/development/fix-correlation.md)
+- [Repository review policy and local operator controls](docs/development/repository-review-policy.md)
 - [CI reconciliation, iteration limits and human intervention](docs/development/ci-and-iteration-policy.md)
 - [Durable re-review planning from synchronize events](docs/development/synchronize-review-planning.md)
 - [Opt-in GitHub PR author notifications](docs/development/author-notifications.md)

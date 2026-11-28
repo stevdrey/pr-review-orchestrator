@@ -68,7 +68,8 @@ public final class DispatchPlannedCodexReview {
         } catch (ReviewRequestFailure failure) {
             // Transient codes leave the permit RESERVED in the store, so a bounded retry can still send it.
             return switch (failure.code()) {
-                case STALE_HEAD, POLICY_DENIED, LIMIT_REACHED, HUMAN_INTERVENTION_REQUIRED, ACTOR_DENIED -> Outcome.CANCELLED;
+                case STALE_HEAD, ACTOR_DENIED -> Outcome.CANCELLED;
+                case POLICY_DENIED, LIMIT_REACHED, HUMAN_INTERVENTION_REQUIRED -> Outcome.POLICY_DENIED;
                 case REMOTE_UNAVAILABLE, PR_NOT_READY, CAPABILITY_UNVERIFIED ->
                         throw new Failure(ErrorCode.REMOTE_UNAVAILABLE, true);
                 case OUTCOME_UNKNOWN -> throw new Failure(ErrorCode.REMOTE_UNCERTAIN, false);

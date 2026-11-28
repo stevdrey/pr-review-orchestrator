@@ -1,6 +1,7 @@
 package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
 import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REVIEW_ASSESSMENT_EVENT;
+import static io.github.stevdrey.prrevieworchestrator.domain.DurableWork.REQUEST_REVIEW;
 
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
@@ -12,6 +13,8 @@ import java.sql.Timestamp;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -28,11 +31,13 @@ public final class JdbcWorkQueue implements WorkQueue {
     private final TransactionTemplate transactions;
     private final TransactionTemplate plannedReviews;
     private final Limits limits;
+    private final JdbcRepositoryPolicy repositoryPolicy;
     private final String worker = UUID.randomUUID().toString();
 
     public JdbcWorkQueue(JdbcTemplate jdbc, PlatformTransactionManager manager, Limits limits) {
         this.jdbc = jdbc;
         this.limits = limits;
+        this.repositoryPolicy = new JdbcRepositoryPolicy(jdbc);
         transactions = transactions(manager, DEADLINE);
         plannedReviews = transactions(manager, PLANNED_REVIEW_DEADLINE);
     }
@@ -93,7 +98,13 @@ public final class JdbcWorkQueue implements WorkQueue {
 
     private Optional<Command> claimCommand(String filter, Object... args) {
         return transaction(() -> {
-            var lease = claim(Queue.OUTBOX, filter, args);
+            var lease = claim(Queue.OUTBOX, filter + """
+                     AND (command_type <> 'REQUEST_REVIEW' OR NOT coalesce((
+                         SELECT held FROM repository_review_policy_versions policy
+                         WHERE (policy.installation_id, policy.repository_id) =
+                             (outbox_commands.installation_id, outbox_commands.repository_id)
+                         ORDER BY version DESC LIMIT 1), false))
+                    """, args);
             if (lease.isEmpty()) return Optional.empty();
             try {
                 Command command = jdbc.queryForObject("""
@@ -147,7 +158,24 @@ public final class JdbcWorkQueue implements WorkQueue {
     public boolean completeEvent(Event event, List<Intent> intents, Runnable authorize) {
         if (intents.size() > MAX_INTENTS) throw new Failure(ErrorCode.INVALID_EVENT, false);
         return completeLocalEvent(event, authorize, () -> {
-            for (Intent intent : intents) enqueue(event, intent, null);
+            var reviewIntents = intents.stream().filter(intent -> REQUEST_REVIEW.equals(intent.type())).toList();
+            // Acquire all PR locks before the shared policy lock, in stable order across event batches.
+            reviewIntents.stream().mapToInt(Intent::prNumber).distinct().sorted()
+                    .forEach(number -> PostgresLocks.lockPr(jdbc, new PullRequestId(event.scope(), number)));
+            var snapshot = reviewIntents.isEmpty() ? null : repositoryPolicy.lockCurrent(event.scope());
+            for (Intent intent : intents) {
+                if (!REQUEST_REVIEW.equals(intent.type())) {
+                    enqueue(event, intent, null, null);
+                    continue;
+                }
+                var pr = new PullRequestId(event.scope(), intent.prNumber());
+                if (snapshot.permits(intent.stage(), intent.provider(), repositoryPolicy.now())
+                        && repositoryPolicy.occupied(pr, null) < snapshot.policy().iterationCap()
+                        && reviewStatePermits(pr, intent, snapshot.policy().requirePassingCi())
+                        && !alreadyReserved(pr, intent)) {
+                    enqueue(event, intent, null, snapshot.version());
+                }
+            }
         });
     }
 
@@ -192,7 +220,7 @@ public final class JdbcWorkQueue implements WorkQueue {
                 event.lease().id(), pr.scope().installationId(), pr.scope().repositoryId());
     }
 
-    void enqueue(Event event, Intent intent, Long plannedHeadEpoch) {
+    void enqueue(Event event, Intent intent, Long plannedHeadEpoch, Long policyVersion) {
         var scope = event.scope();
         UUID cycle = UUID.randomUUID();
         jdbc.update("""
@@ -208,23 +236,56 @@ public final class JdbcWorkQueue implements WorkQueue {
                 intent.expectedHeadSha(), intent.stage(), intent.provider());
         jdbc.update("""
                 INSERT INTO outbox_commands (id, command_key, review_cycle_id, installation_id, repository_id,
-                    expected_head_sha, command_type, target_provider, correlation_id, planned_head_epoch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (command_key) DO NOTHING
+                    expected_head_sha, command_type, target_provider, correlation_id, planned_head_epoch, repository_policy_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (command_key) DO NOTHING
                 """, UUID.randomUUID(), intent.key(scope), cycle, scope.installationId(), scope.repositoryId(),
-                intent.expectedHeadSha(), intent.type(), intent.provider(), event.lease().correlationId(), plannedHeadEpoch);
+                intent.expectedHeadSha(), intent.type(), intent.provider(), event.lease().correlationId(), plannedHeadEpoch,
+                policyVersion);
     }
 
     @Override
-    public boolean executeCommand(Command command, Runnable authorize, Supplier<Outcome> operation) {
+    public boolean executeCommand(Command command, Runnable authorize, Function<BooleanSupplier, Outcome> operation) {
         if (command.plannedHeadEpoch() != null) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
         return transaction(() -> {
             if (!lock(command.lease())) return false;
             authorize.run();
             // Holding the row lock prevents another worker stealing the lease during a bounded API call.
-            Outcome outcome = java.util.Objects.requireNonNull(operation.get());
-            finish(command.lease(), outcome.name(), null);
+            Outcome outcome = java.util.Objects.requireNonNull(operation.apply(() -> reviewPolicyAllows(command)));
+            finishCommand(command.lease(), outcome);
             return true;
         });
+    }
+
+    private boolean reviewPolicyAllows(Command command) {
+        var intent = command.intent();
+        if (!REQUEST_REVIEW.equals(intent.type())) return true;
+        var pr = new PullRequestId(command.scope(), intent.prNumber());
+        PostgresLocks.lockPr(jdbc, pr);
+        var active = repositoryPolicy.lockCurrent(command.scope());
+        Long version = jdbc.queryForObject("SELECT repository_policy_version FROM outbox_commands WHERE id = ?",
+                Long.class, command.lease().id());
+        var pinned = repositoryPolicy.pinned(command.scope(), version);
+        var now = repositoryPolicy.now();
+        return pinned.permits(intent.stage(), intent.provider(), now)
+                && active.permits(intent.stage(), intent.provider(), now)
+                && repositoryPolicy.occupied(pr, null) <= active.policy().iterationCap()
+                && reviewStatePermits(pr, intent, pinned.policy().requirePassingCi() || active.policy().requirePassingCi());
+    }
+
+    private boolean reviewStatePermits(PullRequestId pr, Intent intent, boolean requireCi) {
+        return jdbc.query("""
+                SELECT head_sha = ? AND state <> 'PAUSED' AND (NOT ? OR ci_status = 'PASSED')
+                FROM pr_review_states WHERE (installation_id, repository_id, pr_number) = (?, ?, ?)
+                """, (rs, row) -> rs.getBoolean(1), intent.expectedHeadSha(), requireCi,
+                pr.scope().installationId(), pr.scope().repositoryId(), pr.number()).stream().findFirst().orElse(!requireCi);
+    }
+
+    private boolean alreadyReserved(PullRequestId pr, Intent intent) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM review_requests
+                    WHERE (installation_id, repository_id, pr_number, head_sha, stage, provider) = (?, ?, ?, ?, ?, ?))
+                """, Boolean.class, pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                intent.expectedHeadSha(), intent.stage(), intent.provider()));
     }
 
     @Override
@@ -234,9 +295,14 @@ public final class JdbcWorkQueue implements WorkQueue {
             // Allow the request's foreign-key check to take KEY SHARE without releasing the claim fence.
             if (!lock(command.lease(), "FOR NO KEY UPDATE")) return false;
             // Independent request transactions own the authorization and PR locks for the POST.
-            finish(command.lease(), java.util.Objects.requireNonNull(operation.get()).name(), null);
+            finishCommand(command.lease(), java.util.Objects.requireNonNull(operation.get()));
             return true;
         });
+    }
+
+    private void finishCommand(Lease lease, Outcome outcome) {
+        if (outcome == Outcome.POLICY_DENIED) finish(lease, Outcome.CANCELLED.name(), ErrorCode.POLICY_DENIED);
+        else finish(lease, outcome.name(), null);
     }
 
     @Override
