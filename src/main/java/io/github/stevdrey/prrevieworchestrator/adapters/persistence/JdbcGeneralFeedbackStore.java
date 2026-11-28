@@ -70,7 +70,8 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
             inline_findings AS (
                 SELECT f.id, f.source_kind, f.severity, f.thread_resolved,
                     f.stable_finding_id, f.status, f.verified_at, f.round_observed_at AS at_round,
-                    latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback
+                    latest.captured_at AS linked_at, s.body_sha256, s.source_updated_at, s.feedback,
+                    f.status IN ('OPEN', 'ACKNOWLEDGED') AS pending
                 FROM findings f JOIN review_cycles c ON c.id = f.review_cycle_id
                 LEFT JOIN review_evidence_snapshots latest ON latest.id = f.evidence_snapshot_id
                 LEFT JOIN review_evidence_sources s ON s.snapshot_id = f.evidence_snapshot_id AND s.source_id = f.source_id
@@ -88,7 +89,7 @@ public class JdbcGeneralFeedbackStore implements GeneralFeedbackStore {
                                 AND n.body_sha256 = f.body_sha256 AND n.feedback = f.feedback
                                 AND n.source_updated_at IS NOT DISTINCT FROM f.source_updated_at)))
             ), pending_inline_findings AS (
-                SELECT stable_finding_id FROM effective_inline_findings WHERE status IN ('OPEN', 'ACKNOWLEDGED')
+                SELECT stable_finding_id FROM effective_inline_findings WHERE pending
             )
             """;
 

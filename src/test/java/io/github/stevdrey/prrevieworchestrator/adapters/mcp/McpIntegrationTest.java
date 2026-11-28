@@ -2,13 +2,18 @@ package io.github.stevdrey.prrevieworchestrator.adapters.mcp;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import io.github.stevdrey.prrevieworchestrator.PrReviewOrchestratorApplication;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.PostgresLocks;
 import io.github.stevdrey.prrevieworchestrator.application.DisposeGeneralFeedback;
 import io.github.stevdrey.prrevieworchestrator.application.IngestReviewEvidence;
 import io.github.stevdrey.prrevieworchestrator.application.ReviewLifecycle;
 import io.github.stevdrey.prrevieworchestrator.domain.GeneralFeedback;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewEvidence;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition;
@@ -26,6 +31,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,6 +42,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.junit.jupiter.Container;
@@ -150,9 +157,49 @@ class McpIntegrationTest {
 
         String ping = rpc("ping", Map.of());
         assertEquals(200, post(READ, ping, juneVersion).statusCode());
+        // Each request validates header support independently of initialization.
+        assertEquals(200, post(READ, ping, VERSION).statusCode());
+        assertEquals(200, initialize(VERSION).statusCode());
+        assertEquals(200, post(READ, ping, juneVersion).statusCode());
         assertEquals(400, post(READ, ping, legacyVersion).statusCode());
         assertEquals(400, post(READ, ping, null).statusCode());
         assertEquals(400, post(READ, "[" + ping + "]").statusCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"OPEN", "ACKNOWLEDGED"})
+    void listsOnePendingOccurrenceWhenAnOlderRoundsReadSeesAnEditedInlineFinding(String pendingStatus)
+            throws Exception {
+        UUID olderRound = cycle(101, 7, NEXT_HEAD);
+        UUID currentRound = cycle(101, 7, HEAD);
+        Instant observedAt = Instant.parse("2026-11-27T12:00:00Z");
+        var closedRevision = inlineSource("a".repeat(64), observedAt, true);
+        assertTrue(evidence.ingest(new ReviewEvidence.Snapshot(UUID.randomUUID(), currentRound, PR, "fixture", HEAD,
+                observedAt, List.of(closedRevision))));
+        jdbc.update("""
+                UPDATE findings SET status = 'DISMISSED', disposition_actor = 'maintainer',
+                    disposition_reason = 'Round decision' WHERE review_cycle_id = ?
+                """, currentRound);
+        var stableId = jdbc.queryForObject("SELECT stable_finding_id FROM findings", UUID.class);
+
+        // A historical copy of the same revision remains superseded by its same-head occurrence.
+        assertTrue(evidence.ingest(new ReviewEvidence.Snapshot(UUID.randomUUID(), olderRound, PR, "fixture",
+                NEXT_HEAD, HEAD, observedAt.plusSeconds(1), List.of(closedRevision))));
+        assertInlineFinding(stableId, "DISMISSED", true);
+        var gates = new ReviewTransition.Gates(true, false, false, true, false, ReviewTransition.Ci.UNKNOWN);
+        lifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), 0, HEAD, ReviewTransition.Action.MARK_READY,
+                null, gates));
+        lifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), 1, HEAD, ReviewTransition.Action.START_REVIEW,
+                null, gates));
+        lifecycle.apply(PR, new ReviewTransition(UUID.randomUUID(), 2, HEAD, ReviewTransition.Action.BASELINE_CLEAN,
+                null, gates));
+
+        var editedRevision = inlineSource("b".repeat(64), observedAt.plusSeconds(2), false);
+        assertTrue(evidence.ingest(new ReviewEvidence.Snapshot(UUID.randomUUID(), olderRound, PR, "fixture",
+                NEXT_HEAD, HEAD, observedAt.plusSeconds(2), List.of(editedRevision))));
+        assertEquals(PullRequestReview.State.ACTION_REQUIRED, lifecycle.find(PR).orElseThrow().state());
+        jdbc.update("UPDATE findings SET status = ? WHERE review_cycle_id = ?", pendingStatus, olderRound);
+        assertInlineFinding(stableId, pendingStatus, false);
     }
 
     @Test
@@ -269,6 +316,44 @@ class McpIntegrationTest {
     }
 
     @Test
+    void deniesPauseWhenTheGrantExpiresWhileWaitingForThePrLock() throws Exception {
+        UUID id = UUID.randomUUID();
+        grant(PAUSE, "pause_cycle", id, 0L);
+        String tokenDigest = digest(PAUSE);
+        CompletableFuture<HttpResponse<String>> pending;
+        try (var holder = Objects.requireNonNull(jdbc.getDataSource()).getConnection()) {
+            holder.setAutoCommit(false);
+            var lockJdbc = new JdbcTemplate(new SingleConnectionDataSource(holder, true));
+            try {
+                PostgresLocks.lockPr(lockJdbc, PR);
+                int blocker = lockJdbc.queryForObject("SELECT pg_backend_pid()", Integer.class);
+                jdbc.update("""
+                        UPDATE mcp_tool_sessions SET expires_at = clock_timestamp() + interval '2 seconds'
+                        WHERE token_sha256 = ?
+                        """, tokenDigest);
+                pending = CLIENT.sendAsync(request(PAUSE, call("pause_cycle", command(id, 0))).build(),
+                        HttpResponse.BodyHandlers.ofString());
+                awaitPrLockWait(blocker);
+                assertTrue(grantIsUnexpired(tokenDigest), "The grant must still be valid when the request blocks");
+                // Wait on the database clock, leaving time inside the store's three-second transaction deadline.
+                jdbc.query("""
+                        SELECT pg_sleep(greatest(0, extract(epoch FROM expires_at - clock_timestamp()))::double precision)
+                        FROM mcp_tool_sessions WHERE token_sha256 = ?
+                        """, rs -> {}, tokenDigest);
+                assertFalse(grantIsUnexpired(tokenDigest));
+            } finally {
+                holder.rollback();
+            }
+        }
+        var response = pending.get(5, TimeUnit.SECONDS);
+        assertEquals(401, response.statusCode(), response.body());
+        assertEquals(0, transitionCount());
+        assertEquals(0, auditCount());
+        assertEquals(0, count("SELECT count(*) FROM pr_domain_events"));
+        assertEquals(PullRequestReview.initial(PR, HEAD), lifecycle.find(PR).orElseThrow());
+    }
+
+    @Test
     void deniesMissingOrForgedToolArgumentsAndUnactionableRpcMessages() throws Exception {
         var command = UUID.randomUUID();
         grant(PAUSE, "pause_cycle", command, 0L);
@@ -357,6 +442,39 @@ class McpIntegrationTest {
         var response = post(PAUSE, body);
         assertEquals(200, response.statusCode());
         assertEquals(-32602, JSON.readTree(response.body()).at("/error/code").intValue());
+    }
+
+    private ReviewEvidence.Source inlineSource(String bodyHash, Instant updatedAt, boolean resolved) {
+        return new ReviewEvidence.Source("fixture-inline", ReviewEvidence.Kind.REVIEW_COMMENT, null,
+                "fixture-thread", null, null, HEAD, HEAD, bodyHash, updatedAt, null, resolved, false,
+                "src/Example.java", 10, 10, ReviewEvidence.Severity.UNKNOWN);
+    }
+
+    private void assertInlineFinding(UUID stableId, String status, boolean resolved) throws Exception {
+        assertThat(tool(READ, "list_findings", TARGET, "OK").path("findings").values()).singleElement()
+                .satisfies(row -> {
+                    assertEquals(stableId.toString(), row.path("stableId").asText());
+                    assertEquals(status, row.path("status").asText());
+                    assertEquals(resolved, row.path("threadResolved").booleanValue());
+                });
+    }
+
+    private void awaitPrLockWait(int blocker) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        do {
+            if (Boolean.TRUE.equals(jdbc.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+                        AND wait_event = 'advisory' AND ? = ANY(pg_blocking_pids(pid)))
+                    """, Boolean.class, blocker))) return;
+            Thread.sleep(10);
+        } while (System.nanoTime() < deadline);
+        fail("Pause request did not reach the PostgreSQL advisory lock");
+    }
+
+    private boolean grantIsUnexpired(String tokenDigest) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT expires_at > clock_timestamp() FROM mcp_tool_sessions WHERE token_sha256 = ?
+                """, Boolean.class, tokenDigest));
     }
 
     private void dismiss(UUID stableId, UUID snapshotId, long version) {

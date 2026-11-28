@@ -100,14 +100,14 @@ public class JdbcMcpToolStore implements McpToolStore {
             long installation = pr.scope().installationId();
             long repository = pr.scope().repositoryId();
             // The clean gate's effective projection across every round of the PR: retained findings from earlier
-            // heads stay visible, and superseded inline copies collapse to their current occurrence.
+            // heads stay visible, and each inline identity is represented by a pending occurrence when one exists.
             return jdbc.query(JdbcGeneralFeedbackStore.LAST_HEAD + ", "
                     + JdbcGeneralFeedbackStore.EFFECTIVE_INLINE_FINDING_CTES + """
                     , inline_rows AS (
                         SELECT DISTINCT ON (coalesce(stable_finding_id, id))
                             id, stable_finding_id, source_kind, severity, status, thread_resolved
                         FROM effective_inline_findings
-                        ORDER BY coalesce(stable_finding_id, id), at_round DESC NULLS LAST,
+                        ORDER BY coalesce(stable_finding_id, id), pending DESC, at_round DESC NULLS LAST,
                             linked_at DESC NULLS LAST, id DESC
                     ), general_effective AS (
                     """ + JdbcGeneralFeedbackStore.EFFECTIVE_GENERAL_FINDINGS + """
