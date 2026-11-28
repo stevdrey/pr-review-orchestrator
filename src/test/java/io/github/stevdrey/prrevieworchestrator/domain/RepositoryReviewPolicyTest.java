@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.QuietHours;
 import java.time.Instant;
 import java.time.ZoneId;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -27,6 +28,13 @@ class RepositoryReviewPolicyTest {
         assertEquals(release, hours.end(now));
         assertTrue(hours.contains(release.minusNanos(1)));
         assertFalse(hours.contains(release));
-        assertEquals(release, hours.end(release));
+    }
+
+    @Test
+    void endOutsideQuietHoursFindsTheNextWindowDuringAnOverlap() {
+        var hours = new QuietHours(ZoneId.of("America/New_York"), 60, 90);
+        var afterFirstWindow = Instant.parse("2026-11-01T05:30:00Z");
+        assertFalse(hours.contains(afterFirstWindow));
+        assertEquals(Instant.parse("2026-11-01T06:30:00Z"), hours.end(afterFirstWindow));
     }
 }

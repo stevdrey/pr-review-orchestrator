@@ -55,19 +55,23 @@ public record RepositoryReviewPolicy(Set<Stage> stages, Set<String> providers, b
                     : minute >= startMinute || minute < endMinute;
         }
 
-        /** The first instant at or after {@code now} outside the quiet interval. */
+        /** The first instant outside the current quiet interval, or the end of the next interval. */
         public Instant end(Instant now) {
-            var endTime = LocalTime.of(endMinute / 60, endMinute % 60);
+            var quietStart = contains(now) ? now : nextBoundary(now, startMinute, false);
+            return nextBoundary(quietStart, endMinute, true);
+        }
+
+        private Instant nextBoundary(Instant cursor, int minute, boolean quiet) {
+            var boundaryTime = LocalTime.of(minute / 60, minute % 60);
             var rules = zone.getRules();
-            var cursor = now;
-            while (contains(cursor)) {
+            while (contains(cursor) == quiet) {
                 var local = cursor.atZone(zone);
-                var localEnd = local.toLocalDate().atTime(endTime);
-                if (!localEnd.isAfter(local.toLocalDateTime())) localEnd = localEnd.plusDays(1);
-                var endWithCurrentOffset = localEnd.toInstant(local.getOffset());
+                var localBoundary = local.toLocalDate().atTime(boundaryTime);
+                if (!localBoundary.isAfter(local.toLocalDateTime())) localBoundary = localBoundary.plusDays(1);
+                var boundaryWithCurrentOffset = localBoundary.toInstant(local.getOffset());
                 var transition = rules.nextTransition(cursor);
-                if (transition == null || endWithCurrentOffset.isBefore(transition.getInstant())) {
-                    return endWithCurrentOffset;
+                if (transition == null || boundaryWithCurrentOffset.isBefore(transition.getInstant())) {
+                    return boundaryWithCurrentOffset;
                 }
                 // At a gap or overlap, recheck the new wall-clock time before choosing a release.
                 cursor = transition.getInstant();
