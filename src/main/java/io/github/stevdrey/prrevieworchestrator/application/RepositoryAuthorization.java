@@ -17,8 +17,9 @@ public final class RepositoryAuthorization {
     }
 
     public void requireAuthorized(RepositoryScope scope) {
+        requireAllowlisted(scope);
         try {
-            if (scope != null && allowed.contains(scope) && installations.isActiveAndEnabled(scope)) {
+            if (installations.isActiveAndEnabled(scope)) {
                 return;
             }
         } catch (RuntimeException ignored) {
@@ -26,5 +27,10 @@ public final class RepositoryAuthorization {
             throw new AuthorizationUnavailable();
         }
         throw new AuthorizationDenied();
+    }
+
+    /** Use when a downstream database operation enforces live membership in its own authorization boundary. */
+    public void requireAllowlisted(RepositoryScope scope) {
+        if (scope == null || !allowed.contains(scope)) throw new AuthorizationDenied();
     }
 }

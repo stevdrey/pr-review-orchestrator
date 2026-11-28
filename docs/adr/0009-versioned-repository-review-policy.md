@@ -14,7 +14,7 @@ Store append-only policy versions for each installation and repository pair. An 
 
 Hold a shared repository lock from admission through commit and from the final send decision through its bounded effect and receipt. Policy edits take the exclusive lock and require the expected version. The PR lock continues to serialize head, CI and iteration decisions. A committed pause blocks subsequent sends. An edit waits for a bounded send already inside the fence.
 
-Use a local, non-web operator command. Authenticate through PostgreSQL and intersect the login's scoped operator grant and actor ID with deployment configuration and live installation membership. Append actor, operation and server time with each successful version. Keep operator grant provisioning under database administration. The operator command starts without provider workers.
+Use a local, non-web operator command. Authenticate through PostgreSQL and intersect the login's scoped operator grant and actor ID with deployment configuration and live installation membership. Give the operator login execution rights on scoped database functions. Store the actor, operation and server time with each successful version. Keep operator grant provisioning and table access with the database administrator and runtime service roles. The operator command starts without provider workers.
 
 ## Consequences
 

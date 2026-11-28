@@ -19,6 +19,7 @@ import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -41,8 +42,7 @@ public final class JdbcRepositoryPolicy {
                 return transaction.execute(status -> {
                     PostgresDeadlines.apply(jdbc, DEADLINE);
                     authorize.run();
-                    requireOperator(scope, actorId);
-                    return lockCurrent(scope);
+                    return operatorSnapshot(scope, actorId, false);
                 });
             }
 
@@ -51,41 +51,38 @@ public final class JdbcRepositoryPolicy {
                 return transaction.execute(status -> {
                     PostgresDeadlines.apply(jdbc, DEADLINE);
                     authorize.run();
-                    requireOperator(scope, actorId);
-                    lock(scope, false);
-                    return append(scope, expectedVersion, actorId, change, policy);
+                    var previous = operatorSnapshot(scope, actorId, true);
+                    if (previous.version() != expectedVersion) throw new ReviewConflict(ReviewConflict.Code.STALE_VERSION);
+                    return append(scope, actorId, change, policy, previous);
                 });
             }
         };
     }
 
-    private void requireOperator(RepositoryScope scope, long actorId) {
-        if (jdbc.queryForList("""
-                SELECT 1 FROM repository_review_policy_operators
-                WHERE (installation_id, repository_id, actor_id) = (?, ?, ?) AND database_role = session_user
-                """, Integer.class, scope.installationId(), scope.repositoryId(), actorId).isEmpty()) {
-            throw new AuthorizationDenied();
+    private Snapshot operatorSnapshot(RepositoryScope scope, long actorId, boolean editing) {
+        try {
+            return jdbc.query("SELECT * FROM read_repository_review_policy(?, ?, ?, ?)", this::snapshot,
+                    scope.installationId(), scope.repositoryId(), actorId, editing).stream().findFirst().orElse(DEFAULT);
+        } catch (DataAccessException failure) {
+            if (failure.getMostSpecificCause() instanceof SQLException sql && "42501".equals(sql.getSQLState())) {
+                throw new AuthorizationDenied();
+            }
+            throw failure;
         }
     }
 
-    private Snapshot append(RepositoryScope scope, long expectedVersion, long actorId, Change change,
-            RepositoryReviewPolicy replacement) {
-        var previous = latest(scope);
-        if (previous.version() != expectedVersion) throw new ReviewConflict(ReviewConflict.Code.STALE_VERSION);
+    private Snapshot append(RepositoryScope scope, long actorId, Change change, RepositoryReviewPolicy replacement,
+            Snapshot previous) {
         var policy = change == Change.CONFIGURE ? replacement : previous.policy();
         boolean held = switch (change) {
             case CONFIGURE -> previous.held();
             case PAUSE -> true;
             case RESUME -> false;
         };
-        long version = expectedVersion + 1;
+        long version = previous.version() + 1;
         QuietHours quiet = policy.quietHours();
-        jdbc.update("""
-                INSERT INTO repository_review_policy_versions (installation_id, repository_id, version, stages,
-                    providers, require_passing_ci, quiet_zone, quiet_start_minute, quiet_end_minute,
-                    iteration_cap, held, changed_by, change_kind)
-                VALUES (?, ?, ?, ?::text[], ?::text[], ?, ?, ?, ?, ?, ?, ?, ?)
-                """, scope.installationId(), scope.repositoryId(), version,
+        jdbc.query("SELECT append_repository_review_policy(?, ?, ?, ?::text[], ?::text[], ?, ?, ?, ?, ?, ?, ?, ?)",
+                rs -> {}, scope.installationId(), scope.repositoryId(), version,
                 policy.stages().stream().map(Stage::name).sorted().toArray(String[]::new),
                 policy.providers().stream().sorted().toArray(String[]::new), policy.requirePassingCi(),
                 quiet == null ? null : quiet.zone().getId(), quiet == null ? null : quiet.startMinute(),
@@ -94,11 +91,8 @@ public final class JdbcRepositoryPolicy {
     }
 
     Snapshot lockCurrent(RepositoryScope scope) {
-        lock(scope, true);
-        return latest(scope);
-    }
-
-    private Snapshot latest(RepositoryScope scope) {
+        jdbc.query("SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))", rs -> {},
+                "review-policy:" + scope.installationId() + ":" + scope.repositoryId());
         return jdbc.query("""
                 SELECT * FROM repository_review_policy_versions WHERE installation_id = ? AND repository_id = ?
                 ORDER BY version DESC LIMIT 1
@@ -143,9 +137,4 @@ public final class JdbcRepositoryPolicy {
         return JdbcReviewRequestStore.usedIterations(jdbc, pr) + planned;
     }
 
-    private void lock(RepositoryScope scope, boolean shared) {
-        String lock = shared ? "pg_advisory_xact_lock_shared" : "pg_advisory_xact_lock";
-        jdbc.query("SELECT " + lock + "(hashtextextended(?, 0))", rs -> {},
-                "review-policy:" + scope.installationId() + ":" + scope.repositoryId());
-    }
 }

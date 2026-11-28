@@ -4,17 +4,17 @@
 
 ## Operate the policy
 
-Use a named PostgreSQL login for each operator identity. A database administrator provisions an active, enabled installation/repository pair and inserts a grant for the operator's login and attributed actor ID. The operator login needs database connection and schema usage, `SELECT` on the four tables below and `INSERT` on `repository_review_policy_versions`. PostgreSQL also requires `UPDATE` privilege on one column per membership table for the authorization read locks. Use timestamp columns for that grant. Keep grant writes, schema ownership and policy-table `UPDATE`, `DELETE` and `TRUNCATE` with the administrator. The runtime service login needs read access to the version table.
+Use a dedicated PostgreSQL login for each operator identity. A database administrator provisions an active, enabled installation/repository pair and inserts a grant for the operator's login and attributed actor ID. Give the login database connection, schema usage and execution rights on the two scoped policy functions. Keep table privileges and schema ownership with the service and database administration roles. The runtime service login needs read access to the version table for dispatch.
 
 Example for schema `public`, database role `pro_review_alice`, installation `101`, repository `1001` and actor `42`.
 
 ```sql
 GRANT USAGE ON SCHEMA public TO pro_review_alice;
-GRANT SELECT ON public.installations, public.installation_repositories,
-    public.repository_review_policy_operators, public.repository_review_policy_versions TO pro_review_alice;
-GRANT UPDATE (updated_at) ON public.installations TO pro_review_alice;
-GRANT UPDATE (created_at) ON public.installation_repositories TO pro_review_alice;
-GRANT INSERT ON public.repository_review_policy_versions TO pro_review_alice;
+GRANT EXECUTE ON FUNCTION public.read_repository_review_policy(bigint, bigint, bigint, boolean)
+TO pro_review_alice;
+GRANT EXECUTE ON FUNCTION public.append_repository_review_policy(
+    bigint, bigint, bigint, text[], text[], boolean, text, integer, integer, integer, boolean, bigint, text
+) TO pro_review_alice;
 
 INSERT INTO public.repository_review_policy_operators (installation_id, repository_id, database_role, actor_id)
 VALUES (101, 1001, 'pro_review_alice', 42);
@@ -33,9 +33,9 @@ java -jar build/libs/pr-review-orchestrator-0.1.0-SNAPSHOT.jar repository-policy
 - `configure EXPECTED_VERSION CAP REQUIRE_PASSING_CI STAGES PROVIDERS [ZONE START END]` publishes validated settings and preserves the repository hold. The cap is 0–6. A lower deployment cap still applies where configured. Stages are `BASELINE` and `DEEP`. Use comma-separated allowlists, or `-` for an empty list. Provider IDs use lowercase letters, digits, underscores or hyphens.
 - `pause EXPECTED_VERSION` and `resume EXPECTED_VERSION` append versions while retaining the policy settings. Resume releases the repository hold. A PR-level human hold or iteration stop still requires its existing lifecycle procedure.
 - `show` returns the current version, settings and hold. After `STALE_VERSION`, review the latest settings before deciding whether to retry against the new version.
-- Quiet hours form a daily interval in an IANA time zone. The start is inclusive and the end is exclusive. Overnight windows are supported. Omit all three fields to remove the interval. The worker reads the database clock and evaluates the resulting local time.
+- Quiet hours form a daily interval in an IANA time zone registered in V21 from the Java 27 time-zone catalog. The start is inclusive and the end is exclusive. Overnight windows are supported. Omit all three fields to remove the interval. The worker reads the database clock and evaluates the resulting local time.
 - `REQUIRE_PASSING_CI=true` requires persisted passing CI for the exact current head even on the first review. With `false`, existing CI gates still apply, including the mandatory native re-review and readiness gates. The policy does not define individual workflow identities.
-- Query `repository_review_policy_versions` for the scope, version, operator actor, operation and server time. Revoke an operator by removing the scoped grant and disabling its login if appropriate. Access to a repository still requires the configured allowlist and enabled membership. The insert trigger checks the login, actor, membership, next version and hold semantics even when the login issues SQL directly.
+- Database administrators can query `repository_review_policy_versions` for the scope, version, operator actor, operation and server time. Removing the scoped grant revokes both policy functions for that repository, including SQL calls made outside the CLI. The CLI also requires the configured allowlist. PostgreSQL checks live membership, the login and actor, and validates provider IDs and the time zone before committing a version.
 
 ## Effect on review work
 
@@ -56,3 +56,5 @@ On 2026-11-27, `./gradlew --offline clean build` passed all 419 tests with zero 
 The [PR #79 follow-up](https://github.com/stevdrey/pr-review-orchestrator/pull/79#discussion_r4725562728) reproduced the extra send on `b613e52`. The regression verifies that raising the cap from one to two allows the newer request to send while the older command settles as `CANCELLED / POLICY_DENIED` under its pinned cap. The durable dispatcher suite and `./gradlew --offline clean build` passed. The full suite ran 420 tests with zero failures or skips.
 
 The [native dispatch follow-up](https://github.com/stevdrey/pr-review-orchestrator/pull/79#discussion_r4725631638) reproduced an extra Codex send on `b18a993` after generic dispatch occupied the remaining slot under the pinned cap. The sandbox regressions verify denial before creating a new reservation and `NOT_SENT` when retrying an existing reservation. The focused regressions and `./gradlew --offline clean build` passed. The full suite ran 422 tests with zero failures or skips.
+
+The operator-access follow-up on PR #79 reproduced invalid SQL writes and an unscoped operator read on `346b2d7`. PostgreSQL regressions now verify rejection before appending an immutable version, scoped reads and writes with function-only grants, and loss of access on grant revocation. The focused tests and `./gradlew --offline clean build` passed on JDK 27 and disposable PostgreSQL. The full suite ran 424 tests with zero failures or skips.

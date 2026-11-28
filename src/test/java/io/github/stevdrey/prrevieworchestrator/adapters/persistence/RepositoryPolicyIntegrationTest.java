@@ -18,6 +18,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewRequestFailure;
 import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Reservation;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.HashMap;
@@ -31,6 +32,8 @@ import java.util.concurrent.TimeoutException;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -104,20 +107,40 @@ class RepositoryPolicyIntegrationTest {
 
     @Test
     void localCommandUsesTheProvisionedLoginWithoutMigrationPrivileges() {
+        jdbc.update("""
+                INSERT INTO repository_review_policy_operators (installation_id, repository_id, database_role, actor_id)
+                VALUES (101, 1002, session_user, 42)
+                """);
+        assertEquals(1L, operator.change(OTHER, ACTOR, 0, CONFIGURE, ENABLED).version());
         jdbc.execute("CREATE ROLE issue27_operator LOGIN PASSWORD 'policy-fixture-only'");
         try {
             jdbc.execute("GRANT USAGE ON SCHEMA public TO issue27_operator");
             jdbc.execute("""
-                    GRANT SELECT ON installations, installation_repositories, repository_review_policy_operators,
-                        repository_review_policy_versions TO issue27_operator
+                    GRANT EXECUTE ON FUNCTION read_repository_review_policy(bigint, bigint, bigint, boolean)
+                    TO issue27_operator
                     """);
-            jdbc.execute("GRANT UPDATE (updated_at) ON installations TO issue27_operator");
-            jdbc.execute("GRANT UPDATE (created_at) ON installation_repositories TO issue27_operator");
-            jdbc.execute("GRANT INSERT ON repository_review_policy_versions TO issue27_operator");
+            jdbc.execute("""
+                    GRANT EXECUTE ON FUNCTION append_repository_review_policy(
+                        bigint, bigint, bigint, text[], text[], boolean, text, integer, integer, integer, boolean, bigint, text
+                    ) TO issue27_operator
+                    """);
             jdbc.update("""
                     INSERT INTO repository_review_policy_operators (installation_id, repository_id, database_role, actor_id)
                     VALUES (101, 1001, 'issue27_operator', 52)
                     """);
+            var operatorJdbc = new JdbcTemplate(new DriverManagerDataSource(
+                    POSTGRES.getJdbcUrl(), "issue27_operator", "policy-fixture-only"));
+            for (String table : List.of("repository_review_policy_versions", "repository_review_policy_operators",
+                    "installations", "installation_repositories")) {
+                assertSqlState("42501", () -> operatorJdbc.queryForList("SELECT * FROM " + table));
+            }
+            assertEquals(List.of(), operatorJdbc.queryForList("SELECT version FROM read_repository_review_policy(101, 1001, 52, false)"));
+            assertSqlState("42501", () -> operatorJdbc.queryForList(
+                    "SELECT version FROM read_repository_review_policy(101, 1002, 42, false)"));
+            assertSqlState("42501", () -> operatorJdbc.queryForList("""
+                    SELECT append_repository_review_policy(101, 1002, 2, ARRAY['BASELINE'], ARRAY['codex'], true,
+                        NULL, NULL, NULL, 3, false, 42, 'CONFIGURE')
+                    """));
             var settings = Map.of("spring.datasource.url", POSTGRES.getJdbcUrl(),
                     "spring.datasource.username", "issue27_operator", "spring.datasource.password", "policy-fixture-only",
                     "orchestrator.github.repositories.101[0]", "1001", "orchestrator.github.repositories.101[1]", "1002",
@@ -132,8 +155,14 @@ class RepositoryPolicyIntegrationTest {
                 assertEquals(0, RepositoryPolicyCommand.run(new String[]{"pause", "1"}));
                 assertEquals(1, RepositoryPolicyCommand.run(new String[]{"resume", "1"}));
                 assertEquals(0, RepositoryPolicyCommand.run(new String[]{"resume", "2"}));
+                assertEquals(List.of(3L), operatorJdbc.queryForList(
+                        "SELECT version FROM read_repository_review_policy(101, 1001, 52, false)", Long.class));
                 System.setProperty("orchestrator.repository-policy.operator.repository-id", "1002");
-                assertEquals(1, RepositoryPolicyCommand.run(new String[]{"pause", "0"}));
+                assertEquals(1, RepositoryPolicyCommand.run(new String[]{"show"}));
+                assertEquals(1, RepositoryPolicyCommand.run(new String[]{"pause", "1"}));
+                jdbc.update("DELETE FROM repository_review_policy_operators WHERE database_role = 'issue27_operator'");
+                assertSqlState("42501", () -> operatorJdbc.queryForList(
+                        "SELECT version FROM read_repository_review_policy(101, 1001, 52, false)"));
             } finally {
                 previous.forEach((key, value) -> {
                     if (value == null) System.clearProperty(key);
@@ -141,11 +170,27 @@ class RepositoryPolicyIntegrationTest {
                 });
             }
             assertEquals(List.of(52L, 52L, 52L), jdbc.queryForList(
-                    "SELECT changed_by FROM repository_review_policy_versions ORDER BY version", Long.class));
+                    "SELECT changed_by FROM repository_review_policy_versions WHERE repository_id = 1001 ORDER BY version",
+                    Long.class));
+            assertEquals(1, jdbc.queryForObject(
+                    "SELECT count(*) FROM repository_review_policy_versions WHERE repository_id = 1002", Integer.class));
         } finally {
             jdbc.execute("DROP OWNED BY issue27_operator");
             jdbc.execute("DROP ROLE issue27_operator");
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource(value = {"codex,claude|UTC|23514", "codex|America/Unsupported_Zone|23503"}, delimiter = '|')
+    void invalidPolicyValuesCannotBecomeAnImmutableVersion(String provider, String zone, String sqlState) {
+        assertSqlState(sqlState, () -> jdbc.update("""
+                INSERT INTO repository_review_policy_versions (installation_id, repository_id, version, stages, providers,
+                    require_passing_ci, quiet_zone, quiet_start_minute, quiet_end_minute,
+                    iteration_cap, held, changed_by, change_kind)
+                VALUES (101, 1001, 1, ARRAY['BASELINE'], ?::text[], true, ?, 0, 60, 2, false, 42, 'CONFIGURE')
+                """, new String[]{provider}, zone));
+        assertEquals(0L, operator.read(SCOPE, ACTOR).version());
+        assertEquals(1L, operator.change(SCOPE, ACTOR, 0, CONFIGURE, ENABLED).version());
     }
 
     @Test
@@ -227,6 +272,9 @@ class RepositoryPolicyIntegrationTest {
 
     @Test
     void quietHoursUseLocalTimeAndRejectAmbiguousConfiguration() {
+        var registeredZones = jdbc.queryForList("SELECT zone_id FROM repository_review_policy_time_zones", String.class);
+        assertFalse(registeredZones.isEmpty());
+        assertTrue(ZoneId.getAvailableZoneIds().containsAll(registeredZones));
         var quiet = new QuietHours(ZoneId.of("America/Costa_Rica"), 22 * 60, 6 * 60);
         var policy = new RepositoryReviewPolicy(ENABLED.stages(), ENABLED.providers(), true, quiet, 2);
         var snapshot = operator.change(SCOPE, ACTOR, 0, CONFIGURE, policy);
@@ -240,6 +288,11 @@ class RepositoryPolicyIntegrationTest {
                 Set.of("codex"), true, null, 7));
         assertThrows(IllegalArgumentException.class, () -> new RepositoryReviewPolicy(Set.of(Stage.BASELINE),
                 Set.of("Invalid Provider"), true, null, 1));
+    }
+
+    private void assertSqlState(String state, Runnable operation) {
+        var failure = assertThrows(DataAccessException.class, operation::run);
+        assertEquals(state, assertInstanceOf(SQLException.class, failure.getMostSpecificCause()).getSQLState());
     }
 
     private String editAfter(CountDownLatch start, Change change) throws InterruptedException {

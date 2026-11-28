@@ -7,7 +7,7 @@ import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore;
 import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import java.util.Objects;
 
-/** The authenticated operator role is checked by the store inside the repository authorization transaction. */
+/** The database checks the authenticated operator and live membership inside each policy transaction. */
 public final class RepositoryPolicyOperator {
     private final RepositoryPolicyStore store;
     private final RepositoryAuthorization repositories;
@@ -17,7 +17,7 @@ public final class RepositoryPolicyOperator {
     }
 
     public Snapshot read(RepositoryScope scope, long actorId) {
-        return store.read(scope, actorId, () -> repositories.requireAuthorized(scope));
+        return store.read(scope, actorId, () -> repositories.requireAllowlisted(scope));
     }
 
     public Snapshot change(RepositoryScope scope, long actorId, long expectedVersion,
@@ -27,6 +27,6 @@ public final class RepositoryPolicyOperator {
             throw new IllegalArgumentException("Invalid repository policy change");
         }
         return store.update(scope, expectedVersion, actorId, change, policy,
-                () -> repositories.requireAuthorized(scope));
+                () -> repositories.requireAllowlisted(scope));
     }
 }
