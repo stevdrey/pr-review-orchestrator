@@ -64,7 +64,7 @@ class JdbcWorkQueueLoggingTest {
         root.addAppender(appender);
         try {
             RuntimeException failure = assertThrows(RuntimeException.class, () -> queue.executeCommand(command,
-                    () -> {}, () -> { throw adapterFailure; }));
+                    () -> {}, policyAllows -> { throw adapterFailure; }));
             Throwable callback = failure instanceof TransactionSystemException system
                     ? system.getApplicationException() : failure;
             Failure safe = assertInstanceOf(Failure.class, callback);

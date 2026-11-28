@@ -7,8 +7,14 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
+import io.github.stevdrey.prrevieworchestrator.domain.PullRequestId;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.QuietHours;
 import io.github.stevdrey.prrevieworchestrator.domain.RepositoryScope;
+import java.time.ZoneId;
+import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.Stage;
 import io.github.stevdrey.prrevieworchestrator.ports.*;
+import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -55,6 +61,7 @@ class DurableDispatchIntegrationTest {
         jdbc.execute("TRUNCATE queue_transitions, inbox_events, installations CASCADE");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true), (202, 2002, true)");
+        RepositoryPolicyFixtures.allowReviews(jdbc, "fixture");
         queue = newQueue();
         authorization = new RepositoryAuthorization(Set.of(FIRST, SECOND), new JdbcInstallationAuthorization(jdbc));
         gateway = new FixtureGateway();
@@ -83,6 +90,119 @@ class DurableDispatchIntegrationTest {
         assertTrue(dispatcher().processCommand());
         assertEquals(2, gateway.writes.get());
         assertEquals(2, gateway.applied.size());
+    }
+
+    @Test
+    void pausedRepositoryLeavesQueuedWorkPendingAndNewLimitsVetoTheOriginalSnapshot() {
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1L, jdbc.queryForObject("SELECT repository_policy_version FROM outbox_commands", Long.class));
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(
+                new DataSourceTransactionManager(dataSource)), authorization);
+        assertTrue(operator.change(FIRST, 1, 1, Change.PAUSE, null).held());
+        assertFalse(dispatcher().processCommand());
+        assertEquals(1, count("outbox_commands", "status = 'PENDING' AND attempts = 0"));
+
+        assertTrue(operator.change(FIRST, 1, 2, Change.CONFIGURE, RepositoryReviewPolicy.DEFAULT).held());
+        assertFalse(operator.change(FIRST, 1, 3, Change.RESUME, null).held());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(0, gateway.writes.get());
+        assertEquals(1, count("outbox_commands", "status = 'CANCELLED' AND last_error_code = 'POLICY_DENIED' AND repository_policy_version = 1"));
+    }
+
+    @Test
+    void intentsAdmittedDuringAPauseAreParkedAndRunAfterResume() {
+        var operator = operator();
+        assertTrue(operator.change(FIRST, 1, 1, Change.PAUSE, null).held());
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1, count("outbox_commands", "status = 'PENDING' AND repository_policy_version = 2"));
+        assertFalse(dispatcher().processCommand());
+        assertFalse(operator.change(FIRST, 1, 2, Change.RESUME, null).held());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(1, gateway.writes.get());
+    }
+
+    @Test
+    void aPauseStillReclaimsExpiredInFlightCommandsForReconciliation() {
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        UUID command = jdbc.queryForObject("SELECT id FROM outbox_commands", UUID.class);
+        queue.claimCommand().orElseThrow();
+        gateway.applied.add(INTENT.key(FIRST)); // The crashed attempt's effect landed remotely.
+        expire("outbox_commands", command);
+        assertTrue(operator().change(FIRST, 1, 1, Change.PAUSE, null).held());
+        assertTrue(newQueue().claimCommand().isPresent());
+        expire("outbox_commands", command);
+        queue = newQueue();
+        assertTrue(dispatcher().processCommand());
+        assertEquals("SUCCEEDED", status("outbox_commands", command));
+    }
+
+    @Test
+    void quietHoursDeferAQueuedCommandUntilTheWindowEnds() {
+        int minute = jdbc.queryForObject(
+                "SELECT (extract(hour FROM clock_timestamp() AT TIME ZONE 'UTC') * 60 + extract(minute FROM clock_timestamp() AT TIME ZONE 'UTC'))::int",
+                Integer.class);
+        var quiet = new QuietHours(ZoneId.of("UTC"), minute, (minute + 120) % 1440);
+        operator().change(FIRST, 1, 1, Change.CONFIGURE, new RepositoryReviewPolicy(Set.of(Stage.BASELINE),
+                Set.of(INTENT.provider()), false, quiet, 6));
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(0, gateway.writes.get());
+        assertEquals(1, count("outbox_commands", """
+                status = 'PENDING' AND last_error_code = 'POLICY_DENIED'
+                AND available_at > clock_timestamp() + interval '100 minutes'
+                """));
+        assertEquals(1, count("queue_transitions", "outcome = 'RETRY' AND error_code = 'POLICY_DENIED'"));
+    }
+
+    @Test
+    void aLifecycleRowAtAnotherHeadDoesNotDropAGenericIntent() {
+        new JdbcReviewStateStore(jdbc, new DataSourceTransactionManager(dataSource))
+                .create(new PullRequestId(FIRST, INTENT.prNumber()), NEXT, () -> authorization.requireAuthorized(FIRST));
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1, count("outbox_commands", "status = 'PENDING'"));
+        assertTrue(dispatcher().processCommand());
+        assertEquals(1, gateway.writes.get());
+    }
+
+    RepositoryPolicyOperator operator() {
+        return new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(
+                new DataSourceTransactionManager(dataSource)), authorization);
+    }
+
+    @Test
+    void increasingTheLimitCannotRelaxAnOlderReviewCommand() {
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(
+                new DataSourceTransactionManager(dataSource)), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of(INTENT.provider());
+        assertEquals(2L, operator.change(FIRST, 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 1)).version());
+        event(FIRST, HEAD);
+        assertTrue(dispatcher().processEvent());
+        assertEquals(1, jdbc.update("""
+                UPDATE outbox_commands SET available_at = clock_timestamp() + interval '1 hour'
+                WHERE command_key = ? AND repository_policy_version = 2
+                """, INTENT.key(FIRST)));
+
+        assertEquals(3L, operator.change(FIRST, 1, 2, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 2)).version());
+        var newer = new Intent(7, HEAD, "DEEP", INTENT.provider(), INTENT.type());
+        event(FIRST, HEAD);
+        assertTrue(dispatcher(ignored -> List.of(newer)).processEvent());
+        assertTrue(dispatcher().processCommand());
+        assertEquals(Set.of(newer.key(FIRST)), gateway.applied);
+        assertEquals(1, count("outbox_commands", "status = 'SUCCEEDED' AND repository_policy_version = 3"));
+
+        ready("outbox_commands");
+        assertTrue(dispatcher().processCommand());
+        assertEquals(Set.of(newer.key(FIRST)), gateway.applied);
+        assertEquals(1, count("outbox_commands",
+                "status = 'CANCELLED' AND last_error_code = 'POLICY_DENIED' AND repository_policy_version = 2"));
     }
 
     @Test
@@ -274,7 +394,7 @@ class DurableDispatchIntegrationTest {
         event(FIRST, HEAD);
         dispatcher().processEvent();
         Command claimed = queue.claimCommand().orElseThrow();
-        assertThrows(AssertionError.class, () -> queue.executeCommand(claimed, () -> authorization.requireAuthorized(FIRST), () -> {
+        assertThrows(AssertionError.class, () -> queue.executeCommand(claimed, () -> authorization.requireAuthorized(FIRST), policyAllows -> {
             gateway.execute(claimed);
             throw new AssertionError("simulated process death");
         }));
@@ -458,7 +578,7 @@ class DurableDispatchIntegrationTest {
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         try (var executor = Executors.newSingleThreadExecutor()) {
-            Future<Boolean> result = executor.submit(() -> queue.executeCommand(command, () -> authorization.requireAuthorized(FIRST), () -> {
+            Future<Boolean> result = executor.submit(() -> queue.executeCommand(command, () -> authorization.requireAuthorized(FIRST), policyAllows -> {
                 entered.countDown();
                 try { assertTrue(release.await(5, TimeUnit.SECONDS)); }
                 catch (InterruptedException e) { throw new RuntimeException(e); }
@@ -481,7 +601,7 @@ class DurableDispatchIntegrationTest {
         dispatcher().processEvent();
         Command stale = queue.claimCommand().orElseThrow();
         expire("outbox_commands", stale.lease().id());
-        assertFalse(queue.executeCommand(stale, () -> fail("stale authorization"), () -> { fail("stale effect"); return null; }));
+        assertFalse(queue.executeCommand(stale, () -> fail("stale authorization"), policyAllows -> { fail("stale effect"); return null; }));
         dispatcher().processCommand();
         assertEquals(1, gateway.writes.get());
     }

@@ -50,6 +50,7 @@ class ReviewRequestIntegrationTest {
         jdbc.execute("TRUNCATE sandbox_codex_budget_limits");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1), (202, 2)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true), (202, 2002, true)");
+        RepositoryPolicyFixtures.allowReviews(jdbc, "codex", "provider-0", "provider-1", "provider-2", "provider-3", "provider-4", "provider-5", "provider-6", "final-a", "final-b");
         authorization = new RepositoryAuthorization(Set.of(SCOPE), new JdbcInstallationAuthorization(jdbc));
         comments = mock(GitHubCodexComments.class);
         approval = mock(CodexApproval.class);
@@ -134,11 +135,11 @@ class ReviewRequestIntegrationTest {
     @Test void permitItselfCannotBeReusedEvenAfterRollbackOfEffectTransaction() {
         var r = request(HEAD);
         var reservation = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
-        code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), () -> {
+        code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), finalGuards -> {
             effects.incrementAndGet();
             throw new ReviewRequestFailure(ReviewRequestFailure.Code.OUTCOME_UNKNOWN);
         }));
-        code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), () -> {
+        code(ReviewRequestFailure.Code.OUTCOME_UNKNOWN, () -> store().send(r, reservation.id(), () -> authorization.requireAuthorized(SCOPE), finalGuards -> {
             effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1001, true);
         }));
         assertEquals(1, effects.get());
@@ -182,7 +183,7 @@ class ReviewRequestIntegrationTest {
         var reserved = store().reserve(r, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
         jdbc.update("UPDATE installation_repositories SET enabled = false WHERE installation_id = 101");
         assertThrows(AuthorizationDenied.class, () -> store().send(r, reserved.id(),
-                () -> authorization.requireAuthorized(SCOPE), () -> { effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1, true); }));
+                () -> authorization.requireAuthorized(SCOPE), finalGuards -> { effects.incrementAndGet(); return new ReviewRequestStore.Receipt(1, true); }));
         assertEquals(0, effects.get());
         assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests", String.class));
     }
@@ -287,7 +288,7 @@ class ReviewRequestIntegrationTest {
         var past = reserveBudget(store(), original);
         var budget = budgetStore(new Terms("fixture_units", 4, 5, 9, 20));
         code(ReviewRequestFailure.Code.POLICY_DENIED, () -> budget.send(original, past.id(),
-                () -> authorization.requireAuthorized(SCOPE), () -> fail("Missing budget allowed the effect")));
+                () -> authorization.requireAuthorized(SCOPE), finalGuards -> fail("Missing budget allowed the effect")));
         assertEquals(NOT_SENT, adapter().request(original));
         assertEquals(0, heldBudgets());
     }
@@ -417,7 +418,7 @@ class ReviewRequestIntegrationTest {
         var reserved = store().reserve(request, 42, 6, () -> authorization.requireAuthorized(SCOPE), () -> {});
         reconcileCi(lifecycle().find(PR).orElseThrow(), ReviewTransition.Ci.PENDING);
         code(CI_NOT_PASSED, () -> store().send(request, reserved.id(), () -> authorization.requireAuthorized(SCOPE),
-                () -> fail("A rerun invalidated CI before the effect")));
+                finalGuards -> fail("A rerun invalidated CI before the effect")));
         assertEquals(NOT_SENT, adapter().request(request));
         assertEquals(1, effects.get());
         assertEquals(2, rows());

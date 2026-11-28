@@ -12,6 +12,7 @@ ADRs capture persistent architectural intent. **Accepted** means the decision is
 | [0006](0006-provider-neutral-agents-and-events.md) | Optional adapters for review providers and MCP events | Accepted |
 | [0007](0007-one-shot-sandbox-codex-authorization.md) | One authorized Codex request in the PR #35 sandbox | Accepted. Authorization consumed. |
 | [0008](0008-scoped-mcp-tools.md) | Scoped MCP tool sessions and local command approval | Accepted for private deployments. |
+| [0009](0009-versioned-repository-review-policy.md) | Versioned repository review policy and local operator controls | Accepted for the local operator boundary. |
 
 ## Writing a new ADR
 

@@ -83,6 +83,7 @@ class FixCorrelationIntegrationTest {
     private void createReviewingPr() {
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+        RepositoryPolicyFixtures.allowReviews(jdbc, "github", "codex");
         cycle = createCycle(BASE, 1);
         lifecycle.create(PR, BASE);
         step(MARK_READY, READY);
@@ -497,7 +498,7 @@ class FixCorrelationIntegrationTest {
         assertEquals(original.id(), requests.reserve(originalRequest, 1, 6, guards, () -> {}).id());
         assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
                 () -> requests.send(originalRequest, original.id(), guards,
-                        () -> fail("An earlier epoch must not reach the provider"))).code());
+                        finalGuards -> fail("An earlier epoch must not reach the provider"))).code());
 
         var renewed = new ReviewRequest(PR, FIRST, "BASELINE", "github",
                 ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
@@ -508,7 +509,7 @@ class FixCorrelationIntegrationTest {
         passCi();
         var renewedReservation = requests.reserve(renewed, 1, 6, guards, () -> {});
         assertTrue(renewedReservation.created());
-        requests.send(renewed, renewedReservation.id(), guards, () -> new Receipt(84, true));
+        requests.send(renewed, renewedReservation.id(), guards, finalGuards -> new Receipt(84, true));
         var renewedReplay = requests.reserve(renewed, 1, 6, guards, () -> {});
         assertFalse(renewedReplay.created());
         assertEquals(renewedReservation.id(), renewedReplay.id());
@@ -537,7 +538,7 @@ class FixCorrelationIntegrationTest {
         // A remote return to BASE during this gap would satisfy a remote SHA check.
         assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
                 () -> requests.send(request, reservation.id(), sendGuards,
-                        () -> new Receipt(42, true))).code());
+                        finalGuards -> new Receipt(42, true))).code());
         assertEquals(FIRST, current().headSha());
         assertEquals("NOT_SENT", jdbc.queryForObject("SELECT state FROM review_requests WHERE id = ?",
                 String.class, reservation.id()));
@@ -619,7 +620,7 @@ class FixCorrelationIntegrationTest {
                     () -> assertEquals(ReviewConflict.Code.GUARD_REJECTED, assertThrows(ReviewConflict.class,
                             () -> outcomes.recordClean(assessment, UUID.randomUUID(), READY)).code()),
                     () -> assertEquals(ReviewRequestFailure.Code.STALE_HEAD, assertThrows(ReviewRequestFailure.class,
-                            () -> requests.send(legacyPermit, permitId, authorize, () -> new Receipt(43, true))).code()));
+                            () -> requests.send(legacyPermit, permitId, authorize, finalGuards -> new Receipt(43, true))).code()));
             var currentPermit = new ReviewRequest(PR, BASE, "BASELINE", "codex",
                     ReviewRequest.Trigger.PR_SYNCHRONIZE, 1, false, epoch);
             var duplicatePermit = requests.reserve(currentPermit, 1, 6, authorize, () -> {});

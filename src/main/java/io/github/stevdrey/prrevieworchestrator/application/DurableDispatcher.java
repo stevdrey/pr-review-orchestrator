@@ -64,7 +64,7 @@ public final class DurableDispatcher {
         Command command = claimed.get();
         var effectAttempted = new java.util.concurrent.atomic.AtomicBoolean();
         try {
-            if (queue.executeCommand(command, () -> authorization.requireAuthorized(command.scope()), () -> {
+            if (queue.executeCommand(command, () -> authorization.requireAuthorized(command.scope()), policyAllows -> {
                 if (!commands.supports(command)) throw new Failure(ErrorCode.UNSUPPORTED_COMMAND, false);
                 RemoteState state = commands.reconcile(command);
                 // A later PR head does not undo a confirmed effect for this command's original SHA/key.
@@ -72,6 +72,7 @@ public final class DurableDispatcher {
                 // A stale head forbids new writes, but cannot settle an earlier ambiguous effect.
                 if (state.effect() == RemoteEffect.UNKNOWN) throw new Failure(ErrorCode.REMOTE_UNCERTAIN, true);
                 if (!command.intent().expectedHeadSha().equals(state.currentHeadSha())) return Outcome.CANCELLED;
+                if (!policyAllows.getAsBoolean()) return Outcome.POLICY_DENIED;
                 // No second authorization query: authorize.run() holds FOR SHARE locks on the
                 // installation/repository rows, so a revocation cannot commit before this transaction ends.
                 effectAttempted.set(true);

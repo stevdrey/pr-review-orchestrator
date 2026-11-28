@@ -8,6 +8,7 @@ import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.*;
  * until remote settlement is proved; lack of an eventually-consistent search result is not ABSENT.
  * execute must enforce remote idempotency and all action/approval/budget gates, including a fresh
  * SHA check at the side-effect boundary. A gateway without these capabilities must fail closed.
+ * The native Codex adapter requires its own dispatch path and must not be called by this gateway.
  */
 public interface CommandGateway {
     boolean supports(Command command);

@@ -2,11 +2,14 @@ package io.github.stevdrey.prrevieworchestrator.adapters.persistence;
 
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.PullRequestReview.Intervention;
+import io.github.stevdrey.prrevieworchestrator.domain.RepositoryReviewPolicy.Snapshot;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -21,6 +24,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final JdbcReviewStateStore states;
+    private final JdbcRepositoryPolicy repositoryPolicy;
     private final JdbcSandboxCodexBudget sandboxBudget;
 
     public JdbcReviewRequestStore(JdbcTemplate jdbc, PlatformTransactionManager manager) {
@@ -35,6 +39,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             JdbcSandboxCodexBudget sandboxBudget) {
         this.jdbc = jdbc;
         this.states = states;
+        this.repositoryPolicy = new JdbcRepositoryPolicy(jdbc);
         this.sandboxBudget = sandboxBudget;
         PostgresDeadlines.requireTransactionTimeout(jdbc, "review requests");
         transactions = new TransactionTemplate(manager);
@@ -52,6 +57,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         } catch (RuntimeException failure) { throw ReviewRequestFailure.sanitized(failure); }
     }
     @Override public Reservation reserve(ReviewRequest request, long actorId, int limit, Runnable authorize, Runnable approve) {
+        requireIndependentDispatch();
         if (actorId <= 0 || limit < 1 || limit > 6) throw new IllegalArgumentException("Invalid review policy");
         var reservation = transaction(() -> {
             var pr = request.pr();
@@ -82,10 +88,20 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                     request.pr().scope().repositoryId(), request.pr().number(), request.headSha(),
                     request.stage(), request.provider(), request.headEpoch());
             if (!reconciled.isEmpty()) return reconciled.getFirst();
+            var active = repositoryPolicy.lockCurrent(pr.scope());
+            var pinned = request.plannedCommandId() == null ? active
+                    : repositoryPolicy.pinned(pr.scope(), requirePlannedReview(request, current));
+            requireRepositoryPolicy(request, current, pinned, active);
+            if (request.plannedCommandId() == null && alreadyQueued(request)) {
+                throw new ReviewRequestFailure(POLICY_DENIED);
+            }
             long used = usedIterations(jdbc, pr);
-            if (used >= limit) {
+            long occupied = repositoryPolicy.occupied(pr, request.plannedCommandId());
+            if (occupied >= Math.min(limit, pinned.effectiveIterationCap(active))) {
                 // An untracked PR has no aggregate to pause; never create one from an unverified request head.
                 if (current == null) throw new ReviewRequestFailure(LIMIT_REACHED);
+                // Only consumed deployment slots stop the PR; tentative outbox slots or a lowered policy cap just deny.
+                if (used < limit) throw new ReviewRequestFailure(LIMIT_REACHED);
                 states.stopLocked(current, Intervention.ITERATION_LIMIT);
                 return null; // Commit the pause before exposing the denial.
             }
@@ -94,18 +110,19 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             UUID id = UUID.randomUUID();
             jdbc.update("""
                     INSERT INTO review_requests (id, request_key, installation_id, repository_id, pr_number,
-                        head_sha, stage, provider, actor_id, head_epoch, iteration, planned_command_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        head_sha, stage, provider, actor_id, head_epoch, iteration, planned_command_id, repository_policy_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, id, request.key(), request.pr().scope().installationId(), request.pr().scope().repositoryId(),
                     request.pr().number(), request.headSha(), request.stage(), request.provider(), actorId,
-                    request.headEpoch(), used + 1, request.plannedCommandId());
+                    request.headEpoch(), used + 1, request.plannedCommandId(), pinned.version());
             if (sandboxBudget != null) sandboxBudget.reserve(request);
             return new Reservation(id, State.RESERVED, true);
         });
         if (reservation == null) throw new ReviewRequestFailure(LIMIT_REACHED);
         return reservation;
     }
-    @Override public void send(ReviewRequest request, UUID id, Runnable guards, Supplier<Receipt> effect) {
+    @Override public void send(ReviewRequest request, UUID id, Runnable guards, Function<Runnable, Receipt> effect) {
+        requireIndependentDispatch();
         try {
             transaction(() -> {
                 PostgresLocks.lockPr(jdbc, request.pr());
@@ -135,9 +152,13 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
                 if (requestStates.size() != 1 || requestStates.getFirst() != State.ATTEMPTED) {
                     throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
                 }
-                requireSendPolicy(request, id);
+                Runnable policyCheck = sendPolicyCheck(request, id);
+                policyCheck.run();
                 if (sandboxBudget != null) sandboxBudget.requireHeld(request);
-                Receipt receipt = effect.get();
+                Receipt receipt = effect.apply(() -> {
+                    guards.run();
+                    policyCheck.run();
+                });
                 effectReturned.set(true);
                 if (receipt == null || receipt.commentId() <= 0) throw new ReviewRequestFailure(OUTCOME_UNKNOWN);
                 jdbc.update("UPDATE review_requests SET state = ?, comment_id = ?, completed_at = clock_timestamp() WHERE id = ?",
@@ -177,7 +198,8 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         if (request.plannedCommandId() == null) return false;
         if (failure instanceof AuthorizationUnavailable) return true;
         return failure instanceof ReviewRequestFailure known && switch (known.code()) {
-            case REMOTE_UNAVAILABLE, STORE_UNAVAILABLE, PR_NOT_READY, CI_NOT_PASSED, CAPABILITY_UNVERIFIED -> true;
+            case REMOTE_UNAVAILABLE, STORE_UNAVAILABLE, PR_NOT_READY, CI_NOT_PASSED, CAPABILITY_UNVERIFIED,
+                    QUIET_HOURS -> true;
             default -> false;
         };
     }
@@ -232,11 +254,56 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         return current;
     }
 
-    private PullRequestReview requireSendPolicy(ReviewRequest request, UUID id) {
+    private Runnable sendPolicyCheck(ReviewRequest request, UUID id) {
         var current = requireCurrentVisit(request);
-        long iteration = jdbc.queryForObject("SELECT iteration FROM review_requests WHERE id = ?", Long.class, id);
+        var reservation = jdbc.queryForMap("SELECT iteration, repository_policy_version FROM review_requests WHERE id = ?", id);
+        long iteration = (Long) reservation.get("iteration");
+        var scope = request.pr().scope();
+        var active = repositoryPolicy.lockCurrent(scope);
+        Long version = (Long) reservation.get("repository_policy_version");
+        var pinned = repositoryPolicy.pinned(scope, version);
         requireEligible(request, current, iteration);
-        return current;
+        if (request.plannedCommandId() != null && !Objects.equals(version, requirePlannedReview(request, current))) {
+            throw new ReviewRequestFailure(POLICY_DENIED);
+        }
+        if (repositoryPolicy.occupied(request.pr(), null) > pinned.effectiveIterationCap(active)) {
+            throw new ReviewRequestFailure(POLICY_DENIED);
+        }
+        return () -> requireRepositoryPolicy(request, current, pinned, active);
+    }
+
+    private void requireRepositoryPolicy(ReviewRequest request, PullRequestReview current, Snapshot pinned, Snapshot active) {
+        // The live hold governs; work admitted during a pause runs under its pinned rules after resume.
+        if (active.held()) throw new ReviewRequestFailure(HUMAN_INTERVENTION_REQUIRED);
+        if (!pinned.policy().allows(request.stage(), request.provider())
+                || !active.policy().allows(request.stage(), request.provider())) {
+            throw new ReviewRequestFailure(POLICY_DENIED);
+        }
+        if ((pinned.policy().requirePassingCi() || active.policy().requirePassingCi())
+                && (current == null || current.ci() != ReviewTransition.Ci.PASSED)) {
+            throw new ReviewRequestFailure(CI_NOT_PASSED);
+        }
+        var now = repositoryPolicy.now();
+        if (pinned.quiet(now) || active.quiet(now)) throw new ReviewRequestFailure(QUIET_HOURS);
+    }
+
+    private boolean alreadyQueued(ReviewRequest request) {
+        var pr = request.pr();
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
+                    WHERE o.command_type = 'REQUEST_REVIEW' AND o.status <> 'CANCELLED'
+                        AND (o.planned_head_epoch IS NULL OR o.planned_head_epoch = ?)
+                        AND (o.installation_id, o.repository_id, c.pr_number, o.expected_head_sha,
+                            c.stage, o.target_provider) = (?, ?, ?, ?, ?, ?))
+                """, Boolean.class, request.headEpoch(), pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
+                request.headSha(), request.stage(), request.provider()));
+    }
+
+    private void requireIndependentDispatch() {
+        if (JdbcWorkQueue.GENERIC_DISPATCH.isBound()) {
+            // The generic worker may hold the PR lock on another connection until its gateway returns.
+            throw new DurableWork.Failure(DurableWork.ErrorCode.UNSUPPORTED_COMMAND, false);
+        }
     }
 
     private void requireEligible(ReviewRequest request, PullRequestReview current, long iteration) {
@@ -244,7 +311,6 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
             throw new ReviewRequestFailure(current.intervention() == null ? POLICY_DENIED : HUMAN_INTERVENTION_REQUIRED);
         }
         if (request.plannedCommandId() != null) {
-            requirePlannedReview(request, current);
             return;
         }
         if (current != null && current.ci() == ReviewTransition.Ci.PASSED) return;
@@ -260,7 +326,7 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         if (reReview) throw new ReviewRequestFailure(CI_NOT_PASSED);
     }
 
-    private void requirePlannedReview(ReviewRequest request, PullRequestReview current) {
+    private Long requirePlannedReview(ReviewRequest request, PullRequestReview current) {
         if (current == null || current.state() != PullRequestReview.State.WAITING_FOR_REVIEW) {
             throw new ReviewRequestFailure(POLICY_DENIED);
         }
@@ -270,15 +336,16 @@ public final class JdbcReviewRequestStore implements ReviewRequestStore {
         if (findings.generalNeedsDisposition() || !findings.inlinePending() && !findings.generalPending()) {
             throw new ReviewRequestFailure(POLICY_DENIED);
         }
-        boolean claimed = Boolean.TRUE.equals(jdbc.queryForObject("""
-                SELECT EXISTS (SELECT 1 FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
+        var versions = jdbc.query("""
+                SELECT o.repository_policy_version FROM outbox_commands o JOIN review_cycles c ON c.id = o.review_cycle_id
                     WHERE o.id = ? AND o.status = 'PROCESSING' AND o.command_type = 'REQUEST_REVIEW'
                         AND o.planned_head_epoch = ? AND (o.installation_id, o.repository_id, c.pr_number,
-                            o.expected_head_sha, c.stage, o.target_provider) = (?, ?, ?, ?, ?, ?))
-                """, Boolean.class, request.plannedCommandId(), request.headEpoch(),
+                            o.expected_head_sha, c.stage, o.target_provider) = (?, ?, ?, ?, ?, ?)
+                """, (rs, row) -> rs.getObject(1, Long.class), request.plannedCommandId(), request.headEpoch(),
                 pr.scope().installationId(), pr.scope().repositoryId(), pr.number(),
-                request.headSha(), request.stage(), request.provider()));
-        if (!claimed) throw new ReviewRequestFailure(POLICY_DENIED);
+                request.headSha(), request.stage(), request.provider());
+        if (versions.isEmpty()) throw new ReviewRequestFailure(POLICY_DENIED);
+        return versions.getFirst();
     }
 
     /** Best effort: if this fails the row keeps its conservative RESERVED/ATTEMPTED state. */

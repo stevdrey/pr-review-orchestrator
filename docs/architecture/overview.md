@@ -41,6 +41,8 @@ Acknowledge GitHub after persisting a validated delivery; process asynchronously
 
 Use outbox patterns for external side effects, at-least-once retries, dedupe at command boundary and dead-letter/poison event visibility. Do not claim end-to-end exactly-once behavior over GitHub APIs.
 
+The [repository review policy](../development/repository-review-policy.md) scopes immutable versions to an installation and repository. Review commands and reservations pin the version that admitted them. The active version can stop pending effects, and a local operator changes policy through a version-checked, audited command.
+
 ## Isolation
 
 Installation/repository boundaries are explicit. Scope tokens by action; never store personal access tokens as plaintext or expose them to AI workers. Any future multi-tenant SaaS model must specify isolation in a new ADR before implementation.

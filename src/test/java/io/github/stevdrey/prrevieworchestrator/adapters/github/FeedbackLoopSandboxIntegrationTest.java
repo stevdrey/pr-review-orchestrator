@@ -13,11 +13,13 @@ import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewRe
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewOutcomeStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewEvidenceStore;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcReviewStateStore;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcRepositoryPolicy;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCiInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxCodexBudget.Terms;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcSandboxReviewInbox;
 import io.github.stevdrey.prrevieworchestrator.adapters.persistence.JdbcWorkQueue;
+import io.github.stevdrey.prrevieworchestrator.adapters.persistence.RepositoryPolicyFixtures;
 import io.github.stevdrey.prrevieworchestrator.application.*;
 import io.github.stevdrey.prrevieworchestrator.domain.*;
 import io.github.stevdrey.prrevieworchestrator.domain.DurableWork.Event;
@@ -25,7 +27,9 @@ import io.github.stevdrey.prrevieworchestrator.domain.ReviewOutcome.*;
 import io.github.stevdrey.prrevieworchestrator.domain.ReviewTransition.Ci;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexApproval;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexCompletionSource.TerminalAttempt;
+import io.github.stevdrey.prrevieworchestrator.ports.CommandGateway;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewIntentPolicy;
+import io.github.stevdrey.prrevieworchestrator.ports.RepositoryPolicyStore.Change;
 import io.github.stevdrey.prrevieworchestrator.ports.CodexUserCredentials.Credential;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewProvider.Result;
 import io.github.stevdrey.prrevieworchestrator.ports.ReviewRequestStore.Receipt;
@@ -64,6 +68,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -188,6 +194,7 @@ class FeedbackLoopSandboxIntegrationTest {
         jdbc.execute("TRUNCATE installations, inbox_events, sandbox_codex_budget_limits CASCADE");
         jdbc.update("INSERT INTO installations (installation_id, account_id) VALUES (101, 1)");
         jdbc.update("INSERT INTO installation_repositories (installation_id, repository_id, enabled) VALUES (101, 1001, true)");
+        RepositoryPolicyFixtures.allowReviews(jdbc, "codex", "sandbox-deep");
         var limits = new DurableWork.Limits(Duration.ofSeconds(30), Duration.ofSeconds(1), Duration.ofSeconds(10));
         queue = new JdbcWorkQueue(jdbc, transactions, limits);
         requests = new JdbcReviewRequestStore(jdbc, transactions, states);
@@ -690,6 +697,79 @@ class FeedbackLoopSandboxIntegrationTest {
     }
 
     @Test
+    void plannedRequestInheritsTheIntentPolicyAcrossANewerPermissiveVersion() throws Exception {
+        planCorrectiveReview();
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(transactions), authorization);
+        operator.change(PR.scope(), 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(Set.of(Stage.BASELINE), Set.of("codex"), true, null, 4));
+        assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
+        assertEquals(1L, jdbc.queryForObject("SELECT repository_policy_version FROM outbox_commands", Long.class));
+        assertEquals(1L, jdbc.queryForObject("""
+                SELECT repository_policy_version FROM review_requests WHERE planned_command_id IS NOT NULL
+                """, Long.class));
+        assertThat(github.comments()).extracting(SandboxGitHub.Comment::id).containsExactly(9001L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void plannedDispatchCountsGenericReviewsAgainstItsPinnedCap(boolean reservedBeforeGeneric) throws Exception {
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(transactions), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of("codex", "sandbox-deep");
+        operator.change(PR.scope(), 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 2));
+        planCorrectiveReview();
+        var dispatch = plannedDispatch(new FixtureBudget(1), budgetedRequests());
+        if (reservedBeforeGeneric) {
+            github.failNextPullReads(1);
+            assertTrue(dispatch.processCommand());
+            assertEquals("RESERVED", jdbc.queryForObject("""
+                    SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                    """, String.class));
+            assertSingleBudgetHold(repository.fixedSha);
+        }
+
+        operator.change(PR.scope(), 1, 2, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, 3));
+        var deep = new DurableWork.Intent(PR.number(), repository.fixedSha, "DEEP", "sandbox-deep", DurableWork.REQUEST_REVIEW);
+        var genericEffect = new AtomicBoolean();
+        var generic = new DurableDispatcher(queue, authorization, event -> List.of(deep), new CommandGateway() {
+            @Override public boolean supports(DurableWork.Command command) { return deep.equals(command.intent()); }
+            @Override public DurableWork.RemoteState reconcile(DurableWork.Command command) {
+                return new DurableWork.RemoteState(github.head(), DurableWork.RemoteEffect.ABSENT);
+            }
+            @Override public void execute(DurableWork.Command command) { genericEffect.set(true); }
+        });
+        assertEquals(202, signed("pull_request", UUID.randomUUID(),
+                pullWebhook("ready_for_review", repository.fixedSha)).statusCode());
+        assertTrue(generic.processEvent());
+        assertTrue(generic.processCommand());
+        assertTrue(genericEffect.get());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM outbox_commands WHERE command_key = ?",
+                String.class, deep.key(PR.scope())));
+
+        jdbc.update("UPDATE outbox_commands SET available_at = clock_timestamp() WHERE planned_head_epoch IS NOT NULL");
+        assertTrue(dispatch.processCommand());
+        assertThat(github.comments()).isEmpty();
+        assertEquals(Map.of("status", "CANCELLED", "last_error_code", "POLICY_DENIED", "repository_policy_version", 2L),
+                jdbc.queryForMap("""
+                        SELECT status, last_error_code, repository_policy_version FROM outbox_commands
+                        WHERE planned_head_epoch IS NOT NULL
+                        """));
+        if (reservedBeforeGeneric) {
+            assertEquals("NOT_SENT", jdbc.queryForObject("""
+                    SELECT state FROM review_requests WHERE planned_command_id IS NOT NULL
+                    """, String.class));
+            assertSingleBudgetHold(repository.fixedSha);
+        } else {
+            assertEquals(1, count("review_requests"));
+            assertEquals(0, count("sandbox_codex_budget_reservations"));
+            // A pinned policy cap filled by another command denies without a permanent ITERATION_LIMIT stop.
+            assertNull(current().intervention());
+        }
+    }
+
+    @Test
     void twoRequestsForTheSameHeadRequireTheirOwnCommentAndAttempt() throws Exception {
         var initial = planCorrectiveReview();
         assertTrue(plannedDispatch(new FixtureBudget(1)).processCommand());
@@ -733,6 +813,83 @@ class FeedbackLoopSandboxIntegrationTest {
         attempt.set(attempt(snapshot, 9002, Stage.BASELINE, repository.fixedSha, "attempt-2"));
         assertEquals(Verdict.CLEAN_FOR_SHA, source.assessCodex(current, version, snapshot.id()).verdict());
         assertEquals(0, count("review_clean_evidence"));
+    }
+
+    @Test
+    void genericWorkerRejectsANestedNativeAdapterBeforeReserving() throws Exception {
+        String head = github.head();
+        var intent = new DurableWork.Intent(PR.number(), head, "BASELINE", "codex", DurableWork.REQUEST_REVIEW);
+        var nativeAdapter = codex(request -> fail("nested requests must be rejected before approval"),
+                6, CodexReviewAdapter.Mode.STANDARD);
+        var generic = new DurableDispatcher(queue, authorization, event -> List.of(intent), new CommandGateway() {
+            @Override public boolean supports(DurableWork.Command command) { return intent.equals(command.intent()); }
+            @Override public DurableWork.RemoteState reconcile(DurableWork.Command command) {
+                return new DurableWork.RemoteState(head, DurableWork.RemoteEffect.ABSENT);
+            }
+            @Override public void execute(DurableWork.Command command) {
+                nativeAdapter.request(baseline(head, ReviewRequest.Trigger.PR_READY, 0));
+            }
+        });
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("ready_for_review", head)).statusCode());
+        assertTrue(generic.processEvent());
+        assertTimeout(Duration.ofSeconds(5), () -> assertTrue(generic.processCommand()));
+        assertEquals(Map.of("status", "DEAD", "last_error_code", "UNSUPPORTED_COMMAND", "attempts", 1),
+                jdbc.queryForMap("SELECT status, last_error_code, attempts FROM outbox_commands"));
+        assertEquals(0, count("review_requests"));
+        assertThat(github.comments()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void plannerCapacityDenialAllowsLaterEligibleWorkWithoutAPrStop(boolean tentativeSlot) throws Exception {
+        var round = startRemediation();
+        var permit = new AtomicBoolean();
+        var worker = planningWorker((pr, intent) -> permit.get(), 6);
+        String head = repository.fixedSha;
+        github.push(head);
+        assertEquals(202, signed("pull_request", UUID.randomUUID(), pullWebhook("synchronize", head)).statusCode());
+        assertTrue(worker.processEvent());
+        dispose(round, GeneralFeedback.Action.CLAIM_FIXED, head);
+        successfulWorkflows();
+        agePlanning();
+        assertTrue(worker.processEvent());
+        assertEquals(Ci.PASSED, current().ci());
+        assertEquals(0, count("outbox_commands"));
+
+        var operator = new RepositoryPolicyOperator(new JdbcRepositoryPolicy(jdbc).operatorStore(transactions), authorization);
+        var stages = Set.of(Stage.BASELINE, Stage.DEEP);
+        var providers = Set.of("codex", "sandbox-deep");
+        operator.change(PR.scope(), 1, 1, Change.CONFIGURE,
+                new RepositoryReviewPolicy(stages, providers, false, null, tentativeSlot ? 2 : 1));
+        if (tentativeSlot) {
+            var delivery = enqueue("pull_request", "ready_for_review", head, pullWebhook("ready_for_review", head));
+            var deep = new DurableWork.Intent(PR.number(), head, "DEEP", "sandbox-deep", DurableWork.REQUEST_REVIEW);
+            assertTrue(queue.completeEvent(delivery, List.of(deep), this::authorize));
+            assertEquals(1, count("outbox_commands"));
+        }
+
+        permit.set(true);
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 66)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(WAITING_FOR_REVIEW, current().state());
+        assertNull(current().intervention());
+        assertEquals(0, jdbc.queryForObject("""
+                SELECT count(*) FROM pr_review_transitions WHERE action = 'STOP_ITERATION_LIMIT'
+                """, Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM outbox_commands WHERE planned_head_epoch IS NOT NULL", Integer.class));
+
+        if (tentativeSlot) {
+            assertEquals(1, jdbc.update("UPDATE outbox_commands SET status = 'CANCELLED', completed_at = clock_timestamp()"));
+        } else {
+            operator.change(PR.scope(), 1, 2, Change.CONFIGURE,
+                    new RepositoryReviewPolicy(stages, providers, false, null, 2));
+        }
+        assertEquals(202, signed("check_run", UUID.randomUUID(), ciWebhook("check_run", head, 67)).statusCode());
+        assertTrue(worker.processEvent());
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM outbox_commands WHERE planned_head_epoch IS NOT NULL AND status = 'PENDING'
+                """, Integer.class));
+        assertEquals(WAITING_FOR_REVIEW, current().state());
     }
 
     private Assessment planCorrectiveReview() throws Exception {
@@ -1297,7 +1454,7 @@ class FeedbackLoopSandboxIntegrationTest {
         var deep = new ReviewRequest(PR, repository.fixedSha, "DEEP", "sandbox-deep", ReviewRequest.Trigger.PR_SYNCHRONIZE, 42, false);
         var deepBudget = new FixtureBudget(1);
         var ticket = requests.reserve(deep, 42, 6, this::authorize, () -> deepBudget.requirePermitted(deep));
-        requests.send(deep, ticket.id(), this::authorize, () -> new Receipt(9901, true));
+        requests.send(deep, ticket.id(), this::authorize, finalGuards -> new Receipt(9901, true));
         var deepClean = observeRound(deep, "R3", Conclusion.NO_FINDINGS);
         outcomes.recordClean(deepClean, UUID.randomUUID(), OPEN);
         check(repository.fixedSha, Ci.PENDING);
